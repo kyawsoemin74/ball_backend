@@ -20,7 +20,7 @@ class LiveUpdateScheduler:
         # Add job to run every 2 minutes
         self.scheduler.add_job(
             self._sync_live_matches_job,
-            trigger=IntervalTrigger(minutes=2),
+            trigger=IntervalTrigger(minutes=60),
             id="sync_live_matches",
             name="Sync Live Matches",
             max_instances=1  # Prevent overlapping jobs

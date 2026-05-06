@@ -27,7 +27,8 @@ app = FastAPI(
     title="Fover Backend API",
     description="Football data management API",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    root_path=""
 )
 
 # CORS middleware
