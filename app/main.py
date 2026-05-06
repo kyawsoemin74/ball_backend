@@ -28,7 +28,10 @@ app = FastAPI(
     description="Football data management API",
     version="1.0.0",
     lifespan=lifespan,
-    root_path=""
+    root_path="/api",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json"
 )
 
 # CORS middleware
@@ -41,7 +44,7 @@ app.add_middleware(
 )
 
 # Include routers
-app.include_router(matches_router)
+app.include_router(matches_router, prefix="/api")
 
 
 @app.get("/")
