@@ -2,10 +2,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
 
 from app.api.matches import router as matches_router
 from app.services.scheduler import live_scheduler
@@ -14,7 +10,7 @@ from app.db.database import Base, engine
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables on startup
+    # Create tables on startup (In production, use Alembic migrations)
     Base.metadata.create_all(bind=engine)
     
     # Startup: Start the live update scheduler
@@ -38,7 +34,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Production မှာ တကယ်သုံးမည့် Domain ကိုသာ ပြောင်းလဲရန်
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

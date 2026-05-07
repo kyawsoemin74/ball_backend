@@ -17,10 +17,10 @@ class LiveUpdateScheduler:
             logger.warning("Scheduler is already running")
             return
             
-        # Add job to run every 2 minutes
+        # Add job to run every 2 minutes for real-time updates
         self.scheduler.add_job(
             self._sync_live_matches_job,
-            trigger=IntervalTrigger(minutes=60),
+            trigger=IntervalTrigger(minutes=2),
             id="sync_live_matches",
             name="Sync Live Matches",
             max_instances=1  # Prevent overlapping jobs
@@ -28,7 +28,7 @@ class LiveUpdateScheduler:
         
         self.scheduler.start()
         self.is_running = True
-        logger.info("Live update scheduler started - will sync every 2 minutes")
+        logger.info("Live update scheduler started - syncing every 2 minutes")
         
     def stop(self):
         """Stop the live update scheduler"""

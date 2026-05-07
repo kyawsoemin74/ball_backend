@@ -1,4 +1,3 @@
-import os
 import httpx
 import logging
 from typing import Optional
@@ -7,14 +6,17 @@ from sqlalchemy.orm import Session
 
 from app.models.match import Match
 from app.schemas.match import MatchCreate
-from app.core.config import FOOTBALL_API_BASE_URL, FOOTBALL_API_KEY, SUPPORTED_LEAGUES
+from app.core.config import settings
+
+# Constants for match statuses
+FINISHED_STATUSES = {"FT", "AET", "PEN", "P", "CANC", "ABD", "AWD", "WO"}
 
 logger = logging.getLogger(__name__)
 
 class FootballAPIService:
     def __init__(self):
-        self.base_url = FOOTBALL_API_BASE_URL
-        self.api_key = FOOTBALL_API_KEY
+        self.base_url = settings.FOOTBALL_API_BASE_URL
+        self.api_key = settings.FOOTBALL_API_KEY
         self.headers = {
             "x-apisports-key": self.api_key,
             "Content-Type": "application/json"
@@ -127,11 +129,11 @@ class FootballAPIService:
         for match_create in parsed_matches:
             existing_match = match_map.get(match_create.fixture_id)
             
-            if existing_match:
+            if existing_match and existing_match.status not in FINISHED_STATUSES:
                 for key, value in match_create.model_dump().items():
                     setattr(existing_match, key, value)
                 updated += 1
-            else:
+            elif not existing_match:
                 new_match = Match(**match_create.model_dump())
                 db.add(new_match)
                 inserted += 1
@@ -169,7 +171,7 @@ class FootballAPIService:
         # Filter only supported leagues
         filtered_fixtures = [
             f for f in all_fixtures 
-            if f.get("league", {}).get("id") in SUPPORTED_LEAGUES
+            if f.get("league", {}).get("id") in settings.SUPPORTED_LEAGUES
         ]
         
         if not filtered_fixtures:
@@ -181,8 +183,6 @@ class FootballAPIService:
     
     async def sync_live_matches(self, db: Session) -> dict:
         """ Sync live matches from API-Football /fixtures?live=all """
-        from app.models.match import Match
-        
         # Check if there are any live matches in database
         live_statuses = ["1H", "2H", "HT", "LIVE"]
         live_matches_count = db.query(Match).filter(Match.status.in_(live_statuses)).count()

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 from datetime import datetime, date, timedelta
@@ -6,12 +6,16 @@ from datetime import datetime, date, timedelta
 from app.db import get_db
 from app.models.match import Match
 from app.schemas.match import MatchResponse
-from app.services.football import football_service
+from app.services.football import football_service 
+from app.api.deps import api_key_security # Import the new API key dependency
 
 router = APIRouter(prefix="/matches", tags=["matches"])
 
 @router.get("/live_all", response_model=List[MatchResponse])
-def get_all_live_matches(db: Session = Depends(get_db)):
+def get_all_live_matches(
+    db: Session = Depends(get_db),
+    api_key: str = Depends(api_key_security) # Apply the API key dependency here
+):
     live_statuses = ["1H", "2H", "HT", "ET", "LIVE"]
     matches = db.query(Match).filter(
         Match.status.in_(live_statuses)
@@ -62,7 +66,7 @@ def get_all_matches(
     matches = query.offset(skip).limit(limit).all()
     return matches
 
-@router.post("/sync/season")
+@router.post("/sync/season", dependencies=[Depends(api_key_security)])
 async def sync_full_season(
     league_id: int = 39,
     season: int = 2026,
@@ -74,7 +78,7 @@ async def sync_full_season(
     result = await football_service.sync_full_season(db=db, league=league_id, season=season)
     return result
 
-@router.post("/sync/{date_val}")
+@router.post("/sync/{date_val}", dependencies=[Depends(api_key_security)])
 async def sync_daily_matches(
     date_val: date,
     db: Session = Depends(get_db)
