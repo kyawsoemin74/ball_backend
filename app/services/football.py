@@ -198,8 +198,17 @@ class FootballAPIService:
         fixtures = result.get("response", [])
         if not fixtures:
             return {"success": True, "message": "No live fixtures from API", "updated": 0}
+
+        # Filter only supported leagues for live matches as well
+        filtered_fixtures = [
+            f for f in fixtures 
+            if f.get("league", {}).get("id") in settings.SUPPORTED_LEAGUES
+        ]
+        
+        if not filtered_fixtures:
+            return {"success": True, "message": "No live matches for supported leagues", "updated": 0}
             
-        sync_result = self._process_sync(db, fixtures)
+        sync_result = self._process_sync(db, filtered_fixtures)
         logger.info(f"Live Sync: {sync_result}")
         return sync_result
     
