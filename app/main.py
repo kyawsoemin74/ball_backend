@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -28,9 +29,9 @@ app = FastAPI(
     description="Football data management API",
     version="1.0.0",
     lifespan=lifespan,
-    root_path="/api",
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
+    
+    docs_url=None,
+    redoc_url=None,
     openapi_url="/api/openapi.json"
 )
 
@@ -45,6 +46,16 @@ app.add_middleware(
 
 # Include routers
 app.include_router(matches_router, prefix="/api")
+
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=app.title + " - Swagger UI",
+        # CDN link များကို တိုက်ရိုက်ထည့်ပေးခြင်းဖြင့် Asset ပျောက်တာကို ဖြေရှင်းနိုင်သည်
+        swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js",
+        swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css",
+    )
 
 
 @app.get("/")
