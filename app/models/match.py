@@ -1,14 +1,16 @@
 from sqlalchemy import Column, Integer, String, DateTime, Text
+from sqlalchemy.orm import synonym
 from sqlalchemy.sql import func
 
-from app.db.database import Base
+from app.db import Base
 
 
 class Match(Base):
     __tablename__ = "matches"
 
     # Primary Key
-    fixture_id = Column(Integer, primary_key=True, index=True)
+    match_id = Column("fixture_id", Integer, primary_key=True, index=True)
+    fixture_id = synonym("match_id")
     
     # League Info
     league_id = Column(Integer, nullable=False, index=True)

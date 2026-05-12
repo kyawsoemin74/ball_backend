@@ -1,16 +1,28 @@
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.matches import router as matches_router
+from app.api.leagues import router as leagues_router
+from app.api.teams import router as teams_router
+from app.api.ads import router as ads_router
+from app.api.news import router as news_router
 from app.services.scheduler import live_scheduler
-from app.db.database import Base, engine
+from app.db import Base, engine
+
+# Import models to ensure they are registered with SQLAlchemy
+from app.models import match, league, team, standings, ad, news, odds
+
+logging.basicConfig(level=logging.INFO)
+# Create tables immediately when the app imports, including the odds table.
+Base.metadata.create_all(bind=engine)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables on startup (In production, use Alembic migrations)
+    # Create tables on startup as well to ensure schema exists.
     Base.metadata.create_all(bind=engine)
     
     # Startup: Start the live update scheduler
@@ -42,6 +54,10 @@ app.add_middleware(
 
 # Include routers
 app.include_router(matches_router, prefix="/api")
+app.include_router(leagues_router, prefix="/api/leagues", tags=["leagues"])
+app.include_router(teams_router, prefix="/api/teams", tags=["teams"])
+app.include_router(ads_router, prefix="/api/ads", tags=["ads"])
+app.include_router(news_router, prefix="/api/news", tags=["news"])
 
 @app.get("/docs", include_in_schema=False)
 async def custom_swagger_ui_html():

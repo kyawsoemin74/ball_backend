@@ -1,46 +1,29 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Path, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
+from app.api.deps import api_key_security
 from app.db import get_db
 from app.models.match import Match
 from app.schemas.match import MatchResponse
-from app.services.football import football_service 
-from app.api.deps import api_key_security
+from app.services.football import football_service, LIVE_STATUSES
 
 router = APIRouter(prefix="/matches", tags=["matches"])
 
 # --- GET Routes (Specific Routes First) ---
 
-@router.get("/live", response_model=List[MatchResponse])
+@router.get("/live_all", response_model=List[MatchResponse])
 def get_all_live_matches(
     db: Session = Depends(get_db),
     api_key: str = Depends(api_key_security)
 ):
     """
-    လက်ရှိ ကစားနေသော (Live) ပွဲစဉ်အားလုံးကို Database မှ ဆွဲယူရန်။
+    Return cached active live matches from the database.
+    Live data is kept fresh by the background scheduler polling every 2400 seconds (40 minutes).
     """
-    from app.services.live_update import LIVE_STATUSES
-    matches = db.query(Match).filter(Match.status.in_(LIVE_STATUSES)).all()
-    return matches
-
-@router.get("/date/{date_val}", response_model=List[MatchResponse])
-def get_matches_by_date(
-    date_val: date = Path(..., description="ရက်စွဲအလိုက် ပွဲစဉ်ရှာရန် (Format: YYYY-MM-DD)"),
-    db: Session = Depends(get_db)
-):
-    """
-    သတ်မှတ်ထားသော ရက်စွဲအလိုက် ပွဲစဉ်များကို ရယူရန်။
-    """
-    start_dt = datetime.combine(date_val, datetime.min.time())
-    end_dt = start_dt + timedelta(days=1)
-
-    matches = db.query(Match).filter(
-        Match.match_time >= start_dt,
-        Match.match_time < end_dt
-    ).all()
-    return matches
+    live_matches = db.query(Match).filter(Match.status.in_(LIVE_STATUSES)).all()
+    return live_matches
 
 @router.get("/", response_model=List[MatchResponse])
 def get_all_matches(
@@ -65,7 +48,7 @@ def get_all_matches(
 
 @router.get("/{match_id}", response_model=MatchResponse)
 def get_match_by_id(
-    match_id: int = Path(..., description="The unique fixture ID of the match", gt=0),
+    match_id: int = Path(..., description="The unique match ID of the match", gt=0),
     db: Session = Depends(get_db)
 ):
     """
@@ -73,13 +56,32 @@ def get_match_by_id(
     (Note: match_id သည် integer ဖြစ်ရပါမည်။)
     """
     match = db.query(Match).filter(
-        Match.fixture_id == match_id
+        Match.match_id == match_id
     ).first()
     
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
     
     return match
+
+@router.get("/date/{date_val}", response_model=List[MatchResponse])
+def get_matches_by_date(
+    date_val: date = Path(..., description="ရက်စွဲအလိုက် ပွဲစဉ်ရှာရန် (Format: YYYY-MM-DD)"),
+    db: Session = Depends(get_db)
+):
+    """
+    သတ်မှတ်ထားသော ရက်စွဲအလိုက် ပွဲစဉ်များကို ရယူရန်။
+    Myanmar Timezone (UTC+6:30) aware - returns matches for the full day in Myanmar time.
+    """
+    # Calculate start UTC: beginning of day in Myanmar time minus 6:30 hours
+    start_dt = (datetime.combine(date_val, datetime.min.time()) - timedelta(hours=6, minutes=30)).replace(tzinfo=timezone.utc)
+    end_dt = start_dt + timedelta(days=1)
+
+    matches = db.query(Match).filter(
+        Match.match_time >= start_dt,
+        Match.match_time < end_dt
+    ).all()
+    return matches
 
 @router.get("/{match_id}/events")
 async def get_match_events(match_id: int = Path(..., gt=0)):
@@ -112,13 +114,13 @@ async def get_match_h2h(match_id: int = Path(..., gt=0)):
     return result
 
 @router.get("/{match_id}/odds")
-async def get_match_odds(match_id: int = Path(..., gt=0)):
+async def get_match_odds(match_id: int = Path(..., gt=0), db: Session = Depends(get_db)):
     """
-    Get betting odds for a specific match.
+    Get betting odds for a specific match with smart caching (30-min rule, no API after match start).
     """
-    result = await football_service.get_match_odds(match_id)
-    if not result:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Odds not found")
+    result = await football_service.get_cached_odds(db, match_id)
+    if "error" in result:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["error"])
     return result
 
 # --- POST/Sync Routes (Grouped Together) ---

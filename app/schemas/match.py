@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 # Schema for creating a new match
 class MatchCreate(BaseModel):
     # Primary Key
-    fixture_id: int = Field(..., description="Unique fixture ID (Primary Key)")
+    match_id: int = Field(..., description="Unique match ID (Primary Key)")
     
     # League Info
     league_id: int = Field(..., description="League ID")
@@ -83,7 +83,7 @@ class MatchUpdate(BaseModel):
 # Schema for match response
 class MatchResponse(BaseModel):
     # Primary Key
-    fixture_id: int = Field(..., description="Unique fixture ID (Primary Key)")
+    match_id: int = Field(..., description="Unique match ID (Primary Key)")
     
     # League Info
     league_id: int = Field(..., description="League ID")
