@@ -3,3 +3,4 @@ from app.schemas.match import (
     MatchUpdate,
     MatchResponse,
 )
+from app.schemas.match_event import MatchEventResponse

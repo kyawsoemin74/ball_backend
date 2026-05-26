@@ -1,35 +1,34 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.middleware.cors import CORSMiddleware
 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import JSONResponse
+
+
+from app.core.config import settings
 from app.api.matches import router as matches_router
 from app.api.leagues import router as leagues_router
 from app.api.teams import router as teams_router
 from app.api.ads import router as ads_router
 from app.api.news import router as news_router
-from app.services.scheduler import live_scheduler
-from app.db import Base, engine
-
-# Import models to ensure they are registered with SQLAlchemy
-from app.models import match, league, team, standings, ad, news, odds
+from app.api.auth import router as auth_router
+from app.api.socket import router as socket_router
+from sqlalchemy import text
+from app.db import async_session, engine
+from app.admin import setup_admin
+from app.monitoring import MonitoringMiddleware, metrics_router, POSTGRES_UP, REDIS_UP
+from app.redis import sync_redis
+from app.services.socket_service import broker as redis_broker
 
 logging.basicConfig(level=logging.INFO)
-# Create tables immediately when the app imports, including the odds table.
-Base.metadata.create_all(bind=engine)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables on startup as well to ensure schema exists.
-    Base.metadata.create_all(bind=engine)
-    
-    # Startup: Start the live update scheduler
-    live_scheduler.start()
     yield
-    # Shutdown: Stop the live update scheduler
-    live_scheduler.stop()
 
 
 app = FastAPI(
@@ -37,8 +36,7 @@ app = FastAPI(
     description="Football data management API",
     version="1.0.0",
     lifespan=lifespan,
-    
-    docs_url=None,
+    docs_url="/docs",
     redoc_url=None,
     openapi_url="/api/openapi.json"
 )
@@ -52,23 +50,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Session Middleware (Required for SQLAdmin authentication)
+app.add_middleware(SessionMiddleware, secret_key=settings.JWT_SECRET_KEY)
+
+# Initialize Admin Panel
+setup_admin(app, engine)
+
+# Monitoring middleware and metrics
+app.add_middleware(MonitoringMiddleware)
+app.include_router(metrics_router)
+
+# WebSocket router
+app.include_router(socket_router)
+
 # Include routers
 app.include_router(matches_router, prefix="/api")
+app.include_router(auth_router, prefix="/api")
 app.include_router(leagues_router, prefix="/api/leagues", tags=["leagues"])
 app.include_router(teams_router, prefix="/api/teams", tags=["teams"])
 app.include_router(ads_router, prefix="/api/ads", tags=["ads"])
 app.include_router(news_router, prefix="/api/news", tags=["news"])
 
-@app.get("/docs", include_in_schema=False)
-async def custom_swagger_ui_html():
-    return get_swagger_ui_html(
-        openapi_url=app.openapi_url,
-        title=app.title + " - Swagger UI",
-        # CDN link များကို တိုက်ရိုက်ထည့်ပေးခြင်းဖြင့် Asset ပျောက်တာကို ဖြေရှင်းနိုင်သည်
-        swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js",
-        swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css",
-    )
 
+@app.on_event("startup")
+async def start_websocket_broker() -> None:
+    app.state.websocket_broker_task = asyncio.create_task(redis_broker.start())
+
+
+@app.on_event("shutdown")
+async def stop_websocket_broker() -> None:
+    if hasattr(app.state, "websocket_broker_task"):
+        await redis_broker.stop()
+        app.state.websocket_broker_task.cancel()
 
 @app.get("/")
 def root():
@@ -77,4 +90,41 @@ def root():
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    return {"status": "alive"}
+
+
+async def _check_postgres() -> bool:
+    async with async_session() as db:
+        try:
+            await db.execute(text("SELECT 1"))
+            POSTGRES_UP.set(1)
+            return True
+        except Exception:
+            POSTGRES_UP.set(0)
+            return False
+
+
+def _check_redis() -> bool:
+    try:
+        healthy = sync_redis.ping()
+        REDIS_UP.set(1 if healthy else 0)
+        return bool(healthy)
+    except Exception:
+        REDIS_UP.set(0)
+        return False
+
+
+@app.get("/health/live")
+def health_live():
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    postgres_ok = await _check_postgres()
+    redis_ok = _check_redis()
+    status = "ready" if postgres_ok and redis_ok else "unhealthy"
+    return JSONResponse(
+        status_code=200 if status == "ready" else 503,
+        content={"status": status, "postgres": postgres_ok, "redis": redis_ok},
+    )

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey
 from sqlalchemy.orm import synonym
 from sqlalchemy.sql import func
 
@@ -32,10 +32,12 @@ class Match(Base):
     
     # Home Team
     home_team = Column(String(255), nullable=False)
+    home_team_id = Column(Integer, ForeignKey("teams.team_id"), nullable=True)
     home_team_logo = Column(String(500), nullable=True)
     
     # Away Team
     away_team = Column(String(255), nullable=False)
+    away_team_id = Column(Integer, ForeignKey("teams.team_id"), nullable=True)
     away_team_logo = Column(String(500), nullable=True)
     
     # Scores

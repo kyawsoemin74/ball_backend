@@ -28,10 +28,12 @@ class MatchCreate(BaseModel):
     
     # Home Team
     home_team: str = Field(..., max_length=255, description="Home team name")
+    home_team_id: Optional[int] = Field(None, description="Home team ID")
     home_team_logo: Optional[str] = Field(None, max_length=500, description="Home team logo URL")
     
     # Away Team
     away_team: str = Field(..., max_length=255, description="Away team name")
+    away_team_id: Optional[int] = Field(None, description="Away team ID")
     away_team_logo: Optional[str] = Field(None, max_length=500, description="Away team logo URL")
     
     # Scores
@@ -65,10 +67,12 @@ class MatchUpdate(BaseModel):
     
     # Home Team
     home_team: Optional[str] = Field(None, max_length=255, description="Home team name")
+    home_team_id: Optional[int] = Field(None, description="Home team ID")
     home_team_logo: Optional[str] = Field(None, max_length=500, description="Home team logo URL")
     
     # Away Team
     away_team: Optional[str] = Field(None, max_length=255, description="Away team name")
+    away_team_id: Optional[int] = Field(None, description="Away team ID")
     away_team_logo: Optional[str] = Field(None, max_length=500, description="Away team logo URL")
     
     # Scores
@@ -105,10 +109,12 @@ class MatchResponse(BaseModel):
     
     # Home Team
     home_team: str = Field(..., description="Home team name")
+    home_team_id: Optional[int] = Field(None, description="Home team ID")
     home_team_logo: Optional[str] = Field(None, description="Home team logo URL")
     
     # Away Team
     away_team: str = Field(..., description="Away team name")
+    away_team_id: Optional[int] = Field(None, description="Away team ID")
     away_team_logo: Optional[str] = Field(None, description="Away team logo URL")
     
     # Scores

@@ -1,7 +1,8 @@
 """
 Dependencies for API routes.
 """
-from app.core.security import get_api_key
+from app.core.security import get_current_active_admin, get_current_active_user
 
-# Re-export the API key security dependency for easier import in routes
-api_key_security = get_api_key
+current_active_user = get_current_active_user
+current_active_admin = get_current_active_admin
+api_key_security = get_current_active_user

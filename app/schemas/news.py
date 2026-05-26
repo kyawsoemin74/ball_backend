@@ -1,12 +1,14 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
 from datetime import datetime
+from app.models.news import NewsCategory
 
 
 class NewsBase(BaseModel):
     title: str
     content: str
-    category: str
+    category: NewsCategory
+    image_url: Optional[str] = None
 
 
 class NewsCreate(NewsBase):
@@ -19,8 +21,7 @@ class News(NewsBase):
     created_at: datetime
     updated_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class NewsPagination(BaseModel):

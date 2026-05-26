@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fover-backend
+  namespace: fover-backend
+  labels:
+    app: fover-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: fover-backend
+  template:
+    metadata:
+      labels:
+        app: fover-backend
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/your-org/fover-backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: fover-backend-secrets
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: fover-backend-secrets
+                  key: REDIS_URL
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fover-backend-secrets
+                  key: JWT_SECRET_KEY
+            - name: FOOTBALL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fover-backend-secrets
+                  key: FOOTBALL_API_KEY
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: fover-backend-secrets
+                  key: API_KEY
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+          envFrom:
+            - secretRef:
+                name: fover-backend-secrets

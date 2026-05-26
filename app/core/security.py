@@ -1,22 +1,45 @@
-from fastapi import HTTPException, Security, status
-from fastapi.security import APIKeyHeader
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
+from app.db import get_db
+from app.models.user import User
+from app.monitoring import JWT_FAILURES
+from app.services.token import TokenService
 
-# Define the API key header. The client must send 'X-API-KEY' in the header.
-# auto_error=True means FastAPI will automatically raise a 403 if the header is missing.
-api_key_header = APIKeyHeader(name="X-API-KEY", auto_error=True)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+token_service = TokenService()
 
-async def get_api_key(api_key: str = Security(api_key_header)):
-    """
-    Dependency function to validate the API key provided in the request header.
-    If the API key is missing or incorrect, it raises a 403 Forbidden exception.
-    """
-    # Compare the provided API key with the one configured in settings
-    if api_key == settings.API_KEY:
-        return api_key
-    else:
+
+async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)) -> User:
+    payload = token_service.decode_token(token, expected_type="access")
+    username = payload["sub"]
+    result = await db.execute(select(User).where(User.username == username))
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active:
+        JWT_FAILURES.inc()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+
+
+def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
+    if not current_user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Could not validate credentials",
+            detail="Inactive user",
         )
+    return current_user
+
+
+def get_current_active_admin(current_user: User = Depends(get_current_active_user)) -> User:
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The user does not have sufficient privileges",
+        )
+    return current_user
