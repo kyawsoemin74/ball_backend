@@ -13,6 +13,8 @@ command.stamp(cfg, "0001_initial")
 
 # ၂။ ပြီးမှ users table ဆောက်ဖို့ အတင်း Upgrade ပြန်လုပ်ခိုင်းမယ် (Force Upgrade)
 print("Upgrading to head (Creating users table)...")
+# အတင်းနောက်ပြန်မဆုတ်ဘဲ လက်ရှိရှိနေတဲ့ အခြေအနေကနေ ရှေ့ကိုပဲ သွားတာ ပိုကောင်းပါတယ်
+print("Upgrading to latest migration head...")
 command.upgrade(cfg, "head")
 
 print("Done! Check your database now.")

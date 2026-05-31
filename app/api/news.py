@@ -33,3 +33,30 @@ async def get_news(
     db: AsyncSession = Depends(get_db)
 ):
     return await get_news_by_tab_logic(tab, limit, offset, db)
+
+@router.get("/latest", response_model=NewsResponse)
+async def get_latest_news(
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get latest news specifically"""
+    return await get_news_by_tab_logic("latest", limit, offset, db)
+
+@router.get("/transfers", response_model=NewsResponse)
+async def get_transfer_news(
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get transfer news specifically"""
+    return await get_news_by_tab_logic("transfers", limit, offset, db)
+
+@router.get("/tips", response_model=NewsResponse)
+async def get_betting_tips(
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get football tips specifically"""
+    return await get_news_by_tab_logic("tips", limit, offset, db)

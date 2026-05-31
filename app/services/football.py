@@ -19,7 +19,7 @@ from app.models.match_event import MatchEvent
 from app.schemas.match import MatchCreate
 from app.schemas.league import LeagueCreate
 from app.schemas.team import TeamCreate
-from app.schemas.standing import StandingCreate
+from app.schemas.standing import StandingCreate, StandingResponse
 from app.cache import cache_get_json, cache_set_json, cache_delete, cache_delete_sync, make_cache_key
 from app.core.config import settings
 
@@ -268,7 +268,7 @@ class FootballAPIService:
     async def _process_sync(self, db: AsyncSession, fixtures: list) -> dict:
         """
         Simplified upsert logic for matches only. 
-        Removed team dependency checking and side effects (notifications/sockets).
+        Ensures teams exist to satisfy Foreign Key constraints.
         """
         parsed_matches = []
         for fixture_raw in fixtures:
@@ -280,6 +280,24 @@ class FootballAPIService:
         
         if not parsed_matches:
             return {"success": True, "inserted": 0, "updated": 0, "total": 0}
+
+        # 1. Ensure all teams in matches exist in DB to satisfy FK constraints
+        needed_teams = {}
+        for m in parsed_matches:
+            if m.home_team_id and m.home_team_id not in needed_teams:
+                needed_teams[m.home_team_id] = {"name": m.home_team, "logo": m.home_team_logo}
+            if m.away_team_id and m.away_team_id not in needed_teams:
+                needed_teams[m.away_team_id] = {"name": m.away_team, "logo": m.away_team_logo}
+
+        if needed_teams:
+            t_result = await db.execute(select(Team.team_id).where(Team.team_id.in_(list(needed_teams.keys()))))
+            existing_tids = {r[0] for r in t_result.all()}
+            
+            for tid, info in needed_teams.items():
+                if tid not in existing_tids:
+                    db.add(Team(team_id=tid, name=info["name"], logo=info["logo"]))
+            
+            await db.flush() # Sync teams to DB state before processing matches
 
         match_ids = [m.match_id for m in parsed_matches]
         result = await db.execute(select(Match).where(Match.match_id.in_(match_ids)))
@@ -590,8 +608,11 @@ class FootballAPIService:
                 time_elapsed=e.get("time", {}).get("elapsed"),
                 time_extra=e.get("time", {}).get("extra"),
                 team_id=e.get("team", {}).get("id"),
+                team_name=e.get("team", {}).get("name"),
                 player_id=e.get("player", {}).get("id"),
                 player_name=e.get("player", {}).get("name"),
+                assist_id=e.get("assist", {}).get("id"),
+                assist_name=e.get("assist", {}).get("name"),
                 type=e.get("type"),
                 detail=e.get("detail"),
                 comments=e.get("comments")
@@ -633,8 +654,11 @@ class FootballAPIService:
                         "time_elapsed": e.time_elapsed,
                         "time_extra": e.time_extra,
                         "team_id": e.team_id,
+                        "team_name": e.team_name,
                         "player_id": e.player_id,
                         "player_name": e.player_name,
+                        "assist_id": e.assist_id,
+                        "assist_name": e.assist_name,
                         "type": e.type,
                         "detail": e.detail,
                         "comments": e.comments
@@ -652,12 +676,16 @@ class FootballAPIService:
         payload = []
         for e in api_events:
             payload.append({
+                "id": None,
                 "match_id": match_id,
                 "time_elapsed": e.get("time", {}).get("elapsed"),
                 "time_extra": e.get("time", {}).get("extra"),
                 "team_id": e.get("team", {}).get("id"),
+                "team_name": e.get("team", {}).get("name"),
                 "player_id": e.get("player", {}).get("id"),
                 "player_name": e.get("player", {}).get("name"),
+                "assist_id": e.get("assist", {}).get("id"),
+                "assist_name": e.get("assist", {}).get("name"),
                 "type": e.get("type"),
                 "detail": e.get("detail"),
                 "comments": e.get("comments")
@@ -908,22 +936,122 @@ class FootballAPIService:
         await db.commit()
 
         for standing in standings_data:
+            goals_for = standing.get("all", {}).get("goals", {}).get("for", 0)
+            goals_against = standing.get("all", {}).get("goals", {}).get("against", 0)
             new_standing = Standings(
                 league_id=league_id,
-                season=int(season),
+                season=str(season),
                 team_id=standing["team"]["id"],
+                position=standing["rank"],
                 team_name=standing["team"]["name"],
                 team_logo=standing["team"]["logo"],
-                rank=standing["rank"],
                 points=standing["points"],
                 played=standing["all"]["played"],
-                win=standing["all"]["win"],
-                draw=standing["all"]["draw"],
-                lose=standing["all"]["lose"],
-                goals_diff=standing["goalsDiff"]
+                won=standing["all"]["win"],
+                drawn=standing["all"]["draw"],
+                lost=standing["all"]["lose"],
+                goals_for=goals_for,
+                goals_against=goals_against,
+                goal_difference=standing.get("goalsDiff", goals_for - goals_against)
             )
             db.add(new_standing)
         await db.commit()
         cache_delete_sync(make_cache_key("standings", league_id, season))
+
+    async def get_cached_standings(self, db: AsyncSession, match_id: int) -> Optional[list]:
+        """Cache-first retrieval of standings for a match's league and season.
+
+        Flow:
+        - Load match -> get league_id and season (derive from match_time if not present)
+        - Check Redis cache
+        - Check DB standings rows
+          - If present and fresh (based on REDIS_TTL_STANDINGS), return DB
+          - If present but stale, try refresh from API, update DB, return new data
+        - If not present, fetch from API, upsert, return data
+        """
+        # 1. Get match
+        res = await db.execute(select(Match).where(Match.match_id == match_id))
+        match = res.scalar_one_or_none()
+        if not match:
+            return None
+
+        league_id = match.league_id
+        # derive season from match if no explicit season attribute
+        season = getattr(match, "season", None)
+        if not season:
+            try:
+                season = match.match_time.year
+            except Exception:
+                season = datetime.now(timezone.utc).year
+
+        cache_key = make_cache_key("standings", league_id, season)
+        cached = await cache_get_json(cache_key)
+        if cached is not None:
+            return cached
+
+        # 2. Check DB for existing standings
+        standings_result = await db.execute(
+            select(Standings)
+            .where(Standings.league_id == league_id, Standings.season == str(season))
+            .order_by(Standings.position)
+        )
+        standings_rows = standings_result.scalars().all()
+
+        now = datetime.now(timezone.utc)
+        ttl_seconds = int(settings.REDIS_TTL_STANDINGS)
+
+        if standings_rows:
+            # Determine latest update time
+            latest_update = max((s.updated_at for s in standings_rows if s.updated_at), default=None)
+            if latest_update and (now - latest_update) < timedelta(seconds=ttl_seconds):
+                payload = [StandingResponse.model_validate(s).model_dump(mode="json") for s in standings_rows]
+                await cache_set_json(cache_key, payload, settings.REDIS_TTL_STANDINGS)
+                return payload
+
+            # stale -> try refresh from API
+            api_res = await self.get_league_standings(league_id, int(season))
+            if api_res and "response" in api_res and api_res["response"]:
+                try:
+                    standings_data = api_res["response"][0]["league"]["standings"][0]
+                    await self.upsert_standings(db, standings_data, league_id, str(season))
+                    # read fresh rows
+                    refreshed = await db.execute(
+                        select(Standings)
+                        .where(Standings.league_id == league_id, Standings.season == str(season))
+                        .order_by(Standings.position)
+                    )
+                    rows = refreshed.scalars().all()
+                    payload = [StandingResponse.model_validate(s).model_dump(mode="json") for s in rows]
+                    await cache_set_json(cache_key, payload, settings.REDIS_TTL_STANDINGS)
+                    return payload
+                except Exception as e:
+                    logger.error(f"Error refreshing standings for league {league_id} season {season}: {e}")
+
+            # API failed or parse error: return stale DB rows
+            payload = [StandingResponse.model_validate(s).model_dump(mode="json") for s in standings_rows]
+            await cache_set_json(cache_key, payload, settings.REDIS_TTL_STANDINGS)
+            return payload
+
+        # 3. No DB rows -> fetch from API
+        api_res = await self.get_league_standings(league_id, int(season))
+        if not api_res or "response" not in api_res or not api_res["response"]:
+            return None
+
+        try:
+            standings_data = api_res["response"][0]["league"]["standings"][0]
+            await self.upsert_standings(db, standings_data, league_id, str(season))
+            # read rows
+            new_result = await db.execute(
+                select(Standings)
+                .where(Standings.league_id == league_id, Standings.season == str(season))
+                .order_by(Standings.position)
+            )
+            rows = new_result.scalars().all()
+            payload = [StandingResponse.model_validate(s).model_dump(mode="json") for s in rows]
+            await cache_set_json(cache_key, payload, settings.REDIS_TTL_STANDINGS)
+            return payload
+        except Exception as e:
+            logger.error(f"Error fetching/upserting standings for league {league_id} season {season}: {e}")
+            return None
 
 football_service = FootballAPIService()

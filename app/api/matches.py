@@ -125,6 +125,20 @@ async def get_match_lineup(
     return result
 
 
+@router.get("/{match_id}/standing")
+async def get_match_standing(
+    match_id: int = Path(..., gt=0),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get standings for the match's league and season using cache-first strategy.
+    """
+    result = await football_service.get_cached_standings(db, match_id)
+    if not result:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Standings not found")
+    return result
+
+
 @router.get("/h2h/{match_id}/{team1_id}/{team2_id}")
 async def get_match_h2h_symmetric(
     match_id: int = Path(..., gt=0),

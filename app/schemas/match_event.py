@@ -20,5 +20,9 @@ class MatchEventBase(BaseModel):
     comments: Optional[str] = None
 
 class MatchEventResponse(MatchEventBase):
-    id: int
+    # `id` is optional because events returned directly from the
+    # external API do not include a database primary key until
+    # they are persisted. Making this optional allows the same
+    # response model to validate both DB objects and raw API events.
+    id: Optional[int] = None
     model_config = ConfigDict(from_attributes=True)

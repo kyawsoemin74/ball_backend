@@ -8,8 +8,5 @@ class MatchLineup(Base):
     id = Column(Integer, primary_key=True, index=True)
     # fixture_id from API-Sports
     match_id = Column(Integer, ForeignKey("matches.fixture_id"), unique=True, index=True, nullable=False)
-    # Add home/away foreign keys referencing teams.team_id
-    home_team_id = Column(Integer, ForeignKey("teams.team_id"), nullable=True, index=True)
-    away_team_id = Column(Integer, ForeignKey("teams.team_id"), nullable=True, index=True)
     data = Column(JSON, nullable=False)  # Stores the full response from the API
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

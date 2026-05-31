@@ -58,7 +58,7 @@ async def get_league_standings(league_id: int, season: str = "2023", db: AsyncSe
     existing_result = await db.execute(
         select(Standings).where(
             Standings.league_id == league_id,
-            Standings.season == int(season)
+            Standings.season == str(season)
         )
     )
     existing = existing_result.scalar_one_or_none()
@@ -77,9 +77,9 @@ async def get_league_standings(league_id: int, season: str = "2023", db: AsyncSe
         select(Standings)
         .where(
             Standings.league_id == league_id,
-            Standings.season == int(season)
+            Standings.season == str(season)
         )
-        .order_by(Standings.rank)
+        .order_by(Standings.position)
     )
     standings = standings_result.scalars().all()
     
