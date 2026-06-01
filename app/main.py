@@ -19,16 +19,33 @@ from app.api.socket import router as socket_router
 from sqlalchemy import text
 from app.db import async_session, engine
 from app.admin import setup_admin
-from app.monitoring import MonitoringMiddleware, metrics_router, POSTGRES_UP, REDIS_UP
+from app.monitoring import MonitoringMiddleware, metrics_router, POSTGRES_UP, REDIS_UP, start_worker_metrics_server
 from app.redis import sync_redis
+from app.services.notification import notification_worker
 from app.services.socket_service import broker as redis_broker
+from scheduler_service import start_scheduler, stop_scheduler
 
 logging.basicConfig(level=logging.INFO)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
+    # Start auxiliary background services with the FastAPI application lifecycle.
+    start_worker_metrics_server(8001)
+    start_scheduler()
+    app.state.notification_worker_task = asyncio.create_task(notification_worker.start())
+
+    try:
+        yield
+    finally:
+        await notification_worker.stop()
+        if hasattr(app.state, "notification_worker_task"):
+            app.state.notification_worker_task.cancel()
+            try:
+                await app.state.notification_worker_task
+            except asyncio.CancelledError:
+                pass
+        stop_scheduler()
 
 
 app = FastAPI(
