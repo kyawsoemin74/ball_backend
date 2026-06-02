@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     FOOTBALL_API_KEY: str
 
     # Supported leagues for daily sync (example: Premier League, La Liga, Serie A)
-    SUPPORTED_LEAGUES: list[int] = [39, 140, 135, 186, 128, 344, 71, 242, 233, 268, 17, 
+    SUPPORTED_LEAGUES: list[int] = [1,2,3,4,10,39, 140, 135, 186, 128, 344, 71, 242, 233, 268, 17, 
     18,    # AFC Cup
     292,   # Saudi Pro League
     307,   # UAE Pro League
@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     332,   # South Korea K League 1
     333,   # Australia A-League
     334,   # Myanmar National League
+    529      #Club Friendlies
     
 ] 
     
