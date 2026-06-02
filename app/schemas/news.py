@@ -34,3 +34,13 @@ class NewsResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class NewsDetailResponse(BaseModel):
+    success: bool = True
+    data: News
+
+
+class ErrorResponse(BaseModel):
+    success: bool = False
+    message: str

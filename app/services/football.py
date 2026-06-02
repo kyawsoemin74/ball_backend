@@ -344,23 +344,16 @@ class FootballAPIService:
         return sync_result
 
     async def sync_daily_fixtures(self, db: AsyncSession, target_date: str) -> dict:
-        """ နေ့စဉ်ပွဲစဉ်များကို sync လုပ်ခြင်း (Filter by SUPPORTED_LEAGUES) """
+        """ နေ့စဉ်ပွဲစဉ်များကို sync လုပ်ခြင်း """
         result = await self.get_fixtures_by_date(target_date)
         if not result or "response" not in result:
             return {"success": False, "message": "API error"}
             
-        all_fixtures = result.get("response", [])
-        
-        # Filter only supported leagues
-        filtered_fixtures = [
-            f for f in all_fixtures 
-            if f.get("league", {}).get("id") in settings.SUPPORTED_LEAGUES
-        ]
-        
-        if not filtered_fixtures:
-            return {"success": True, "message": "No matches for supported leagues today", "updated": 0}
+        fixtures = result.get("response", [])
+        if not fixtures:
+            return {"success": True, "message": "No matches for today", "updated": 0}
             
-        sync_result = await self._process_sync(db, filtered_fixtures)
+        sync_result = await self._process_sync(db, fixtures)
         logger.info(f"Daily Sync for {target_date}: {sync_result}")
         return sync_result
     
@@ -381,12 +374,12 @@ class FootballAPIService:
         # before our last sync cycle could update it to 'FT'.
         api_live_ids = {f["fixture"]["id"] for f in fixtures if f.get("fixture") and f["fixture"].get("id")}
         
-        # Look for matches in DB that are marked as LIVE but missing from API's live feed.
-        # We check matches scheduled to start within the last 24 hours to handle missed updates.
+        # Look for matches in DB that are currently live but missing from API's live feed.
+        # This avoids rechecking pre-match statuses like NS/TBD/PST, which should not trigger stale sync.
         stale_threshold = datetime.now(timezone.utc) - timedelta(hours=24)
         
         stale_query = select(Match).where(
-            Match.status.notin_(FINISHED_STATUSES),
+            Match.status.in_(LIVE_STATUSES),
             Match.match_time >= stale_threshold
         )
         if api_live_ids:
@@ -410,15 +403,10 @@ class FootballAPIService:
             except Exception as e:
                 logger.error(f"Failed to fetch updates for stale matches: {e}")
 
-        filtered_fixtures = [
-            f for f in fixtures 
-            if f.get("league", {}).get("id") in settings.SUPPORTED_LEAGUES
-        ]
-        
-        if not filtered_fixtures:
-            return {"success": True, "message": "No live matches for supported leagues", "updated": 0}
+        if not fixtures:
+            return {"success": True, "message": "No live matches", "updated": 0}
             
-        sync_result = await self._process_sync(db, filtered_fixtures)
+        sync_result = await self._process_sync(db, fixtures)
         logger.info(f"Live Sync: {sync_result}")
         return sync_result
     
@@ -499,77 +487,49 @@ class FootballAPIService:
             return None
 
     async def get_cached_h2h(self, db: AsyncSession, team1_id: int, team2_id: int, match_id: int) -> Optional[dict]:
-        """
-        Symmetric H2H caching strategy with time-based window logic.
-        """
-        # 1. Symmetric Key Generation
+        """Get head-to-head data on demand: cache -> DB -> API -> DB -> cache."""
         ids = sorted([team1_id, team2_id])
         h2h_key = f"{ids[0]}-{ids[1]}"
-        redis_key = f"match:h2h:{h2h_key}"
+        cache_key = make_cache_key("match", "h2h", h2h_key)
 
-        # 2. Match Details for timing
+        cached = await cache_get_json(cache_key)
+        if cached is not None:
+            return cached
+
         res = await db.execute(select(Match).where(Match.match_id == match_id))
         match = res.scalar_one_or_none()
         if not match:
             return None
 
-        now = datetime.now(timezone.utc)
-        match_time = match.match_time if match.match_time.tzinfo else match.match_time.replace(tzinfo=timezone.utc)
-        time_to_kickoff = match_time - now
-        
-        # Determine Window
-        is_window_1 = time_to_kickoff > timedelta(hours=24)
-
-        # 3. Apply Strategic Logic
-        
-        # WINDOW 2: Check Redis Cache (if within 24h or live/finished)
-        if not is_window_1:
-            cached = await cache_get_json(redis_key)
-            if cached is not None:
-                return cached
-
-        # Check Database (Both windows use DB on cache miss/bypass)
         res = await db.execute(select(MatchH2H).where(MatchH2H.h2h_key == h2h_key))
         db_record = res.scalar_one_or_none()
-
         if db_record:
-            if not is_window_1:
-                await cache_set_json(redis_key, db_record.data, 86400) # 24h TTL
+            await cache_set_json(cache_key, db_record.data, 86400)
             return db_record.data
 
-        # Cache Miss / DB Miss: Fetch from API
         endpoint = f"{self.base_url}/fixtures/headtohead"
         params = {"h2h": h2h_key}
-        
+
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(endpoint, headers=self.headers, params=params)
                 response.raise_for_status()
                 api_data = response.json()
-                
+
                 if not api_data or "response" not in api_data:
                     return None
-                
-                h2h_data = api_data["response"]
 
-                # Upsert to DB
-                res = await db.execute(select(MatchH2H).where(MatchH2H.h2h_key == h2h_key))
-                existing = res.scalar_one_or_none()
-                
-                if existing:
-                    existing.data = h2h_data
+                h2h_data = api_data["response"]
+                existing = await db.execute(select(MatchH2H).where(MatchH2H.h2h_key == h2h_key))
+                existing_record = existing.scalar_one_or_none()
+                if existing_record:
+                    existing_record.data = h2h_data
                 else:
-                    new_h2h = MatchH2H(h2h_key=h2h_key, data=h2h_data)
-                    db.add(new_h2h)
-                
+                    db.add(MatchH2H(h2h_key=h2h_key, data=h2h_data))
                 await db.commit()
 
-                # Cache if in Window 2
-                if not is_window_1:
-                    await cache_set_json(redis_key, h2h_data, 86400)
-                
+                await cache_set_json(cache_key, h2h_data, 86400)
                 return h2h_data
-
         except Exception as e:
             logger.error(f"Error fetching symmetric H2H for {h2h_key}: {e}")
             return None
@@ -691,13 +651,28 @@ class FootballAPIService:
                 "comments": e.get("comments")
             })
 
-        if match.status in LIVE_STATUSES:
-            await cache_set_json(cache_key, payload, 120)  # Short TTL for live
-        elif match.status in FINISHED_STATUSES:
-            # Trigger sync background if finished but missing from DB
-            asyncio.create_task(self.sync_match_events(db, match_id))
-            await cache_set_json(cache_key, payload, settings.REDIS_TTL_STANDINGS)
+        # Persist fetched events on-demand
+        await db.execute(delete(MatchEvent).where(MatchEvent.match_id == match_id))
+        for e in api_events:
+            new_event = MatchEvent(
+                match_id=match_id,
+                time_elapsed=e.get("time", {}).get("elapsed"),
+                time_extra=e.get("time", {}).get("extra"),
+                team_id=e.get("team", {}).get("id"),
+                team_name=e.get("team", {}).get("name"),
+                player_id=e.get("player", {}).get("id"),
+                player_name=e.get("player", {}).get("name"),
+                assist_id=e.get("assist", {}).get("id"),
+                assist_name=e.get("assist", {}).get("name"),
+                type=e.get("type"),
+                detail=e.get("detail"),
+                comments=e.get("comments")
+            )
+            db.add(new_event)
+        await db.commit()
 
+        ttl = 120 if match.status in LIVE_STATUSES else settings.REDIS_TTL_STANDINGS
+        await cache_set_json(cache_key, payload, ttl)
         return payload
 
     async def get_cached_odds(self, db: AsyncSession, fixture_id: int) -> dict:

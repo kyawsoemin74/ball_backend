@@ -7,7 +7,7 @@ from sqlalchemy import select, func
 from app.db import async_session
 from app.models.match import Match
 from app.monitoring import SCHEDULER_JOB_ERRORS, SCHEDULER_JOB_RUNS
-from app.services.football import football_service, FINISHED_STATUSES
+from app.services.football import football_service, FINISHED_STATUSES, LIVE_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,17 @@ class LiveUpdateScheduler:
             name="Daily Fixtures Sync",
             max_instances=1
         )
+
+        self.scheduler.add_job(
+            self._repair_daily_matches_job,
+            trigger=CronTrigger(
+                    hour=2,
+                    minute=0,
+                    timezone=MM_TZ),
+            id="repair_daily_matches",
+            name="Daily Repair Matches Sync",
+            max_instances=1
+        )
         
         self.scheduler.start()
         self.is_running = True
@@ -63,7 +74,7 @@ class LiveUpdateScheduler:
             .select_from(Match)
             .where(Match.match_time <= future_threshold)
             .where(Match.match_time >= past_threshold)
-            .where(Match.status.notin_(FINISHED_STATUSES))
+            .where(Match.status.in_(LIVE_STATUSES))
         )
         count = result.scalar_one()
         logger.debug(f"Live sync check found {count} upcoming/non-finished matches")
@@ -102,6 +113,28 @@ class LiveUpdateScheduler:
         except Exception as e:
             SCHEDULER_JOB_ERRORS.labels(job="sync_daily_fixtures").inc()
             logger.error(f"Error in daily sync job: {e}")
+
+    async def _repair_daily_matches_job(self):
+        """Job function to repair live/stuck matches by re-syncing yesterday and today."""
+        try:
+            today = datetime.now().date()
+            yesterday = today - timedelta(days=1)
+            yesterday_str = yesterday.strftime("%Y-%m-%d")
+            today_str = today.strftime("%Y-%m-%d")
+
+            async with async_session() as db:
+                logger.info(f"Starting daily repair sync for {yesterday_str} and {today_str}")
+
+                result_yesterday = await football_service.sync_daily_fixtures(db, yesterday_str)
+                logger.info(f"Daily repair sync for {yesterday_str} completed: {result_yesterday}")
+
+                result_today = await football_service.sync_daily_fixtures(db, today_str)
+                logger.info(f"Daily repair sync for {today_str} completed: {result_today}")
+
+                SCHEDULER_JOB_RUNS.labels(job="repair_daily_matches").inc()
+        except Exception as e:
+            SCHEDULER_JOB_ERRORS.labels(job="repair_daily_matches").inc()
+            logger.error(f"Error in daily repair sync job: {e}")
 
 # Global scheduler instance
 live_scheduler = LiveUpdateScheduler()

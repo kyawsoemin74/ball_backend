@@ -1,6 +1,6 @@
 from sqlalchemy import desc, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List
+from typing import List, Optional
 
 from app.models.news import News
 from app.schemas.news import NewsCreate, NewsPagination
@@ -31,3 +31,8 @@ async def create_news(db: AsyncSession, news: NewsCreate) -> News:
     await db.commit()
     await db.refresh(db_news)
     return db_news
+
+
+async def get_news_by_id(db: AsyncSession, news_id: int) -> Optional[News]:
+    result = await db.execute(select(News).where(News.id == news_id))
+    return result.scalar_one_or_none()
