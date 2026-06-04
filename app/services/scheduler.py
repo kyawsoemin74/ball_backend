@@ -89,6 +89,7 @@ class LiveUpdateScheduler:
                     return
 
                 result = await football_service.sync_live_matches(db)
+                await db.commit()
                 SCHEDULER_JOB_RUNS.labels(job="sync_live_matches").inc()
                 if result.get("success"):
                     if result.get("updated", 0) > 0:
@@ -108,6 +109,7 @@ class LiveUpdateScheduler:
             async with async_session() as db:
                 logger.info(f"Starting automatic daily sync for {today}")
                 result = await football_service.sync_daily_fixtures(db, today)
+                await db.commit()
                 SCHEDULER_JOB_RUNS.labels(job="sync_daily_fixtures").inc()
                 logger.info(f"Automatic daily sync completed: {result}")
         except Exception as e:
@@ -126,9 +128,11 @@ class LiveUpdateScheduler:
                 logger.info(f"Starting daily repair sync for {yesterday_str} and {today_str}")
 
                 result_yesterday = await football_service.sync_daily_fixtures(db, yesterday_str)
+                await db.commit()
                 logger.info(f"Daily repair sync for {yesterday_str} completed: {result_yesterday}")
 
                 result_today = await football_service.sync_daily_fixtures(db, today_str)
+                await db.commit()
                 logger.info(f"Daily repair sync for {today_str} completed: {result_today}")
 
                 SCHEDULER_JOB_RUNS.labels(job="repair_daily_matches").inc()

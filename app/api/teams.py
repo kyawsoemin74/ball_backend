@@ -37,6 +37,7 @@ async def get_team_details(team_id: int, db: AsyncSession = Depends(get_db)):
 
     team_data = result["response"][0]
     upserted_team = await football_service.upsert_team(db, team_data)
+    await db.commit()
     logger.info(f"Team {team_id} fetched from API and cached")
     payload = TeamSchema.from_orm(upserted_team).dict()
     await cache_set_json(cache_key, payload, settings.REDIS_TTL_LEAGUE_TEAM)

@@ -40,6 +40,7 @@ async def get_league_details(league_id: int, db: AsyncSession = Depends(get_db))
 
     league_data = result["response"][0]
     upserted_league = await football_service.upsert_league(db, league_data)
+    await db.commit()
     logger.info(f"League {league_id} fetched from API and cached")
     payload = LeagueSchema.from_orm(upserted_league).dict()
     await cache_set_json(cache_key, payload, settings.REDIS_TTL_LEAGUE_TEAM)
@@ -62,7 +63,9 @@ async def sync_all_leagues(
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
     """Admin-only sync for all leagues from API-Football."""
-    return await football_service.sync_all_leagues(db=db)
+    result = await football_service.sync_all_leagues(db=db)
+    await db.commit()
+    return result
 
 
 @router.post("/sync/standings/{league_id}", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
@@ -72,4 +75,6 @@ async def sync_league_standings(
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
     """Explicitly sync standings for a league and season from API-Sports"""
-    return await football_service.sync_standings(db=db, league_id=league_id, season=season)
+    result = await football_service.sync_standings(db=db, league_id=league_id, season=season)
+    await db.commit()
+    return result

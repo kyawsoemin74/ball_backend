@@ -163,7 +163,9 @@ async def sync_match_events(
     """
     Finalized ဖြစ်သွားသော ပွဲစဉ်အတွက် Events များကို API မှ ဆွဲယူပြီး Database တွင် သိမ်းဆည်းရန်။
     """
-    return await football_service.sync_match_events(db=db, match_id=match_id)
+    result = await football_service.sync_match_events(db=db, match_id=match_id)
+    await db.commit()
+    return result
 
 
 @router.post("/sync/season", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
@@ -175,7 +177,9 @@ async def sync_full_season(
     """
     သတ်မှတ်ထားသော League နှင့် Season တစ်ခုလုံးအတွက် ပွဲစဉ်များကို Sync လုပ်ရန်။
     """
-    return await football_service.sync_full_season(db=db, league=league_id, season=season)
+    result = await football_service.sync_full_season(db=db, league=league_id, season=season)
+    await db.commit()
+    return result
 
 
 @router.post("/sync/{date_val}", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
@@ -186,4 +190,6 @@ async def sync_daily_matches(
     """
     သတ်မှတ်ထားသော ရက်စဉ်အတွက် ပွဲစဉ်များကို API မှ ဆွဲယူပြီး Database တွင် သိမ်းဆည်းရန်။
     """
-    return await football_service.sync_daily_fixtures(db=db, target_date=date_val.isoformat())
+    result = await football_service.sync_daily_fixtures(db=db, target_date=date_val.isoformat())
+    await db.commit()
+    return result
