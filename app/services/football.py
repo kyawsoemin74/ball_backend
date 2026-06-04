@@ -265,6 +265,74 @@ class FootballAPIService:
             logger.error(f"Parsing error for Fixture ID {fixture.get('fixture', {}).get('id')}: {e}")
             return None
 
+    async def ensure_teams_exist(self, db: AsyncSession, teams_data: list[dict]) -> dict:
+        """Ensure referenced teams exist in the database with a single read + bulk insert flow."""
+        if not teams_data:
+            return {"created": 0, "existing": 0, "total": 0}
+
+        normalized_teams = []
+        seen_team_ids = set()
+
+        for item in teams_data:
+            if not isinstance(item, dict):
+                logger.warning("Skipping invalid team payload: %r", item)
+                continue
+
+            team_id = item.get("team_id") if "team_id" in item else item.get("id")
+            name = item.get("name")
+
+            if team_id is None:
+                logger.warning("Skipping team payload without team_id: %r", item)
+                continue
+
+            if not name:
+                logger.warning("Skipping team payload without name for team_id=%s", team_id)
+                continue
+
+            if team_id in seen_team_ids:
+                logger.warning("Skipping duplicate team_id=%s in request payload", team_id)
+                continue
+
+            seen_team_ids.add(team_id)
+            normalized_teams.append({
+                "team_id": int(team_id),
+                "name": str(name),
+                "country": item.get("country"),
+                "logo": item.get("logo"),
+                "stadium": item.get("stadium"),
+                "founded": item.get("founded"),
+            })
+
+        if not normalized_teams:
+            return {"created": 0, "existing": 0, "total": 0}
+
+        team_ids = [team["team_id"] for team in normalized_teams]
+        existing_result = await db.execute(select(Team).where(Team.team_id.in_(team_ids)))
+        existing_ids = {row.team_id for row in existing_result.scalars().all()}
+
+        missing_teams = [team for team in normalized_teams if team["team_id"] not in existing_ids]
+
+        if missing_teams:
+            db.add_all([
+                Team(
+                    team_id=team["team_id"],
+                    name=team["name"],
+                    country=team.get("country"),
+                    logo=team.get("logo"),
+                    stadium=team.get("stadium"),
+                    founded=team.get("founded"),
+                )
+                for team in missing_teams
+            ])
+            await db.flush()
+
+        created = len(missing_teams)
+        existing = len(normalized_teams) - created
+
+        logger.info("ensure_teams_exist: created=%s, existing=%s", created, existing)
+
+        return {"created": created, "existing": existing, "total": len(normalized_teams)}
+
     async def _process_sync(self, db: AsyncSession, fixtures: list) -> dict:
         """
         Simplified upsert logic for matches only. 
@@ -290,14 +358,11 @@ class FootballAPIService:
                 needed_teams[m.away_team_id] = {"name": m.away_team, "logo": m.away_team_logo}
 
         if needed_teams:
-            t_result = await db.execute(select(Team.team_id).where(Team.team_id.in_(list(needed_teams.keys()))))
-            existing_tids = {r[0] for r in t_result.all()}
-            
-            for tid, info in needed_teams.items():
-                if tid not in existing_tids:
-                    db.add(Team(team_id=tid, name=info["name"], logo=info["logo"]))
-            
-            await db.flush() # Sync teams to DB state before processing matches
+            team_payload = [
+                {"team_id": tid, "name": info["name"], "logo": info["logo"]}
+                for tid, info in needed_teams.items()
+            ]
+            await self.ensure_teams_exist(db, team_payload)
 
         match_ids = [m.match_id for m in parsed_matches]
         result = await db.execute(select(Match).where(Match.match_id.in_(match_ids)))
@@ -787,7 +852,7 @@ class FootballAPIService:
         return result
 
     async def get_league_details(self, league_id: int) -> Optional[dict]:
-        """ Get league details """
+        """Get a single league by API-Football id."""
         endpoint = f"{self.base_url}/leagues"
         params = {"id": league_id}
 
@@ -798,7 +863,20 @@ class FootballAPIService:
                 data = response.json()
                 return data
         except Exception as e:
-            logger.error(f"Error fetching league {league_id}: {e}")
+            logger.error("Error fetching league %s: %s", league_id, e)
+            return None
+
+    async def get_all_leagues(self) -> Optional[dict]:
+        """Fetch all leagues from API-Football."""
+        endpoint = f"{self.base_url}/leagues"
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(endpoint, headers=self.headers)
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            logger.error("Error fetching all leagues: %s", e)
             return None
 
     async def get_team_details(self, team_id: int) -> Optional[dict]:
@@ -831,32 +909,58 @@ class FootballAPIService:
             logger.error(f"Error fetching standings for league {league_id} season {season}: {e}")
             return None
 
-    async def upsert_league(self, db: AsyncSession, league_data: dict) -> League:
-        """ Upsert league """
-        league_id = league_data["league"]["id"]
+    async def upsert_league(self, db: AsyncSession, league_data: dict, commit: bool = True) -> League:
+        """Upsert a league record with robust country/season parsing and optional batch commits."""
+        league_payload = league_data.get("league") or league_data
+        league_id = league_payload.get("id")
+        if league_id is None:
+            raise ValueError("League payload is missing the id field")
+
+        country_payload = league_data.get("country") or {}
+        if isinstance(country_payload, dict):
+            country_name = country_payload.get("name") or country_payload.get("country")
+        else:
+            country_name = country_payload
+
+        season_payload = league_data.get("seasons") or []
+        season_value = None
+        if isinstance(season_payload, list) and season_payload:
+            first_season = season_payload[0]
+            if isinstance(first_season, dict):
+                season_value = first_season.get("year") or first_season.get("season")
+            else:
+                season_value = first_season
+
         result = await db.execute(select(League).where(League.league_id == league_id))
         existing = result.scalar_one_or_none()
+
         if existing:
-            for key, value in league_data["league"].items():
-                # Only update attributes that exist on the model and are not primary keys
-                if hasattr(existing, key) and key != "league_id":
-                    setattr(existing, key, value)
-            await db.commit()
+            existing.name = league_payload.get("name", existing.name)
+            existing.country = country_name or existing.country
+            existing.logo = league_payload.get("logo", existing.logo)
+            existing.season = str(season_value) if season_value is not None else existing.season
+            if commit:
+                await db.commit()
+            else:
+                await db.flush()
             cache_delete_sync(make_cache_key("league", league_id))
             return existing
-        else:
-            new_league = League(
-                # Ensure league_id is explicitly set for new records
-                league_id=league_id, 
-                name=league_data["league"]["name"],
-                country=league_data["league"]["country"],
-                logo=league_data["league"]["logo"],
-                season=league_data["seasons"][0]["year"] if league_data.get("seasons") else None
-            )
-            db.add(new_league)
+
+        new_league = League(
+            league_id=league_id,
+            name=league_payload.get("name"),
+            country=country_name,
+            logo=league_payload.get("logo"),
+            season=str(season_value) if season_value is not None else None,
+        )
+        db.add(new_league)
+        if commit:
             await db.commit()
             await db.refresh(new_league)
-            return new_league
+        else:
+            await db.flush()
+        cache_delete_sync(make_cache_key("league", league_id))
+        return new_league
 
     async def upsert_team(self, db: AsyncSession, team_data: dict) -> Team:
         """ Upsert team """
@@ -887,8 +991,55 @@ class FootballAPIService:
             await db.refresh(new_team)
             return new_team
 
+    async def sync_all_leagues(self, db: AsyncSession) -> dict:
+        """Synchronize all leagues from API-Football into the local database."""
+        logger.info("League sync started")
+
+        result = await self.get_all_leagues()
+        if not result or "response" not in result:
+            logger.warning("League sync aborted: no response from API-Football")
+            return {"success": False, "message": "No leagues data found from API"}
+
+        leagues = result.get("response", [])
+        inserted = 0
+        updated = 0
+
+        for league_data in leagues:
+            league_payload = league_data.get("league") or league_data
+            league_id = league_payload.get("id")
+            if league_id is None:
+                logger.warning("Skipping invalid league payload: %s", league_data)
+                continue
+
+            existing = await db.execute(select(League).where(League.league_id == league_id))
+            is_new = existing.scalar_one_or_none() is None
+
+            await self.upsert_league(db, league_data, commit=False)
+            if is_new:
+                inserted += 1
+            else:
+                updated += 1
+
+            cache_delete_sync(make_cache_key("league", league_id))
+
+        await db.commit()
+        logger.info("League sync completed")
+        logger.info("League sync result: inserted=%s, updated=%s", inserted, updated)
+
+        return {
+            "success": True,
+            "inserted": inserted,
+            "updated": updated,
+            "total": len(leagues),
+        }
+
     async def sync_standings(self, db: AsyncSession, league_id: int, season: int) -> dict:
-        """ Fetch standings from API and sync to DB """
+        """Fetch standings from API and sync to DB."""
+        league_result = await self.get_league_details(league_id)
+        if league_result and "response" in league_result and league_result["response"]:
+            await self.upsert_league(db, league_result["response"][0], commit=False)
+            await db.commit()
+
         result = await self.get_league_standings(league_id, season)
         if not result or "response" not in result or not result["response"]:
             return {"success": False, "message": "No standings data found from API"}
@@ -903,12 +1054,38 @@ class FootballAPIService:
             return {"success": False, "message": "Unexpected API response format"}
 
     async def upsert_standings(self, db: AsyncSession, standings_data: list, league_id: int, season: str):
-        """ Upsert standings """
+        """Upsert standings after ensuring all referenced teams exist."""
+        team_payload = []
+        for standing in standings_data:
+            team = standing.get("team") or {}
+            if not isinstance(team, dict):
+                logger.warning("Skipping standings row with invalid team payload: %r", standing)
+                continue
+
+            team_id = team.get("id")
+            if team_id is None:
+                logger.warning("Skipping standings row with missing team_id: %r", standing)
+                continue
+
+            if not team.get("name"):
+                logger.warning("Skipping standings row with missing team name for team_id=%s", team_id)
+                continue
+
+            team_payload.append({
+                "team_id": int(team_id),
+                "name": team.get("name"),
+                "logo": team.get("logo"),
+                "country": team.get("country"),
+            })
+
+        team_result = await self.ensure_teams_exist(db, team_payload)
+        logger.info("Standings sync ensured %s teams before insert", team_result["total"])
+
         await db.execute(delete(Standings).where(
             Standings.league_id == league_id,
             Standings.season == season
         ))
-        await db.commit()
+        await db.flush()
 
         for standing in standings_data:
             goals_for = standing.get("all", {}).get("goals", {}).get("for", 0)
@@ -933,38 +1110,21 @@ class FootballAPIService:
         await db.commit()
         cache_delete_sync(make_cache_key("standings", league_id, season))
 
-    async def get_cached_standings(self, db: AsyncSession, match_id: int) -> Optional[list]:
-        """Cache-first retrieval of standings for a match's league and season.
+    async def get_cached_standings(self, db: AsyncSession, league_id: int, season: int | str) -> Optional[list]:
+        """Cache-first retrieval of standings for a league and season.
 
         Flow:
-        - Load match -> get league_id and season (derive from match_time if not present)
         - Check Redis cache
         - Check DB standings rows
-          - If present and fresh (based on REDIS_TTL_STANDINGS), return DB
-          - If present but stale, try refresh from API, update DB, return new data
-        - If not present, fetch from API, upsert, return data
+          - If present and fresh, return DB
+          - If present but stale, refresh from API and return fresh data
+        - If no DB rows, fetch from API, upsert, return data
         """
-        # 1. Get match
-        res = await db.execute(select(Match).where(Match.match_id == match_id))
-        match = res.scalar_one_or_none()
-        if not match:
-            return None
-
-        league_id = match.league_id
-        # derive season from match if no explicit season attribute
-        season = getattr(match, "season", None)
-        if not season:
-            try:
-                season = match.match_time.year
-            except Exception:
-                season = datetime.now(timezone.utc).year
-
         cache_key = make_cache_key("standings", league_id, season)
         cached = await cache_get_json(cache_key)
         if cached is not None:
             return cached
 
-        # 2. Check DB for existing standings
         standings_result = await db.execute(
             select(Standings)
             .where(Standings.league_id == league_id, Standings.season == str(season))
@@ -976,20 +1136,17 @@ class FootballAPIService:
         ttl_seconds = int(settings.REDIS_TTL_STANDINGS)
 
         if standings_rows:
-            # Determine latest update time
             latest_update = max((s.updated_at for s in standings_rows if s.updated_at), default=None)
             if latest_update and (now - latest_update) < timedelta(seconds=ttl_seconds):
                 payload = [StandingResponse.model_validate(s).model_dump(mode="json") for s in standings_rows]
                 await cache_set_json(cache_key, payload, settings.REDIS_TTL_STANDINGS)
                 return payload
 
-            # stale -> try refresh from API
             api_res = await self.get_league_standings(league_id, int(season))
             if api_res and "response" in api_res and api_res["response"]:
                 try:
                     standings_data = api_res["response"][0]["league"]["standings"][0]
                     await self.upsert_standings(db, standings_data, league_id, str(season))
-                    # read fresh rows
                     refreshed = await db.execute(
                         select(Standings)
                         .where(Standings.league_id == league_id, Standings.season == str(season))
@@ -1002,12 +1159,10 @@ class FootballAPIService:
                 except Exception as e:
                     logger.error(f"Error refreshing standings for league {league_id} season {season}: {e}")
 
-            # API failed or parse error: return stale DB rows
             payload = [StandingResponse.model_validate(s).model_dump(mode="json") for s in standings_rows]
             await cache_set_json(cache_key, payload, settings.REDIS_TTL_STANDINGS)
             return payload
 
-        # 3. No DB rows -> fetch from API
         api_res = await self.get_league_standings(league_id, int(season))
         if not api_res or "response" not in api_res or not api_res["response"]:
             return None
@@ -1015,7 +1170,6 @@ class FootballAPIService:
         try:
             standings_data = api_res["response"][0]["league"]["standings"][0]
             await self.upsert_standings(db, standings_data, league_id, str(season))
-            # read rows
             new_result = await db.execute(
                 select(Standings)
                 .where(Standings.league_id == league_id, Standings.season == str(season))

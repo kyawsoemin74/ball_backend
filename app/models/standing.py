@@ -9,6 +9,8 @@ class Standings(Base):
     league_id = Column(Integer, index=True, nullable=False)
     season = Column(String(10), nullable=False)
     team_id = Column(Integer, nullable=False)
+    team_name = Column(String(255), nullable=True)
+    team_logo = Column(String(1024), nullable=True)
     position = Column(Integer, nullable=False)
     points = Column(Integer, nullable=False)
     played = Column(Integer, nullable=False)
@@ -20,7 +22,8 @@ class Standings(Base):
     goal_difference = Column(Integer, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
-        DateTime(timezone=True), 
-        server_default=func.now(), 
-        onupdate=func.now()
+    DateTime(timezone=True),
+    server_default=func.now(),
+    onupdate=func.now(),
+    nullable=False
     )

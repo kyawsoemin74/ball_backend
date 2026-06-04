@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
@@ -9,7 +9,6 @@ from app.cache import cache_get_json, cache_set_json, make_cache_key
 from app.core.config import settings
 from app.db import get_db
 from app.models.league import League
-from app.models.standing import Standings
 from app.schemas.league import League as LeagueSchema
 from app.schemas.standing import StandingResponse
 from app.services.football import football_service
@@ -46,46 +45,25 @@ async def get_league_details(league_id: int, db: AsyncSession = Depends(get_db))
     await cache_set_json(cache_key, payload, settings.REDIS_TTL_LEAGUE_TEAM)
     return payload
 
-@router.get("/{league_id}/standing", response_model=List[StandingResponse])
-async def get_league_standings(league_id: int, season: str = "2023", db: AsyncSession = Depends(get_db)):
-    """Get league standings, ensuring fresh data"""
-    cache_key = make_cache_key("standings", league_id, season)
-    cached = await cache_get_json(cache_key)
-    if cached is not None:
-        return cached
+@router.get("/{league_id}/standing/{season}", response_model=List[StandingResponse])
+async def get_league_standings(
+    league_id: int,
+    season: int = Path(..., description="The season year"),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get league standings, ensuring fresh data."""
+    result = await football_service.get_cached_standings(db, league_id, season)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Standings not found")
+    return result
 
-    # Check if we have recent standings
-    existing_result = await db.execute(
-        select(Standings).where(
-            Standings.league_id == league_id,
-            Standings.season == str(season)
-        )
-    )
-    existing = existing_result.scalar_one_or_none()
+@router.post("/sync", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
+async def sync_all_leagues(
+    db: AsyncSession = Depends(get_db)
+) -> Dict[str, Any]:
+    """Admin-only sync for all leagues from API-Football."""
+    return await football_service.sync_all_leagues(db=db)
 
-    if not existing:
-        # Fetch from API
-        result = await football_service.get_league_standings(league_id, int(season))
-        if not result or "response" not in result or not result["response"]:
-            raise HTTPException(status_code=404, detail="Standings not found")
-
-        standings_data = result["response"][0]["league"]["standings"][0]  # Assuming single group
-        await football_service.upsert_standings(db, standings_data, league_id, season)
-        logger.info(f"Standings for league {league_id} season {season} fetched from API and cached")
-
-    standings_result = await db.execute(
-        select(Standings)
-        .where(
-            Standings.league_id == league_id,
-            Standings.season == str(season)
-        )
-        .order_by(Standings.position)
-    )
-    standings = standings_result.scalars().all()
-    
-    payload = [StandingResponse.model_validate(s).model_dump(mode="json") for s in standings]
-    await cache_set_json(cache_key, payload, settings.REDIS_TTL_STANDINGS)
-    return standings
 
 @router.post("/sync/standings/{league_id}", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
 async def sync_league_standings(
