@@ -28,6 +28,7 @@ class MatchRepository:
             .order_by(
                 League.is_featured.desc(),
                 League.display_order.asc(),
+                League.country.asc(),
                 League.name.asc(),
                 Match.match_time.asc(),
                 Match.match_id.asc(),
@@ -42,9 +43,9 @@ class MatchRepository:
             key=lambda match: (
                 0 if bool(getattr(getattr(match, "league_obj", None), "is_featured", False)) else 1,
                 int(getattr(getattr(match, "league_obj", None), "display_order", 999) or 999),
+                str(getattr(getattr(match, "league_obj", None), "country", "")).lower(),
                 str(getattr(getattr(match, "league_obj", None), "name", "")).lower(),
                 getattr(match, "match_time", None) or datetime.min.replace(tzinfo=timezone.utc),
-                int(getattr(match, "match_id", 0) or 0),
             ),
         )
 
