@@ -9,12 +9,31 @@ from app.cache import cache_get_json, cache_set_json, make_cache_key
 from app.core.config import settings
 from app.db import get_db
 from app.models.league import League
-from app.schemas.league import League as LeagueSchema
+from app.schemas.league import League as LeagueSchema, LeagueGroupResponse
 from app.schemas.standing import StandingResponse
 from app.services.football import football_service
+from app.services.league_grouping_service import LeagueGroupingService
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+@router.get("/grouped", response_model=List[LeagueGroupResponse])
+async def get_grouped_leagues(db: AsyncSession = Depends(get_db)):
+    """Return leagues in a frontend-friendly, ordered, grouped structure."""
+    cache_key = make_cache_key("leagues_grouped")
+    cached = await cache_get_json(cache_key)
+    if cached is not None:
+        return cached
+
+    result = await db.execute(
+        select(League)
+        .order_by(League.is_featured.desc(), League.display_order.asc(), League.name.asc())
+    )
+    leagues = result.scalars().all()
+    payload = LeagueGroupingService().build_groups(leagues)
+    await cache_set_json(cache_key, payload, settings.REDIS_TTL_LEAGUE_TEAM)
+    return payload
 
 @router.get("/{league_id}", response_model=LeagueSchema)
 async def get_league_details(league_id: int, db: AsyncSession = Depends(get_db)):

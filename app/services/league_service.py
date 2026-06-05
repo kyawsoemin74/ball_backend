@@ -50,6 +50,10 @@ class LeagueService:
             existing.country = country_name or existing.country
             existing.logo = league_payload.get("logo", existing.logo)
             existing.season = str(season_value) if season_value is not None else existing.season
+            if "is_featured" in league_payload:
+                existing.is_featured = bool(league_payload.get("is_featured", existing.is_featured))
+            if "display_order" in league_payload:
+                existing.display_order = int(league_payload.get("display_order", existing.display_order))
             await db.flush()
             self.cache_service.delete_sync(make_cache_key("league", league_id))
             return existing
@@ -60,6 +64,8 @@ class LeagueService:
             country=country_name,
             logo=league_payload.get("logo"),
             season=str(season_value) if season_value is not None else None,
+            is_featured=bool(league_payload.get("is_featured", False)),
+            display_order=int(league_payload.get("display_order", 999)),
         )
         db.add(new_league)
         await db.flush()

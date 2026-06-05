@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.routing import NoMatchFound
 
+from app.db import get_db
 from app.main import app
 
 client = TestClient(app)
@@ -27,6 +28,66 @@ def test_league_standings_new_path_exists():
 def test_league_sync_route_exists():
     path = app.url_path_for("sync_all_leagues")
     assert path == "/api/leagues/sync"
+
+
+def test_grouped_leagues_route_exists():
+    path = app.url_path_for("get_grouped_leagues")
+    assert path == "/api/leagues/grouped"
+
+
+def test_home_route_exists():
+    path = app.url_path_for("get_home")
+    assert path == "/api/home"
+
+
+def test_home_endpoint_returns_payload(monkeypatch):
+    expected = {
+        "live_today": [{"league_id": 1, "name": "Live League", "country": "England", "logo": None, "season": "2024", "is_featured": False, "display_order": 1}],
+        "featured": [{"league_id": 2, "name": "Featured League", "country": "Spain", "logo": None, "season": "2024", "is_featured": True, "display_order": 2}],
+        "countries": [{"type": "country", "country": "England", "leagues": []}],
+    }
+
+    async def fake_get_home_payload(self, db):
+        return expected
+
+    monkeypatch.setattr("app.api.home.HomeService.get_home_payload", fake_get_home_payload)
+
+    response = client.get("/api/home")
+
+    assert response.status_code == 200
+    assert response.json() == expected
+
+
+def test_matches_date_endpoint_uses_ordered_repository_results(monkeypatch):
+    from app.api import matches as matches_api
+
+    ordered_matches = [
+        {"match_id": 2, "league_id": 2, "league_name": "Ordered League", "country_name": "Test", "match_time": "2026-06-05T18:00:00+00:00", "status": "NS", "home_team": "A", "away_team": "B", "home_score": 0, "away_score": 0},
+    ]
+
+    async def fake_get_matches_by_date(self, db, date_val):
+        return []
+
+    def fake_order_matches_for_date(matches):
+        return ordered_matches
+
+    monkeypatch.setattr(matches_api.MatchRepository, "get_matches_by_date", fake_get_matches_by_date)
+    monkeypatch.setattr(matches_api.MatchRepository, "order_matches_for_date", staticmethod(fake_order_matches_for_date))
+
+    async def override_get_db():
+        yield object()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        response = client.get("/api/matches/date/2026-06-05")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["match_id"] == 2
+    assert payload[0]["league_name"] == "Ordered League"
 
 
 def test_old_match_standing_route_removed():

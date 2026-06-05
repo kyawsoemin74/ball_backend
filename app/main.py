@@ -11,6 +11,7 @@ from starlette.responses import JSONResponse
 from app.core.config import settings
 from app.api.matches import router as matches_router
 from app.api.leagues import router as leagues_router
+from app.api.home import router as home_router
 from app.api.teams import router as teams_router
 from app.api.ads import router as ads_router
 from app.api.news import router as news_router
@@ -83,6 +84,7 @@ app.include_router(socket_router)
 # Include routers
 app.include_router(matches_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
+app.include_router(home_router, prefix="/api", tags=["home"])
 app.include_router(leagues_router, prefix="/api/leagues", tags=["leagues"])
 app.include_router(teams_router, prefix="/api/teams", tags=["teams"])
 app.include_router(ads_router, prefix="/api/ads", tags=["ads"])

@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey
-from sqlalchemy.orm import synonym
+from sqlalchemy.orm import relationship, synonym
 from sqlalchemy.sql import func
 
 from app.db import Base
@@ -13,7 +13,7 @@ class Match(Base):
     fixture_id = synonym("match_id")
     
     # League Info
-    league_id = Column(Integer, nullable=False, index=True)
+    league_id = Column(Integer, ForeignKey("leagues.league_id"), nullable=False, index=True)
     league_name = Column(String(255), nullable=True)
     league_logo = Column(String(500), nullable=True)
     
@@ -47,6 +47,8 @@ class Match(Base):
     # Venue
     venue_name = Column(String(255), nullable=True)
     venue_city = Column(String(255), nullable=True)
+
+    league_obj = relationship("League", foreign_keys=[league_id], back_populates="matches")
     
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())

@@ -1,11 +1,6 @@
-"""remove_unique_constraint_from_teams_name
-Revision ID: d8a7f6e5d4c3
-Revises: bafc6e79386f
-Create Date: 2026-06-04 00:00:00.000000+00:00
-"""
-
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import text
 
 # revision identifiers, used by Alembic.
 revision = 'd8a7f6e5d4c3'
@@ -15,7 +10,16 @@ depends_on = None
 
 
 def upgrade():
-    op.drop_constraint('teams_name_key', 'teams', type_='unique')
+    conn = op.get_bind()
+
+    result = conn.execute(text("""
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'teams_name_key'
+    """))
+
+    if result.fetchone():
+        op.drop_constraint('teams_name_key', 'teams', type_='unique')
 
 
 def downgrade():

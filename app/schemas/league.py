@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
 
 
@@ -9,6 +9,8 @@ class LeagueBase(BaseModel):
     country: Optional[str] = None
     logo: Optional[str] = None
     season: Optional[str] = None
+    is_featured: bool = False
+    display_order: int = 999
 
 
 class LeagueCreate(LeagueBase):
@@ -21,3 +23,10 @@ class League(LeagueBase):
 
     class Config:
         from_attributes = True
+
+
+class LeagueGroupResponse(BaseModel):
+    type: str
+    title: Optional[str] = None
+    country: Optional[str] = None
+    leagues: List[LeagueBase]

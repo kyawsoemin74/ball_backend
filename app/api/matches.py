@@ -9,6 +9,7 @@ from app.cache import cache_get_json, cache_set_json, make_cache_key
 from app.core.config import settings
 from app.db import get_db
 from app.models.match import Match
+from app.repositories.match_repository import MatchRepository
 from app.schemas.match_event import MatchEventResponse
 from app.schemas.match import MatchResponse
 from app.services.football import football_service, LIVE_STATUSES
@@ -85,16 +86,8 @@ async def get_matches_by_date(
     သတ်မှတ်ထားသော ရက်စွဲအလိုက် ပွဲစဉ်များကို ရယူရန်။
     Myanmar Timezone (UTC+6:30) aware - returns matches for the full day in Myanmar time.
     """
-    # Calculate start UTC: beginning of day in Myanmar time minus 6:30 hours
-    start_dt = (datetime.combine(date_val, datetime.min.time()) - timedelta(hours=6, minutes=30)).replace(tzinfo=timezone.utc)
-    end_dt = start_dt + timedelta(days=1)
-
-    result = await db.execute(
-        select(Match)
-        .where(Match.match_time >= start_dt)
-        .where(Match.match_time < end_dt)
-    )
-    return result.scalars().all()
+    matches = await MatchRepository().get_matches_by_date(db, date_val)
+    return MatchRepository.order_matches_for_date(matches)
 
 
 @router.get("/{match_id}/events", response_model=List[MatchEventResponse])
