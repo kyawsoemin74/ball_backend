@@ -50,7 +50,9 @@ class MatchRepository:
         )
 
     async def get_live_stale(self, db: AsyncSession, live_ids: set[int], stale_threshold) -> list[Match]:
-        query = select(Match).where(Match.status.in_("1H", "2H", "HT", "ET", "LIVE", "BT", "P"), Match.match_time >= stale_threshold)
+        from app.services.football import LIVE_STATUSES
+
+        query = select(Match).where(Match.status.in_(LIVE_STATUSES), Match.match_time >= stale_threshold)
         if live_ids:
             query = query.where(Match.match_id.not_in(list(live_ids)))
         result = await db.execute(query)
