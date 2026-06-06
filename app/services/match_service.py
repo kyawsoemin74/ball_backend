@@ -147,14 +147,48 @@ class MatchService:
         api_live_ids = {item["fixture"]["id"] for item in fixtures if item.get("fixture") and item["fixture"].get("id")}
         stale_threshold = datetime.now(timezone.utc) - timedelta(hours=24)
         stale_matches = await self.match_repository.get_live_stale(db, api_live_ids, stale_threshold)
+        logger.debug("get_live_stale returned %d stale matches", len(stale_matches))
+        for match in stale_matches[:20]:
+            logger.debug("fixture_id=%s status=%s match_time=%s", match.match_id, getattr(match, "status", None), getattr(match, "match_time", None))
 
         if stale_matches:
             stale_ids = [str(match.match_id) for match in stale_matches]
             logger.info("Syncing %d stale matches that are no longer in live feed", len(stale_ids))
             try:
-                stale_resp = await self.client.get("/fixtures", params={"ids": "-".join(stale_ids)})
-                if stale_resp and stale_resp.get("response"):
-                    fixtures.extend(stale_resp["response"])
+                stale_chunks = [stale_ids[i : i + 20] for i in range(0, len(stale_ids), 20)]
+                total_chunks = len(stale_chunks)
+                stale_api_fixtures = []
+
+                for chunk_index, chunk in enumerate(stale_chunks, start=1):
+                    logger.info("Fetching stale chunk %s/%s (%s ids)", chunk_index, total_chunks, len(chunk))
+                    stale_resp = await self.client.get("/fixtures", params={"ids": "-".join(chunk)})
+                    chunk_response = stale_resp.get("response", []) if isinstance(stale_resp, dict) else []
+                    logger.info("Chunk returned %s fixtures", len(chunk_response))
+
+                    print("STALE_RESULTS =", stale_resp.get("results"))
+                    print("STALE_ERRORS =", stale_resp.get("errors"))
+                    print("STALE_RESPONSE_LEN =", len(chunk_response))
+                    if chunk_response:
+                        first = chunk_response[0]
+                        print("FIRST_FIXTURE_ID =", first.get("fixture", {}).get("id"))
+                        print("FIRST_STATUS =", first.get("fixture", {}).get("status", {}).get("short"))
+                        print("FIRST_ELAPSED =", first.get("fixture", {}).get("status", {}).get("elapsed"))
+                    print(f"STALE_API_COUNT={len(chunk_response)}")
+
+                    stale_api_fixtures.extend(chunk_response)
+
+                if stale_api_fixtures:
+                    logger.info("total_stale_api_fixtures=%d", len(stale_api_fixtures))
+                    for fixture in stale_api_fixtures:
+                        fixture_info = fixture.get("fixture", {})
+                        status_info = fixture_info.get("status", {})
+                        logger.info(
+                            "fixture_id=%s api_status=%s elapsed=%s",
+                            fixture_info.get("id"),
+                            status_info.get("short"),
+                            status_info.get("elapsed"),
+                        )
+                    fixtures.extend(stale_api_fixtures)
             except Exception as exc:
                 logger.error("Failed to fetch updates for stale matches: %s", exc)
 
