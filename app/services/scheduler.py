@@ -66,19 +66,37 @@ class LiveUpdateScheduler:
             
     async def _should_sync_live_matches(self, db) -> bool:
         now = datetime.now(timezone.utc)
-        future_threshold = now + timedelta(minutes=5)
         past_threshold = now - timedelta(hours=24)
+        kickoff_start = now - timedelta(minutes=10)
+        kickoff_end = now + timedelta(minutes=10)
 
-        result = await db.execute(
+        live_result = await db.execute(
             select(func.count())
             .select_from(Match)
-            .where(Match.match_time <= future_threshold)
             .where(Match.match_time >= past_threshold)
             .where(Match.status.in_(LIVE_STATUSES))
         )
-        count = result.scalar_one()
-        logger.debug(f"Live sync check found {count} upcoming/non-finished matches")
-        return count > 0
+        live_match_count = live_result.scalar_one()
+
+        kickoff_result = await db.execute(
+            select(func.count())
+            .select_from(Match)
+            .where(Match.match_time >= kickoff_start)
+            .where(Match.match_time <= kickoff_end)
+        )
+        kickoff_window_count = kickoff_result.scalar_one()
+
+        should_sync = live_match_count > 0 or kickoff_window_count > 0
+
+        logger.info(
+            "Live sync gate evaluated",
+            extra={
+                "live_match_count": live_match_count,
+                "kickoff_window_count": kickoff_window_count,
+                "should_sync": should_sync,
+            },
+        )
+        return should_sync
 
     async def _sync_live_matches_job(self):
         """Job function to sync live matches"""
