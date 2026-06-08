@@ -11,6 +11,7 @@ class League(Base):
     league_id = Column(Integer, primary_key=True, index=True)
     name = Column(String(255), nullable=False)
     country = Column(String(255), nullable=True)
+    country_code = Column(String(20), nullable=True)
     logo = Column(String(500), nullable=True)
     season = Column(String(10), nullable=True)  # e.g., "2023"
     is_featured = Column(Boolean, nullable=False, server_default='false')

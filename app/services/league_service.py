@@ -30,11 +30,13 @@ class LeagueService:
         if league_id is None:
             raise ValueError("League payload is missing the id field")
 
-        country_payload = league_data.get("country") or {}
+        country_payload = league_data.get("country")
         if isinstance(country_payload, dict):
             country_name = country_payload.get("name") or country_payload.get("country")
+            country_code = country_payload.get("code")
         else:
-            country_name = country_payload
+            country_name = country_payload or league_payload.get("country")
+            country_code = None
 
         season_value = None
         for season in league_data.get("seasons") or []:
@@ -48,6 +50,7 @@ class LeagueService:
         if existing:
             existing.name = league_payload.get("name", existing.name)
             existing.country = country_name or existing.country
+            existing.country_code = country_code or existing.country_code
             existing.logo = league_payload.get("logo", existing.logo)
             existing.season = str(season_value) if season_value is not None else existing.season
             if "is_featured" in league_payload:
@@ -62,6 +65,7 @@ class LeagueService:
             league_id=league_id,
             name=league_payload.get("name"),
             country=country_name,
+            country_code=country_code,
             logo=league_payload.get("logo"),
             season=str(season_value) if season_value is not None else None,
             is_featured=bool(league_payload.get("is_featured", False)),

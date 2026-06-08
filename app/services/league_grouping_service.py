@@ -42,6 +42,7 @@ class LeagueGroupingService:
             "league_id": league.league_id,
             "name": league.name,
             "country": league.country,
+            "country_code": getattr(league, "country_code", None),
             "logo": league.logo,
             "season": league.season,
             "is_featured": bool(getattr(league, "is_featured", False)),

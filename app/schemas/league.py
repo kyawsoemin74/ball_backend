@@ -7,6 +7,7 @@ class LeagueBase(BaseModel):
     league_id: int
     name: str
     country: Optional[str] = None
+    country_code: Optional[str] = None
     logo: Optional[str] = None
     season: Optional[str] = None
     is_featured: bool = False

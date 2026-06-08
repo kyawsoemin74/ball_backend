@@ -66,9 +66,9 @@ def test_home_service_groups_non_featured_countries():
 
     assert payload["countries"] == [
         {"type": "country", "country": "England", "leagues": [
-            {"league_id": 2, "name": "League One", "country": "England", "logo": None, "season": "2024", "is_featured": False, "display_order": 2},
+            {"league_id": 2, "name": "League One", "country": "England", "country_code": None, "logo": None, "season": "2024", "is_featured": False, "display_order": 2},
         ]},
         {"type": "country", "country": "Germany", "leagues": [
-            {"league_id": 3, "name": "Bundesliga", "country": "Germany", "logo": None, "season": "2024", "is_featured": False, "display_order": 1},
+            {"league_id": 3, "name": "Bundesliga", "country": "Germany", "country_code": None, "logo": None, "season": "2024", "is_featured": False, "display_order": 1},
         ]},
     ]
