@@ -103,9 +103,13 @@ class AuthService:
             try:
                 await db.commit()
                 await db.refresh(user)
-            except Exception:
+            except Exception as e:
                 await db.rollback()
-                raise HTTPException(status_code=400, detail="Could not create user from Google account")
+                print("GOOGLE DB ERROR:", repr(e))
+                raise HTTPException(
+                    status_code=400,
+                    detail=str(e)
+                )
 
         return user
 
