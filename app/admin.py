@@ -20,6 +20,11 @@ class MatchAdmin(ModelView, model=Match):
 
 class NewsAdmin(ModelView, model=News):
     column_list = ["id", "title", "category", "image_url", "created_at"]
+    form_excluded_columns = [
+        "published_at",
+        "created_at",
+        "updated_at",
+    ]
     # SQLAdmin 0.25.0 exposes form_overrides in ModelView and uses it when
     # building forms via get_model_form(..., form_overrides=...).
     form_overrides = {"image_url": FileField}
