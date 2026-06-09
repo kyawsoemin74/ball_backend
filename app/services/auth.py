@@ -1,4 +1,5 @@
 import secrets
+import string
 
 import bcrypt
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -86,12 +87,24 @@ class AuthService:
                 # Update existing user with google_id
                 user.google_id = google_id
             else:
-                # 3. Create new user
+                # 3. Create new user using the email-derived username and ensure it stays unique.
+                base_username = email.split("@")[0]
+                candidate_username = base_username
+
+                result = await db.execute(select(User).where(User.username == candidate_username))
+                existing_user = result.scalar_one_or_none()
+
+                while existing_user:
+                    suffix = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+                    candidate_username = f"{base_username}_{suffix}"
+                    result = await db.execute(select(User).where(User.username == candidate_username))
+                    existing_user = result.scalar_one_or_none()
+
                 # Generate a unique random password for Google-authenticated users.
                 random_password = secrets.token_urlsafe(32)
 
                 user = User(
-                    username=username,
+                    username=candidate_username,
                     email=email,
                     google_id=google_id,
                     hashed_password=self.hash_password(random_password),
@@ -99,7 +112,7 @@ class AuthService:
                     is_active=True
                 )
                 db.add(user)
-            
+
             try:
                 await db.commit()
                 await db.refresh(user)
@@ -108,7 +121,7 @@ class AuthService:
                 print("GOOGLE DB ERROR:", repr(e))
                 raise HTTPException(
                     status_code=400,
-                    detail=str(e)
+                    detail="Could not create user from Google account"
                 )
 
         return user
