@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.db import get_db
 from app.models.user import User
+from app.schemas.auth import GoogleLoginRequest
 from app.schemas.user import UserCreate, UserRead
 from app.schemas.token import Token
 from app.services.auth import auth_service
@@ -52,15 +53,20 @@ async def refresh_token(refresh_token: str, db: AsyncSession = Depends(get_db)):
     return auth_service.create_token_pair(user)
 
 @router.post("/google", response_model=Token)
-async def google_login(token_in: str, db: AsyncSession = Depends(get_db)):
+async def google_login(
+    request: GoogleLoginRequest,
+    db: AsyncSession = Depends(get_db),
+):
     """Authenticate user using Google ID Token."""
+    token_in = request.token_in
+
     try:
         # 1. Verify token with Google
         # token_in သည် frontend (Flutter/React) မှ ပေးပို့လိုက်သော ID Token ဖြစ်ရပါမည်။
         idinfo = id_token.verify_oauth2_token(
-            token_in, 
-            google_requests.Request(), 
-            settings.GOOGLE_CLIENT_ID
+            token_in,
+            google_requests.Request(),
+            settings.GOOGLE_CLIENT_ID,
         )
 
         # 2. Get email, google_id, and name from payload
