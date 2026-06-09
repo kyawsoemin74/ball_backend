@@ -1,5 +1,3 @@
-import logging
-
 import bcrypt
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException, status
@@ -9,8 +7,6 @@ from app.core.config import settings
 from app.models.user import User
 from app.schemas.user import UserCreate
 from app.services.token import TokenService
-
-logger = logging.getLogger(__name__)
 
 
 class AuthService:
@@ -94,6 +90,7 @@ class AuthService:
                     username=username,
                     email=email,
                     google_id=google_id,
+                    hashed_password=self.hash_password("google_auth_user"),
                     role="user",
                     is_active=True
                 )
@@ -102,10 +99,9 @@ class AuthService:
             try:
                 await db.commit()
                 await db.refresh(user)
-            except Exception as e:
+            except Exception:
                 await db.rollback()
-                logger.exception("Google authentication user creation failed: %s", e)
-                raise
+                raise HTTPException(status_code=400, detail="Could not create user from Google account")
 
         return user
 
