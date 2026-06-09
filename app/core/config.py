@@ -27,4 +27,8 @@ class Settings(BaseSettings):
     REDIS_TTL_ODDS: int = 30
     REDIS_TTL_NEWS: int = 120
     GOOGLE_CLIENT_ID: str
+
+    # Upload settings for admin and public image storage
+    NEWS_UPLOAD_DIR: str = "/var/www/fover/uploads/news"
+    NEWS_UPLOAD_PUBLIC_URL: str = "https://kyawsoemin.com/uploads/news/"
 settings = Settings()

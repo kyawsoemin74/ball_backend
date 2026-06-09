@@ -17,6 +17,7 @@ from app.api.ads import router as ads_router
 from app.api.news import router as news_router
 from app.api.auth import router as auth_router
 from app.api.socket import router as socket_router
+from app.api.uploads import router as uploads_router
 from sqlalchemy import text
 from app.db import async_session, engine
 from app.admin import setup_admin
@@ -89,6 +90,7 @@ app.include_router(leagues_router, prefix="/api/leagues", tags=["leagues"])
 app.include_router(teams_router, prefix="/api/teams", tags=["teams"])
 app.include_router(ads_router, prefix="/api/ads", tags=["ads"])
 app.include_router(news_router, prefix="/api/news", tags=["news"])
+app.include_router(uploads_router, prefix="/api", tags=["uploads"])
 
 
 @app.on_event("startup")
