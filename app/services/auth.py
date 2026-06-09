@@ -1,3 +1,5 @@
+import secrets
+
 import bcrypt
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException, status
@@ -85,12 +87,14 @@ class AuthService:
                 user.google_id = google_id
             else:
                 # 3. Create new user
-                # Ensure username is unique
+                # Generate a unique random password for Google-authenticated users.
+                random_password = secrets.token_urlsafe(32)
+
                 user = User(
                     username=username,
                     email=email,
                     google_id=google_id,
-                    hashed_password=self.hash_password("google_auth_user"),
+                    hashed_password=self.hash_password(random_password),
                     role="user",
                     is_active=True
                 )
