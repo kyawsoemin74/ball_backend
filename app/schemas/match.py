@@ -84,10 +84,73 @@ class MatchUpdate(BaseModel):
     venue_city: Optional[str] = Field(None, max_length=255, description="Venue city")
 
 
+class MatchDateResponse(BaseModel):
+    # Primary Key
+    match_id: int = Field(..., description="Unique match ID (Primary Key)")
+
+    # League Info
+    league_id: int = Field(..., description="League ID")
+    league_name: Optional[str] = Field(None, description="League name")
+    league_logo: Optional[str] = Field(None, description="League logo URL")
+
+    # Country Info
+    country_name: Optional[str] = Field(None, description="Country name")
+    country_logo: Optional[str] = Field(None, description="Country logo URL")
+
+    # Match Time
+    match_time: datetime = Field(..., description="Match scheduled time")
+
+    # Match Status
+    status: str = Field(..., description="Match status")
+
+    # Elapsed Time
+    elapsed: int = Field(default=0, description="Elapsed time in minutes")
+
+    # Home Team
+    home_team: str = Field(..., description="Home team name")
+    home_team_id: Optional[int] = Field(None, description="Home team ID")
+    home_team_logo: Optional[str] = Field(None, description="Home team logo URL")
+
+    # Away Team
+    away_team: str = Field(..., description="Away team name")
+    away_team_id: Optional[int] = Field(None, description="Away team ID")
+    away_team_logo: Optional[str] = Field(None, description="Away team logo URL")
+
+    # Scores
+    home_score: int = Field(..., description="Home team score")
+    away_score: int = Field(..., description="Away team score")
+
+    # Venue
+    venue_name: Optional[str] = Field(None, description="Venue name")
+    venue_city: Optional[str] = Field(None, description="Venue city")
+
+    # Timestamps
+    created_at: Optional[datetime] = Field(None, description="Creation timestamp")
+    updated_at: Optional[datetime] = Field(None, description="Last update timestamp")
+
+    class Config:
+        from_attributes = True
+
+
 # Schema for match response
 class MatchResponse(BaseModel):
     # Primary Key
     match_id: int = Field(..., description="Unique match ID (Primary Key)")
+
+    # Availability / tab support flags
+    has_events: bool = Field(default=False, description="Whether match events are available for this fixture")
+    has_stats: bool = Field(default=False, description="Whether statistics data is available for this fixture")
+    has_lineups: bool = Field(default=False, description="Whether lineup data is available for this fixture")
+    has_odds: bool = Field(default=False, description="Whether odds data is available for this fixture")
+    has_h2h: bool = Field(default=False, description="Whether head-to-head data is available for this fixture")
+    has_standings: bool = Field(default=False, description="Whether standings data is available for this fixture")
+    has_predictions: bool = Field(default=False, description="Whether predictions data is available for this fixture")
+    has_rankings: bool = Field(default=False, description="Whether rankings data is available for this fixture")
+    has_news: bool = Field(default=False, description="Whether related news is available for this fixture")
+    has_highlights: bool = Field(default=False, description="Whether highlights are available for this fixture")
+    has_comments: bool = Field(default=False, description="Whether comments are available for this fixture")
+    is_knockout: bool = Field(default=False, description="Whether the competition format is knockout/cup based")
+    has_bracket: bool = Field(default=False, description="Whether bracket data can be displayed for this fixture")
     
     # League Info
     league_id: int = Field(..., description="League ID")

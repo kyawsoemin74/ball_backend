@@ -14,6 +14,7 @@ from app.services.lineup_service import LineupService
 from app.services.match_service import MatchService
 from app.services.odds_service import OddsService
 from app.services.standing_service import StandingService
+from app.services.statistics_service import StatisticsService
 from app.services.team_service import TeamService
 
 FINISHED_STATUSES = {"FT", "AET", "PEN", "CANC", "ABD", "AWD", "WO"}
@@ -48,6 +49,7 @@ class FootballAPIService:
         self.h2h_service = h2h_service or H2HService(self.client, self.cache_service)
         self.lineup_service = lineup_service or LineupService(self.client, self.cache_service)
         self.event_service = event_service or EventService(self.client, self.cache_service)
+        self.statistics_service = StatisticsService(self.client, self.cache_service)
 
     async def get_fixtures(self, league: int, season: int) -> Optional[dict]:
         return await self.client.get("/fixtures", params={"league": league, "season": season})
@@ -87,6 +89,9 @@ class FootballAPIService:
 
     async def get_match_h2h(self, match_id: int) -> Optional[dict]:
         return await self.h2h_service.get_match_h2h(match_id)
+
+    async def get_cached_statistics(self, db: AsyncSession, match_id: int) -> Optional[dict]:
+        return await self.statistics_service.get_cached_statistics(db, match_id)
 
     async def get_cached_h2h(self, db: AsyncSession, team1_id: int, team2_id: int, match_id: int) -> Optional[dict]:
         return await self.h2h_service.get_cached_h2h(db, team1_id, team2_id, match_id)

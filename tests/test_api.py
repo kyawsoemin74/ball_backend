@@ -4,6 +4,7 @@ from starlette.routing import NoMatchFound
 
 from app.db import get_db
 from app.main import app
+from app.schemas.match import MatchResponse
 
 client = TestClient(app)
 
@@ -88,6 +89,78 @@ def test_matches_date_endpoint_uses_ordered_repository_results(monkeypatch):
     assert len(payload) == 1
     assert payload[0]["match_id"] == 2
     assert payload[0]["league_name"] == "Ordered League"
+
+
+def test_date_matches_response_excludes_availability_flags():
+    response = client.get("/api/matches/date/2026-06-10")
+
+    assert response.status_code == 200
+    assert isinstance(response.json(), list)
+    assert response.json()
+
+    first_match = response.json()[0]
+    assert "has_events" not in first_match
+    assert "has_stats" not in first_match
+    assert "has_lineups" not in first_match
+    assert "has_odds" not in first_match
+    assert "has_h2h" not in first_match
+    assert "has_standings" not in first_match
+    assert "has_predictions" not in first_match
+    assert "has_rankings" not in first_match
+    assert "has_news" not in first_match
+    assert "has_highlights" not in first_match
+    assert "has_comments" not in first_match
+    assert "is_knockout" not in first_match
+    assert "has_bracket" not in first_match
+
+
+def test_match_response_includes_availability_flags():
+    payload = MatchResponse(
+        match_id=1,
+        league_id=39,
+        league_name="Premier League",
+        league_logo=None,
+        country_name="England",
+        country_logo=None,
+        match_time="2026-06-10T18:00:00+00:00",
+        status="FT",
+        elapsed=90,
+        home_team="Team A",
+        home_team_id=1,
+        home_team_logo=None,
+        away_team="Team B",
+        away_team_id=2,
+        away_team_logo=None,
+        home_score=2,
+        away_score=1,
+        venue_name=None,
+        venue_city=None,
+        created_at=None,
+        updated_at=None,
+    ).model_dump()
+
+    assert payload["has_events"] is False
+    assert payload["has_stats"] is False
+    assert payload["has_lineups"] is False
+    assert payload["has_odds"] is False
+    assert payload["has_h2h"] is False
+    assert payload["has_standings"] is False
+    assert payload["has_predictions"] is False
+    assert payload["has_rankings"] is False
+    assert payload["has_news"] is False
+    assert payload["has_highlights"] is False
+    assert payload["has_comments"] is False
+    assert payload["is_knockout"] is False
+    assert payload["has_bracket"] is False
+
+
+def test_has_availability_data_accepts_cached_payload_shapes():
+    from app.api.matches import _has_availability_data
+
+    assert _has_availability_data({"odds": [{"odd": 1.23}]}) is True
+    assert _has_availability_data({"response": [{"team": "A"}]}) is True
+    assert _has_availability_data({"source": "database", "odds": []}) is False
+    assert _has_availability_data({"error": "No data"}) is False
 
 
 def test_old_match_standing_route_removed():

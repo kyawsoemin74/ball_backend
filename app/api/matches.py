@@ -8,13 +8,102 @@ from app.api.deps import current_active_admin, current_active_user
 from app.cache import cache_get_json, cache_set_json, make_cache_key
 from app.core.config import settings
 from app.db import get_db
+from app.models.league import League
 from app.models.match import Match
+from app.models.match_event import MatchEvent
+from app.models.match_lineup import MatchLineup
+from app.models.standing import Standings
 from app.repositories.match_repository import MatchRepository
 from app.schemas.match_event import MatchEventResponse
-from app.schemas.match import MatchResponse
+from app.schemas.match import MatchDateResponse, MatchResponse
 from app.services.football import football_service, LIVE_STATUSES
 
 router = APIRouter(prefix="/matches", tags=["matches"])
+
+
+def _has_availability_data(payload: Any) -> bool:
+    """Return True when the payload contains real cached/API data instead of an empty or error response."""
+    if payload is None:
+        return False
+
+    if isinstance(payload, dict):
+        if payload.get("error"):
+            return False
+
+        for key in ("response", "odds", "stats", "fixtures", "data", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return len(value) > 0
+            if isinstance(value, dict):
+                return bool(value)
+
+        return bool(payload.get("cached") or payload.get("source") in {"database", "api"})
+
+    if isinstance(payload, (list, tuple, set)):
+        return len(payload) > 0
+
+    return bool(payload)
+
+
+async def _build_match_availability_flags(match: Match, db: AsyncSession) -> Dict[str, bool]:
+    """Compute match detail tab availability flags from existing cached data sources."""
+    flags = {
+        "has_events": False,
+        "has_stats": False,
+        "has_lineups": False,
+        "has_odds": False,
+        "has_h2h": False,
+        "has_standings": False,
+        "has_predictions": False,
+        "has_rankings": False,
+        "has_news": False,
+        "has_highlights": False,
+        "has_comments": False,
+        "is_knockout": False,
+        "has_bracket": False,
+    }
+
+    events_result = await db.execute(select(MatchEvent).where(MatchEvent.match_id == match.match_id).limit(1))
+    flags["has_events"] = events_result.scalar_one_or_none() is not None
+
+    try:
+        stats_payload = await football_service.get_cached_statistics(db, match.match_id)
+    except Exception:
+        stats_payload = {}
+    flags["has_stats"] = _has_availability_data(stats_payload)
+
+    lineup_result = await db.execute(select(MatchLineup).where(MatchLineup.match_id == match.match_id).limit(1))
+    flags["has_lineups"] = lineup_result.scalar_one_or_none() is not None
+
+    try:
+        odds_payload = await football_service.get_cached_odds(db, match.match_id)
+    except Exception:
+        odds_payload = {}
+    flags["has_odds"] = _has_availability_data(odds_payload)
+
+    if match.home_team_id and match.away_team_id:
+        try:
+            h2h_payload = await football_service.get_cached_h2h(db, match.home_team_id, match.away_team_id, match.match_id)
+        except Exception:
+            h2h_payload = {}
+        flags["has_h2h"] = _has_availability_data(h2h_payload)
+
+    league = await db.get(League, match.league_id)
+    season = getattr(league, "season", None) if league else None
+    if season:
+        standings_result = await db.execute(
+            select(Standings)
+            .where(Standings.league_id == match.league_id, Standings.season == str(season))
+            .limit(1)
+        )
+        flags["has_standings"] = standings_result.scalar_one_or_none() is not None
+
+    league_name = (match.league_name or "").lower()
+    if any(keyword in league_name for keyword in ("cup", "knockout", "playoff", "final", "semi")):
+        flags["is_knockout"] = True
+
+    return flags
+
 
 # --- GET Routes (Specific Routes First) ---
 
@@ -74,10 +163,12 @@ async def get_match_by_id(
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    return match
+    availability_flags = await _build_match_availability_flags(match, db)
+    response = MatchResponse.model_validate(match)
+    return response.model_copy(update=availability_flags)
 
 
-@router.get("/date/{date_val}", response_model=List[MatchResponse])
+@router.get("/date/{date_val}", response_model=List[MatchDateResponse])
 async def get_matches_by_date(
     date_val: date = Path(..., description="ရက်စွဲအလိုက် ပွဲစဉ်ရှာရန် (Format: YYYY-MM-DD)"),
     db: AsyncSession = Depends(get_db)
