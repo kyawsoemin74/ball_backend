@@ -8,6 +8,7 @@ from sqlalchemy import or_, select
 
 from app.core.config import settings
 from app.models.user import User
+from app.schemas.token import GoogleAuthResponse, GoogleAuthUser
 from app.schemas.user import UserCreate
 from app.services.token import TokenService
 
@@ -132,6 +133,22 @@ class AuthService:
             "refresh_token": self.token_service.create_refresh_token(user.username, user.role),
             "token_type": "bearer",
         }
+
+    def create_google_auth_response(self, user: User) -> GoogleAuthResponse:
+        token_pair = self.create_token_pair(user)
+
+        return GoogleAuthResponse(
+            access_token=token_pair["access_token"],
+            refresh_token=token_pair["refresh_token"],
+            token_type=token_pair["token_type"],
+            user=GoogleAuthUser(
+                id=str(user.id),
+                email=user.email,
+                name=user.username,
+                avatarUrl=None,
+                provider="google",
+            ),
+        )
 
 
 auth_service = AuthService()

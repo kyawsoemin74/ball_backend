@@ -10,7 +10,7 @@ from app.db import get_db
 from app.models.user import User
 from app.schemas.auth import GoogleLoginRequest
 from app.schemas.user import UserCreate, UserRead
-from app.schemas.token import Token
+from app.schemas.token import GoogleAuthResponse, Token
 from app.services.auth import auth_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -52,7 +52,7 @@ async def refresh_token(refresh_token: str, db: AsyncSession = Depends(get_db)):
         )
     return auth_service.create_token_pair(user)
 
-@router.post("/google", response_model=Token)
+@router.post("/google", response_model=GoogleAuthResponse)
 async def google_login(
     request: GoogleLoginRequest,
     db: AsyncSession = Depends(get_db),
@@ -87,4 +87,4 @@ async def google_login(
         google_id=google_id,
         username=name
     )
-    return auth_service.create_token_pair(user)
+    return auth_service.create_google_auth_response(user)
