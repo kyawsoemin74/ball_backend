@@ -13,6 +13,7 @@ class Odds(Base):
     market_name = Column(String(255), nullable=False, index=True)
     selection = Column(String(255), nullable=False, index=True)
     odd_value = Column(String(50), nullable=False)
+    myanmar_odd = Column(String(20), nullable=True)
     last_updated = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (

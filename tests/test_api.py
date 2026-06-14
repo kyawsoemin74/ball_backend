@@ -163,6 +163,35 @@ def test_has_availability_data_accepts_cached_payload_shapes():
     assert _has_availability_data({"error": "No data"}) is False
 
 
+def test_match_odds_endpoint_commits_db_session(monkeypatch):
+    class FakeSession:
+        def __init__(self):
+            self.committed = False
+
+        async def commit(self):
+            self.committed = True
+
+    fake_db = FakeSession()
+
+    async def fake_get_cached_odds(db, match_id):
+        assert db is fake_db
+        return {"source": "api", "odds": [], "updated": 1}
+
+    monkeypatch.setattr("app.services.football.football_service.get_cached_odds", fake_get_cached_odds)
+
+    async def override_get_db():
+        yield fake_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        response = client.get("/api/matches/1/odds")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert fake_db.committed is True
+
+
 def test_old_match_standing_route_removed():
     with pytest.raises(NoMatchFound):
         app.url_path_for("get_match_standing", match_id="1")

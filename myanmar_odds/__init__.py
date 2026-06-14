@@ -1,0 +1,1 @@
+"""Myanmar Odds domain module."""

@@ -234,6 +234,8 @@ async def get_match_odds(match_id: int = Path(..., gt=0), db: AsyncSession = Dep
     result = await football_service.get_cached_odds(db, match_id)
     if "error" in result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["error"])
+
+    await db.commit()
     return result
 
 
