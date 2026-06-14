@@ -18,6 +18,39 @@ class LeagueService:
         self.cache_service = cache_service or CacheService()
         self.league_repository = LeagueRepository()
 
+    async def get_cached_league_top_scorers(self, league_id: int, season: int) -> Optional[dict]:
+        from app.cache import make_cache_key
+
+        cache_key = make_cache_key("league", league_id, "topscorers", season)
+        cached = await self.cache_service.get_json(cache_key)
+        if cached is not None:
+            return cached
+
+        result = await self.client.get("/players/topscorers", params={"league": league_id, "season": season})
+        if not result or "response" not in result or not result["response"]:
+            return {"error": "Top scorers not found"}
+
+        payload = {
+            "league_id": league_id,
+            "season": season,
+            "players": [
+                {
+                    "player_id": item.get("player", {}).get("id"),
+                    "player_name": item.get("player", {}).get("name"),
+                    "team_id": item.get("statistics", [{}])[0].get("team", {}).get("id") if isinstance(item.get("statistics"), list) and item.get("statistics") else None,
+                    "team_name": item.get("statistics", [{}])[0].get("team", {}).get("name") if isinstance(item.get("statistics"), list) and item.get("statistics") else None,
+                    "goals": item.get("statistics", [{}])[0].get("goals", {}).get("total") if isinstance(item.get("statistics"), list) and item.get("statistics") else None,
+                    "assists": item.get("statistics", [{}])[0].get("goals", {}).get("assists") if isinstance(item.get("statistics"), list) and item.get("statistics") else None,
+                    "appearances": item.get("statistics", [{}])[0].get("games", {}).get("appearences") if isinstance(item.get("statistics"), list) and item.get("statistics") else None,
+                    "photo": item.get("player", {}).get("photo"),
+                }
+                for item in result["response"]
+                if isinstance(item, dict)
+            ],
+        }
+        await self.cache_service.set_json(cache_key, payload, 300)
+        return payload
+
     async def get_league_details(self, league_id: int) -> Optional[dict]:
         return await self.client.get("/leagues", params={"id": league_id})
 

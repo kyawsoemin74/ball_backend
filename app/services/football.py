@@ -93,6 +93,9 @@ class FootballAPIService:
     async def get_cached_statistics(self, db: AsyncSession, match_id: int) -> Optional[dict]:
         return await self.statistics_service.get_cached_statistics(db, match_id)
 
+    async def get_normalized_statistics(self, db: AsyncSession, match_id: int) -> Optional[dict]:
+        return await self.statistics_service.get_normalized_statistics(db, match_id)
+
     async def get_cached_h2h(self, db: AsyncSession, team1_id: int, team2_id: int, match_id: int) -> Optional[dict]:
         return await self.h2h_service.get_cached_h2h(db, team1_id, team2_id, match_id)
 
@@ -111,11 +114,23 @@ class FootballAPIService:
     async def get_league_details(self, league_id: int) -> Optional[dict]:
         return await self.league_service.get_league_details(league_id)
 
+    async def get_league_top_scorers(self, league_id: int, season: int) -> Optional[dict]:
+        return await self.league_service.get_cached_league_top_scorers(league_id, season)
+
     async def get_all_leagues(self) -> Optional[dict]:
         return await self.league_service.get_all_leagues()
 
     async def get_team_details(self, team_id: int) -> Optional[dict]:
         return await self.team_service.get_team_details(team_id)
+
+    async def get_team_fixtures(self, db: AsyncSession, team_id: int) -> Optional[dict]:
+        return await self.team_service.get_cached_team_fixtures(db, team_id)
+
+    async def get_team_squad(self, team_id: int) -> Optional[dict]:
+        return await self.team_service.get_cached_team_squad(team_id)
+
+    async def get_team_statistics(self, team_id: int, league_id: int, season: int) -> Optional[dict]:
+        return await self.team_service.get_cached_team_statistics(team_id, league_id, season)
 
     async def get_league_standings(self, league_id: int, season: int) -> Optional[dict]:
         return await self.standing_service.get_league_standings(league_id, season)

@@ -15,7 +15,7 @@ from app.models.match_lineup import MatchLineup
 from app.models.standing import Standings
 from app.repositories.match_repository import MatchRepository
 from app.schemas.match_event import MatchEventResponse
-from app.schemas.match import MatchDateResponse, MatchResponse
+from app.schemas.match import MatchDateResponse, MatchResponse, MatchStatisticsResponse
 from app.services.football import football_service, LIVE_STATUSES
 
 router = APIRouter(prefix="/matches", tags=["matches"])
@@ -222,6 +222,20 @@ async def get_match_h2h_symmetric(
     result = await football_service.get_cached_h2h(db, team1_id, team2_id, match_id)
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="H2H data not found")
+    return result
+
+
+@router.get("/{match_id}/statistics", response_model=MatchStatisticsResponse)
+async def get_match_statistics(
+    match_id: int = Path(..., gt=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get normalized match statistics for a specific match using the existing cached API-Football data.
+    """
+    result = await football_service.get_normalized_statistics(db, match_id)
+    if not result or "error" in result:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Statistics not found")
     return result
 
 

@@ -31,3 +31,20 @@ class LeagueGroupResponse(BaseModel):
     title: Optional[str] = None
     country: Optional[str] = None
     leagues: List[LeagueBase]
+
+
+class TopScorerItem(BaseModel):
+    player_id: Optional[int] = None
+    player_name: Optional[str] = None
+    team_id: Optional[int] = None
+    team_name: Optional[str] = None
+    goals: Optional[int] = None
+    assists: Optional[int] = None
+    appearances: Optional[int] = None
+    photo: Optional[str] = None
+
+
+class TopScorersResponse(BaseModel):
+    league_id: int
+    season: int
+    players: List[TopScorerItem] = []

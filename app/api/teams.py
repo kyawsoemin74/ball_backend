@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
@@ -7,11 +7,44 @@ from app.cache import cache_get_json, cache_set_json, make_cache_key
 from app.core.config import settings
 from app.db import get_db
 from app.models.team import Team
-from app.schemas.team import Team as TeamSchema
+from app.schemas.team import Team as TeamSchema, TeamFixturesResponse, TeamSquadResponse, TeamStatisticsResponse
 from app.services.football import football_service
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+@router.get("/{team_id}/fixtures", response_model=TeamFixturesResponse)
+async def get_team_fixtures(team_id: int = Path(..., gt=0), db: AsyncSession = Depends(get_db)):
+    """Get recent and upcoming fixtures for a team."""
+    result = await football_service.get_team_fixtures(db, team_id)
+    if not result or "error" in result:
+        raise HTTPException(status_code=404, detail="Fixtures not found")
+    return result
+
+
+@router.get("/{team_id}/squad", response_model=TeamSquadResponse)
+async def get_team_squad(team_id: int = Path(..., gt=0), db: AsyncSession = Depends(get_db)):
+    """Get the current squad for a team."""
+    result = await football_service.get_team_squad(team_id)
+    if not result or "error" in result:
+        raise HTTPException(status_code=404, detail="Squad not found")
+    return result
+
+
+@router.get("/{team_id}/statistics/{league_id}/{season}", response_model=TeamStatisticsResponse)
+async def get_team_statistics(
+    team_id: int = Path(..., gt=0),
+    league_id: int = Path(..., gt=0),
+    season: int = Path(..., gt=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get normalized team statistics for a team, league, and season."""
+    result = await football_service.get_team_statistics(team_id, league_id, season)
+    if not result or "error" in result:
+        raise HTTPException(status_code=404, detail="Statistics not found")
+    return result
+
 
 @router.get("/{team_id}", response_model=TeamSchema)
 async def get_team_details(team_id: int, db: AsyncSession = Depends(get_db)):

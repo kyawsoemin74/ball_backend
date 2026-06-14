@@ -9,13 +9,26 @@ from app.cache import cache_get_json, cache_set_json, make_cache_key
 from app.core.config import settings
 from app.db import get_db
 from app.models.league import League
-from app.schemas.league import League as LeagueSchema, LeagueGroupResponse
+from app.schemas.league import League as LeagueSchema, LeagueGroupResponse, TopScorersResponse
 from app.schemas.standing import StandingResponse
 from app.services.football import football_service
 from app.services.league_grouping_service import LeagueGroupingService
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+@router.get("/{league_id}/topscorers/{season}", response_model=TopScorersResponse)
+async def get_league_top_scorers(
+    league_id: int = Path(..., gt=0),
+    season: int = Path(..., gt=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get top scorers for a league and season."""
+    result = await football_service.get_league_top_scorers(league_id, season)
+    if not result or "error" in result:
+        raise HTTPException(status_code=404, detail="Top scorers not found")
+    return result
 
 
 @router.get("/grouped", response_model=List[LeagueGroupResponse])

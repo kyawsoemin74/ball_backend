@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
@@ -82,6 +82,21 @@ class MatchUpdate(BaseModel):
     # Venue
     venue_name: Optional[str] = Field(None, max_length=255, description="Venue name")
     venue_city: Optional[str] = Field(None, max_length=255, description="Venue city")
+
+
+class MatchStatisticItem(BaseModel):
+    data_name: str = Field(..., description="Internal normalized stat key")
+    label: str = Field(..., description="Human-readable stat label")
+    home_value: Any = Field(..., description="Home team stat value")
+    away_value: Any = Field(..., description="Away team stat value")
+
+
+class MatchStatisticsResponse(BaseModel):
+    match_id: int = Field(..., description="Unique match ID")
+    statistics: list[MatchStatisticItem] = Field(default_factory=list, description="Normalized statistics data")
+
+    class Config:
+        from_attributes = True
 
 
 class MatchDateResponse(BaseModel):
