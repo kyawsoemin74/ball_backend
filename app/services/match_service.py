@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache import make_cache_key
 from app.models.match import Match
+from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.match_repository import MatchRepository
 from app.schemas.match import MatchCreate
 from app.services.base.football_client import FootballAPIClient
@@ -27,6 +28,7 @@ class MatchService:
         self.team_service = team_service
         self.cache_service = cache_service or CacheService()
         self.match_repository = MatchRepository()
+        self.allowed_league_repository = AllowedLeagueRepository()
 
     def _extract_id_from_logo(self, obj: dict) -> Optional[int]:
         url = obj.get("logo")
@@ -79,8 +81,32 @@ class MatchService:
             return None
 
     async def _process_sync(self, db: AsyncSession, fixtures: list) -> dict:
-        parsed_matches = []
+        allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
+        if not allowed_ids:
+            logger.info("Allowed league list is empty; skipping all fixture synchronization.")
+            return {"success": True, "inserted": 0, "updated": 0, "total": 0}
+
+        filtered_fixtures = []
         for fixture_raw in fixtures:
+            league_info = fixture_raw.get("league") or {}
+            league_id = league_info.get("id")
+            league_name = league_info.get("name") or "Unknown league"
+            if league_id is None:
+                logger.warning("Skipping fixture %s with missing league_id", fixture_raw.get("fixture", {}).get("id"))
+                continue
+            if int(league_id) not in allowed_ids:
+                logger.info("SKIPPED LEAGUE: league_id=%s league_name=%s", league_id, league_name)
+                continue
+
+            logger.info("ALLOWED LEAGUE: league_id=%s league_name=%s", league_id, league_name)
+            filtered_fixtures.append(fixture_raw)
+
+        if not filtered_fixtures:
+            logger.info("No allowed leagues were present in the fixture payload; skipping fixture synchronization.")
+            return {"success": True, "inserted": 0, "updated": 0, "total": 0}
+
+        parsed_matches = []
+        for fixture_raw in filtered_fixtures:
             match = self.parse_fixture_to_match(fixture_raw)
             if match:
                 parsed_matches.append(match)
@@ -118,9 +144,14 @@ class MatchService:
 
         await db.flush()
         await self.cache_service.delete(make_cache_key("live_matches"))
-        return {"success": True, "inserted": inserted, "updated": updated, "total": len(fixtures)}
+        return {"success": True, "inserted": inserted, "updated": updated, "total": len(filtered_fixtures)}
 
     async def sync_full_season(self, db: AsyncSession, league: int, season: int) -> dict:
+        allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
+        if league not in allowed_ids:
+            logger.info("SKIPPED LEAGUE: league_id=%s league_name=%s", league, "requested league")
+            return {"success": True, "inserted": 0, "updated": 0, "total": 0, "message": "League is not allowed for synchronization"}
+
         result = await self.client.get("/fixtures", params={"league": league, "season": season})
         if not result or "response" not in result:
             return {"success": False, "message": "API error"}

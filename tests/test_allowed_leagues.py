@@ -13,6 +13,9 @@ from app.db import get_db
 from app.main import app
 from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.services.allowed_league_service import AllowedLeagueService
+from app.services.league_service import LeagueService
+from app.services.match_service import MatchService
+from app.services.standing_service import StandingService
 
 client = TestClient(app)
 
@@ -217,6 +220,219 @@ def test_allowed_league_repository_rolls_back_on_failure():
 
     assert db.rolled_back is True
     assert db.committed is False
+
+
+class FakeAllowedIdsRepository:
+    def __init__(self, allowed_ids):
+        self.allowed_ids = set(allowed_ids)
+
+    async def get_allowed_ids(self, db):
+        return set(self.allowed_ids)
+
+
+class FakeMatchClient:
+    async def get(self, path, params=None):
+        return {"response": [
+            {"fixture": {"id": 1001, "date": "2026-06-15T18:00:00+00:00", "status": {"short": "NS", "elapsed": 0}, "venue": {"name": "A", "city": "B"}},
+             "league": {"id": 39, "name": "Allowed League", "country": "X", "logo": None, "flag": None},
+             "teams": {"home": {"id": 1, "name": "Home", "logo": None}, "away": {"id": 2, "name": "Away", "logo": None}},
+             "goals": {"home": 0, "away": 0},
+            },
+            {"fixture": {"id": 1002, "date": "2026-06-15T18:00:00+00:00", "status": {"short": "NS", "elapsed": 0}, "venue": {"name": "A", "city": "B"}},
+             "league": {"id": 999, "name": "Blocked League", "country": "Y", "logo": None, "flag": None},
+             "teams": {"home": {"id": 3, "name": "Home2", "logo": None}, "away": {"id": 4, "name": "Away2", "logo": None}},
+             "goals": {"home": 0, "away": 0},
+            },
+        ]}
+
+
+class RecordingMatchService(MatchService):
+    def __init__(self, client, allowed_ids):
+        super().__init__(client=client, team_service=object(), cache_service=FakeCacheService())
+        self.allowed_league_repository = FakeAllowedIdsRepository(allowed_ids)
+        self.seen_fixtures = None
+
+    async def _process_sync(self, db, fixtures):
+        allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
+        filtered = [fixture for fixture in fixtures if int((fixture.get("league") or {}).get("id", 0)) in allowed_ids]
+        self.seen_fixtures = filtered
+        return {"success": True, "inserted": len(filtered), "updated": 0, "total": len(filtered)}
+
+
+class FakeStandingClient:
+    async def get(self, path, params=None):
+        return {"response": []}
+
+
+class FakeLeagueSyncClient:
+    async def get(self, path, params=None):
+        return {"response": [
+            {"league": {"id": 39, "name": "Allowed League", "country": "X", "logo": None}},
+            {"league": {"id": 999, "name": "Blocked League", "country": "Y", "logo": None}},
+        ]}
+
+
+class RecordingLeagueService(LeagueService):
+    def __init__(self, client, allowed_ids):
+        super().__init__(client=client, cache_service=FakeCacheService())
+        self.allowed_league_repository = FakeAllowedIdsRepository(allowed_ids)
+        self.upserted = []
+
+    async def upsert_league(self, db, league_data, allowed_ids=None):
+        self.upserted.append(league_data)
+        return league_data
+
+
+class RecordingStandingService(StandingService):
+    def __init__(self, client, allowed_ids):
+        super().__init__(client=client, team_service=object(), cache_service=FakeCacheService())
+        self.allowed_league_repository = FakeAllowedIdsRepository(allowed_ids)
+
+
+class FakeSyncDB:
+    async def execute(self, query):
+        class FakeScalars:
+            def all(self):
+                return []
+
+        class FakeResult:
+            def scalars(self):
+                return FakeScalars()
+
+            def scalar_one_or_none(self):
+                return None
+
+            def all(self):
+                return []
+
+        return FakeResult()
+
+    async def flush(self):
+        return None
+
+    async def refresh(self, obj):
+        return None
+
+    def add(self, obj):
+        return None
+
+
+class FakeCacheService:
+    def __init__(self):
+        self.deleted = []
+
+    def delete_sync(self, key):
+        self.deleted.append(key)
+
+
+class FakeTeamService:
+    async def ensure_teams_exist(self, db, teams):
+        return None
+
+
+class CountingAllowedLeagueRepository:
+    def __init__(self, allowed_ids):
+        self.allowed_ids = set(allowed_ids)
+        self.calls = 0
+
+    async def get_allowed_ids(self, db):
+        self.calls += 1
+        return set(self.allowed_ids)
+
+
+class CountingLeagueRepository:
+    async def get_by_id(self, db, league_id):
+        return None
+
+    async def get_many_by_ids(self, db, league_ids):
+        return []
+
+
+class CountingDB:
+    async def execute(self, query):
+        return type("Result", (), {"scalar_one_or_none": lambda self: None})()
+
+    async def flush(self):
+        return None
+
+    async def refresh(self, obj):
+        return None
+
+    def add(self, obj):
+        return None
+
+
+def test_league_sync_uses_allowed_ids_only_once_per_run():
+    service = LeagueService(client=FakeLeagueSyncClient(), cache_service=FakeCacheService())
+    repository = CountingAllowedLeagueRepository([39])
+    service.allowed_league_repository = repository
+    service.league_repository = CountingLeagueRepository()
+
+    async def run():
+        return await service.sync_all_leagues(CountingDB())
+
+    result = asyncio.run(run())
+
+    assert result["success"] is True
+    assert repository.calls == 1
+
+
+def test_match_service_sync_full_season_filters_unallowed_leagues_before_write():
+    service = RecordingMatchService(FakeMatchClient(), [39])
+
+    async def run():
+        result = await service.sync_full_season(FakeSyncDB(), 39, 2024)
+        return result
+
+    result = asyncio.run(run())
+
+    assert result["inserted"] == 1
+    assert len(service.seen_fixtures) == 1
+    assert service.seen_fixtures[0]["league"]["id"] == 39
+
+
+def test_match_service_sync_daily_fixtures_filters_unallowed_leagues_before_write():
+    service = RecordingMatchService(FakeMatchClient(), [39])
+
+    async def run():
+        result = await service.sync_daily_fixtures(FakeSyncDB(), "2026-06-15")
+        return result
+
+    result = asyncio.run(run())
+
+    assert result["inserted"] == 1
+    assert len(service.seen_fixtures) == 1
+    assert service.seen_fixtures[0]["league"]["id"] == 39
+
+
+def test_league_service_sync_all_leagues_skips_unallowed_leagues():
+    service = RecordingLeagueService(FakeLeagueSyncClient(), [39])
+
+    async def run():
+        result = await service.sync_all_leagues(FakeSyncDB())
+        return result
+
+    result = asyncio.run(run())
+
+    assert result["success"] is True
+    assert result["inserted"] == 1
+    assert result["updated"] == 0
+    assert len(service.upserted) == 1
+    assert service.upserted[0]["league"]["id"] == 39
+
+
+def test_standing_service_sync_standings_skips_unallowed_league():
+    service = RecordingStandingService(FakeStandingClient(), [])
+
+    async def run():
+        result = await service.sync_standings(FakeSyncDB(), 999, 2024)
+        return result
+
+    result = asyncio.run(run())
+
+    assert result["success"] is True
+    assert result["updated"] == 0
+    assert result["message"] == "League is not allowed for synchronization"
 
 
 def test_allowed_leagues_admin_requires_admin_access():

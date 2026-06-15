@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache import make_cache_key
 from app.models.league import League
+from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.league_repository import LeagueRepository
 from app.services.base.football_client import FootballAPIClient
 from app.services.cache_service import CacheService
@@ -17,6 +18,7 @@ class LeagueService:
         self.client = client
         self.cache_service = cache_service or CacheService()
         self.league_repository = LeagueRepository()
+        self.allowed_league_repository = AllowedLeagueRepository()
 
     async def get_cached_league_top_scorers(self, league_id: int, season: int) -> Optional[dict]:
         from app.cache import make_cache_key
@@ -57,7 +59,19 @@ class LeagueService:
     async def get_all_leagues(self) -> Optional[dict]:
         return await self.client.get("/leagues")
 
-    async def upsert_league(self, db: AsyncSession, league_data: dict) -> League:
+    async def upsert_league(self, db: AsyncSession, league_data: dict, allowed_ids: set[int] | None = None) -> League | None:
+        league_payload = league_data.get("league") or league_data
+        league_id = league_payload.get("id")
+        if league_id is None:
+            raise ValueError("League payload is missing the id field")
+
+        if allowed_ids is not None and (not allowed_ids or int(league_id) not in allowed_ids):
+            logger.info("SKIPPED LEAGUE: league_id=%s league_name=%s", league_id, league_payload.get("name"))
+            return None
+
+        return await self._upsert_league(db, league_data)
+
+    async def _upsert_league(self, db: AsyncSession, league_data: dict) -> League | None:
         league_payload = league_data.get("league") or league_data
         league_id = league_payload.get("id")
         if league_id is None:
@@ -118,30 +132,47 @@ class LeagueService:
             return {"success": False, "message": "No leagues data found from API"}
 
         leagues = result.get("response", [])
-        league_ids = []
+        allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
+        if not allowed_ids:
+            logger.info("Allowed league list is empty; skipping all league synchronization.")
+            return {"success": True, "inserted": 0, "updated": 0, "total": 0}
+
+        filtered_leagues = []
         for league_data in leagues:
             league_payload = league_data.get("league") or league_data
             league_id = league_payload.get("id")
             if league_id is None:
                 logger.warning("Skipping invalid league payload: %s", league_data)
                 continue
-            league_ids.append(int(league_id))
 
+            league_id_int = int(league_id)
+            if league_id_int not in allowed_ids:
+                logger.info("SKIPPED LEAGUE: league_id=%s league_name=%s", league_id_int, league_payload.get("name"))
+                continue
+
+            logger.info("ALLOWED LEAGUE: league_id=%s league_name=%s", league_id_int, league_payload.get("name"))
+            filtered_leagues.append(league_data)
+
+        if not filtered_leagues:
+            logger.info("No allowed leagues were present in the API response; skipping league synchronization.")
+            return {"success": True, "inserted": 0, "updated": 0, "total": 0}
+
+        league_ids = [int((league_data.get("league") or league_data).get("id")) for league_data in filtered_leagues]
         existing_lookup = {league.league_id: league for league in await self.league_repository.get_many_by_ids(db, league_ids)}
 
         inserted = 0
         updated = 0
-        for league_data in leagues:
+        for league_data in filtered_leagues:
             league_payload = league_data.get("league") or league_data
-            league_id = league_payload.get("id")
-            if league_id is None:
-                continue
+            league_id = int(league_payload.get("id"))
 
-            await self.upsert_league(db, league_data)
+            upserted = await self.upsert_league(db, league_data, allowed_ids=allowed_ids)
+            if upserted is None:
+                continue
             if league_id in existing_lookup:
                 updated += 1
             else:
                 inserted += 1
         logger.info("League sync completed")
         logger.info("League sync result: inserted=%s, updated=%s", inserted, updated)
-        return {"success": True, "inserted": inserted, "updated": updated, "total": len(leagues)}
+        return {"success": True, "inserted": inserted, "updated": updated, "total": len(filtered_leagues)}

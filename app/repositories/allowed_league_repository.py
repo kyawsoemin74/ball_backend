@@ -6,6 +6,10 @@ from app.models.league import League
 
 
 class AllowedLeagueRepository:
+    async def get_allowed_ids(self, db: AsyncSession) -> set[int]:
+        result = await db.execute(select(AllowedLeague.league_id))
+        return {int(row[0]) for row in result.all()}
+
     async def get_all(self, db: AsyncSession) -> list[dict]:
         result = await db.execute(
             select(
