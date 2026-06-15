@@ -178,6 +178,7 @@ async def get_matches_by_date(
     Myanmar Timezone (UTC+6:30) aware - returns matches for the full day in Myanmar time.
     """
     matches = await MatchRepository().get_matches_by_date(db, date_val)
+    matches = [match for match in matches if MatchRepository.is_visible_league(match)]
     return MatchRepository.order_matches_for_date(matches)
 
 

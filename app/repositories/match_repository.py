@@ -1,6 +1,6 @@
 from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -25,6 +25,7 @@ class MatchRepository:
             .options(joinedload(Match.league_obj))
             .where(Match.match_time >= start_dt)
             .where(Match.match_time < end_dt)
+            .where(or_(League.display_order <= 200, League.is_featured.is_(True)))
             .order_by(
                 League.is_featured.desc(),
                 League.display_order.asc(),
@@ -35,6 +36,14 @@ class MatchRepository:
             )
         )
         return list(result.scalars().all())
+
+    @staticmethod
+    def is_visible_league(match: Match) -> bool:
+        league = getattr(match, "league_obj", None)
+        if league is None:
+            return True
+
+        return bool(league.display_order <= 200 or league.is_featured)
 
     @staticmethod
     def order_matches_for_date(matches: list[Match]) -> list[Match]:

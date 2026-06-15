@@ -325,6 +325,55 @@ def test_home_endpoint_returns_payload(monkeypatch):
     assert response.json() == expected
 
 
+def test_matches_date_endpoint_filters_invisible_leagues(monkeypatch):
+    from app.api import matches as matches_api
+
+    visible_match = SimpleNamespace(
+        match_id=1,
+        league_id=1,
+        league_name="Visible League",
+        country_name="Test",
+        match_time="2026-06-05T18:00:00+00:00",
+        status="NS",
+        home_team="A",
+        away_team="B",
+        home_score=0,
+        away_score=0,
+        league_obj=SimpleNamespace(display_order=10, is_featured=False, country="Test", name="Visible League"),
+    )
+    hidden_match = SimpleNamespace(
+        match_id=2,
+        league_id=2,
+        league_name="Hidden League",
+        country_name="Test",
+        match_time="2026-06-05T19:00:00+00:00",
+        status="NS",
+        home_team="C",
+        away_team="D",
+        home_score=0,
+        away_score=0,
+        league_obj=SimpleNamespace(display_order=201, is_featured=False, country="Test", name="Hidden League"),
+    )
+
+    async def fake_get_matches_by_date(self, db, date_val):
+        return [hidden_match, visible_match]
+
+    monkeypatch.setattr(matches_api.MatchRepository, "get_matches_by_date", fake_get_matches_by_date)
+
+    async def override_get_db():
+        yield object()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        response = client.get("/api/matches/date/2026-06-05")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["match_id"] for item in payload] == [1]
+
+
 def test_matches_date_endpoint_uses_ordered_repository_results(monkeypatch):
     from app.api import matches as matches_api
 
