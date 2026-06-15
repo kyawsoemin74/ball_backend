@@ -2,9 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException, status, Path, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional, Dict, Any
-from datetime import datetime, date, timedelta, timezone
+from datetime import date
 
-from app.api.deps import current_active_admin, current_active_user
+from app.api.deps import current_active_admin
 from app.cache import cache_get_json, cache_set_json, make_cache_key
 from app.core.config import settings
 from app.db import get_db
@@ -14,7 +14,6 @@ from app.models.match_event import MatchEvent
 from app.models.match_lineup import MatchLineup
 from app.models.standing import Standings
 from app.repositories.match_repository import MatchRepository
-from app.schemas.match_event import MatchEventResponse
 from app.schemas.match import MatchDateResponse, MatchResponse, MatchStatisticsResponse
 from app.services.football import football_service, LIVE_STATUSES
 
@@ -182,7 +181,7 @@ async def get_matches_by_date(
     return MatchRepository.order_matches_for_date(matches)
 
 
-@router.get("/{match_id}/events", response_model=List[MatchEventResponse])
+@router.get("/{match_id}/events")
 async def get_match_events(
     match_id: int = Path(..., gt=0),
     db: AsyncSession = Depends(get_db)

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.cache import make_cache_key
 from app.core.config import settings
 from app.models.standing import Standings
+from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.standing_repository import StandingRepository
 from app.schemas.standing import StandingResponse
 from app.services.base.football_client import FootballAPIClient
@@ -22,6 +23,7 @@ class StandingService:
         self.team_service = team_service
         self.cache_service = cache_service or CacheService()
         self.standing_repository = StandingRepository()
+        self.allowed_league_repository = AllowedLeagueRepository()
 
     async def get_league_standings(self, league_id: int, season: int) -> Optional[dict]:
         return await self.client.get("/standings", params={"league": league_id, "season": season})
@@ -72,6 +74,16 @@ class StandingService:
         self.cache_service.delete_sync(make_cache_key("standings", league_id, season))
 
     async def sync_standings(self, db: AsyncSession, league_id: int, season: int) -> dict:
+        allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
+        if not allowed_ids:
+            logger.info("Allowed league list is empty; skipping standings synchronization for league_id=%s", league_id)
+            return {"success": True, "league_id": league_id, "season": season, "updated": 0, "message": "League is not allowed for synchronization"}
+
+        if league_id not in allowed_ids:
+            logger.info("SKIPPED LEAGUE: league_id=%s league_name=%s", league_id, "requested league")
+            return {"success": True, "league_id": league_id, "season": season, "updated": 0, "message": "League is not allowed for synchronization"}
+
+        logger.info("ALLOWED LEAGUE: league_id=%s league_name=%s", league_id, "requested league")
         result = await self.get_league_standings(league_id, season)
         if not result or "response" not in result or not result["response"]:
             return {"success": False, "message": "No standings data found from API"}
