@@ -11,6 +11,7 @@ from app.db import get_db
 from app.models.league import League
 from app.schemas.league import League as LeagueSchema, LeagueGroupResponse, TopScorersResponse
 from app.schemas.standing import StandingResponse
+from app.repositories.league_repository import LeagueRepository
 from app.services.football import football_service
 from app.services.league_grouping_service import LeagueGroupingService
 
@@ -39,11 +40,7 @@ async def get_grouped_leagues(db: AsyncSession = Depends(get_db)):
     if cached is not None:
         return cached
 
-    result = await db.execute(
-        select(League)
-        .order_by(League.is_featured.desc(), League.display_order.asc(), League.name.asc())
-    )
-    leagues = result.scalars().all()
+    leagues = await LeagueRepository().get_all_leagues(db)
     payload = LeagueGroupingService().build_groups(leagues)
     await cache_set_json(cache_key, payload, settings.REDIS_TTL_LEAGUE_TEAM)
     return payload

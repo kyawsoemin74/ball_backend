@@ -8,8 +8,14 @@ class LeagueGroupingService:
     """Builds frontend-ready league groups with featured leagues first."""
 
     def build_groups(self, leagues: Iterable[League]) -> list[dict]:
+        visible = [
+            league
+            for league in leagues
+            if int(getattr(league, "display_order", 999) or 999) <= 200
+            or bool(getattr(league, "is_featured", False))
+        ]
         ordered = sorted(
-            leagues,
+            visible,
             key=lambda league: (
                 0 if getattr(league, "is_featured", False) else 1,
                 int(getattr(league, "display_order", 999) or 999),
@@ -31,7 +37,10 @@ class LeagueGroupingService:
         for country in sorted(by_country.keys(), key=lambda value: value.lower()):
             country_leagues = sorted(
                 by_country[country],
-                key=lambda league: str(getattr(league, "name", "")).lower(),
+                key=lambda league: (
+                    int(getattr(league, "display_order", 999) or 999),
+                    str(getattr(league, "name", "")).lower(),
+                ),
             )
             groups.append({"type": "country", "country": country, "leagues": [self._serialize(league) for league in country_leagues]})
 

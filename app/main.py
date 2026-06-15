@@ -18,6 +18,7 @@ from app.api.news import router as news_router
 from app.api.auth import router as auth_router
 from app.api.socket import router as socket_router
 from app.api.uploads import router as uploads_router
+from app.api.admin_leagues import router as admin_leagues_router
 from sqlalchemy import text
 from app.db import async_session, engine
 from app.admin import setup_admin
@@ -86,6 +87,7 @@ app.include_router(socket_router)
 app.include_router(matches_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(home_router, prefix="/api", tags=["home"])
+app.include_router(admin_leagues_router, prefix="/api/admin", tags=["admin"])
 app.include_router(leagues_router, prefix="/api/leagues", tags=["leagues"])
 app.include_router(teams_router, prefix="/api/teams", tags=["teams"])
 app.include_router(ads_router, prefix="/api/ads", tags=["ads"])

@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
 
@@ -24,6 +24,11 @@ class League(LeagueBase):
 
     class Config:
         from_attributes = True
+
+
+class LeagueVisibilityUpdate(BaseModel):
+    display_order: Optional[int] = Field(default=None, ge=1)
+    is_featured: Optional[bool] = None
 
 
 class LeagueGroupResponse(BaseModel):

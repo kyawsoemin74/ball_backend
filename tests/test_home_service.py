@@ -53,6 +53,29 @@ def test_home_service_featured_and_live_today_are_ordered():
     assert [item["league_id"] for item in payload["featured"]] == [2, 4]
 
 
+def test_home_service_excludes_display_order_above_200_and_keeps_featured_leagues():
+    all_leagues = [
+        make_league(10, "Hidden League", "England", False, 201),
+        make_league(11, "Visible League", "England", False, 150),
+    ]
+
+    service = HomeService(
+        FakeLeagueRepository(
+            featured=[make_league(12, "Featured League", "England", True, 500)],
+            all_leagues=all_leagues,
+        )
+    )
+
+    payload = asyncio.run(service.get_home_payload(None))
+
+    visible_ids = [item["league_id"] for item in payload["countries"][0]["leagues"]]
+    featured_ids = [item["league_id"] for item in payload["featured"]]
+
+    assert 11 in visible_ids
+    assert 12 in featured_ids
+    assert 10 not in visible_ids
+
+
 def test_home_service_groups_non_featured_countries():
     all_leagues = [
         make_league(1, "Premier League", "England", True, 1),

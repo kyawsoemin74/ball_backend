@@ -25,8 +25,14 @@ class HomeService:
         }
 
     def _order_leagues(self, leagues) -> list:
+        visible = [
+            league
+            for league in leagues
+            if int(getattr(league, "display_order", 999) or 999) <= 200
+            or bool(getattr(league, "is_featured", False))
+        ]
         return sorted(
-            leagues,
+            visible,
             key=lambda league: (
                 int(getattr(league, "display_order", 999) or 999),
                 str(getattr(league, "name", "")).lower(),

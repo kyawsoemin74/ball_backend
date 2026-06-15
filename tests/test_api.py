@@ -4,9 +4,15 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.routing import NoMatchFound
 
+from datetime import datetime
+
+from fastapi import HTTPException
+
 from app.db import get_db
 from app.main import app
 from app.schemas.match import MatchResponse
+from app.api.admin_leagues import router as admin_leagues_router
+from app.core.security import get_current_active_admin
 
 client = TestClient(app)
 
@@ -36,6 +42,80 @@ def test_league_sync_route_exists():
 def test_grouped_leagues_route_exists():
     path = app.url_path_for("get_grouped_leagues")
     assert path == "/api/leagues/grouped"
+
+
+def test_admin_league_patch_route_exists():
+    assert "patch_admin_league" in [route.name for route in admin_leagues_router.routes]
+    path = app.url_path_for("patch_admin_league", league_id="7")
+    assert path == "/api/admin/leagues/7"
+
+
+def test_admin_league_patch_route_is_in_openapi():
+    response = client.get("/api/openapi.json")
+
+    assert response.status_code == 200
+    assert "/api/admin/leagues/{league_id}" in response.json()["paths"]
+
+
+def test_admin_league_patch_updates_league(monkeypatch):
+    league = SimpleNamespace(
+        league_id=7,
+        name="Test League",
+        country="England",
+        country_code=None,
+        logo=None,
+        season="2024",
+        display_order=999,
+        is_featured=False,
+        created_at=datetime.utcnow(),
+        updated_at=None,
+    )
+    committed = {"value": False}
+
+    class FakeResult:
+        def scalar_one_or_none(self):
+            return league
+
+    class FakeDB:
+        async def execute(self, query):
+            return FakeResult()
+
+        async def commit(self):
+            committed["value"] = True
+
+        async def refresh(self, obj):
+            return None
+
+    async def override_get_db():
+        yield FakeDB()
+
+    async def override_admin():
+        return SimpleNamespace(role="admin", is_active=True)
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_active_admin] = override_admin
+    try:
+        response = client.patch("/api/admin/leagues/7", json={"display_order": 25, "is_featured": True})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert league.display_order == 25
+    assert league.is_featured is True
+    assert committed["value"] is True
+
+
+def test_admin_league_patch_rejects_non_admin():
+    async def override_admin():
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    app.dependency_overrides[get_current_active_admin] = override_admin
+    try:
+        response = client.patch("/api/admin/leagues/7", json={"display_order": 25})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 403
 
 
 def test_team_fixtures_service_uses_db_cache_not_api_football():
