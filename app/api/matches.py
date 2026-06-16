@@ -11,7 +11,9 @@ from app.db import get_db
 from app.models.league import League
 from app.models.match import Match
 from app.models.match_event import MatchEvent
+from app.models.match_h2h import MatchH2H
 from app.models.match_lineup import MatchLineup
+from app.models.odds import Odds
 from app.models.standing import Standings
 from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.match_repository import MatchRepository
@@ -75,18 +77,8 @@ async def _build_match_availability_flags(match: Match, db: AsyncSession) -> Dic
     lineup_result = await db.execute(select(MatchLineup).where(MatchLineup.match_id == match.match_id).limit(1))
     flags["has_lineups"] = lineup_result.scalar_one_or_none() is not None
 
-    try:
-        odds_payload = await football_service.get_cached_odds(db, match.match_id)
-    except Exception:
-        odds_payload = {}
-    flags["has_odds"] = _has_availability_data(odds_payload)
-
-    if match.home_team_id and match.away_team_id:
-        try:
-            h2h_payload = await football_service.get_cached_h2h(db, match.home_team_id, match.away_team_id, match.match_id)
-        except Exception:
-            h2h_payload = {}
-        flags["has_h2h"] = _has_availability_data(h2h_payload)
+    flags["has_odds"] = await _has_odds_available(match.match_id, db)
+    flags["has_h2h"] = await _has_h2h_available(match.home_team_id, match.away_team_id, match.match_id, db)
 
     league = await db.get(League, match.league_id)
     season = getattr(league, "season", None) if league else None
@@ -103,6 +95,39 @@ async def _build_match_availability_flags(match: Match, db: AsyncSession) -> Dic
         flags["is_knockout"] = True
 
     return flags
+
+
+async def _has_odds_available(match_id: int, db: AsyncSession) -> bool:
+    odds_result = await db.execute(select(Odds).where(Odds.fixture_id == match_id).limit(1))
+    if odds_result.scalar_one_or_none() is not None:
+        return True
+
+    try:
+        odds_payload = await football_service.get_cached_odds(db, match_id)
+    except Exception:
+        odds_payload = {}
+    return _has_availability_data(odds_payload)
+
+
+def _build_h2h_key(home_team_id: int, away_team_id: int) -> str:
+    ids = sorted([home_team_id, away_team_id])
+    return f"{ids[0]}-{ids[1]}"
+
+
+async def _has_h2h_available(home_team_id: int | None, away_team_id: int | None, match_id: int, db: AsyncSession) -> bool:
+    if not home_team_id or not away_team_id:
+        return False
+
+    h2h_key = _build_h2h_key(home_team_id, away_team_id)
+    h2h_result = await db.execute(select(MatchH2H).where(MatchH2H.h2h_key == h2h_key).limit(1))
+    if h2h_result.scalar_one_or_none() is not None:
+        return True
+
+    try:
+        h2h_payload = await football_service.get_cached_h2h(db, home_team_id, away_team_id, match_id)
+    except Exception:
+        h2h_payload = {}
+    return _has_availability_data(h2h_payload)
 
 
 # --- GET Routes (Specific Routes First) ---

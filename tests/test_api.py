@@ -709,6 +709,84 @@ def test_match_response_includes_availability_flags():
     assert payload["has_bracket"] is False
 
 
+def test_finished_match_availability_flags_persist_with_stored_data(monkeypatch):
+    from app.api.matches import _assert_match_allowed
+
+    class FakeResult:
+        def __init__(self, value):
+            self._value = value
+
+        def scalar_one_or_none(self):
+            return self._value
+
+    class FakeDB:
+        def __init__(self):
+            self.calls = 0
+            self.league = SimpleNamespace(season=2026)
+
+        async def execute(self, query):
+            self.calls += 1
+            if self.calls == 1:
+                return FakeResult(None)
+            if self.calls == 2:
+                return FakeResult(SimpleNamespace(match_id=1))
+            if self.calls == 3:
+                return FakeResult(SimpleNamespace(id=1))
+            if self.calls == 4:
+                return FakeResult(SimpleNamespace(id=1))
+            if self.calls == 5:
+                return FakeResult(SimpleNamespace(id=1))
+            return FakeResult(None)
+
+        async def get(self, model, pk):
+            return self.league
+
+    async def fake_assert_match_allowed(match_id, db):
+        return SimpleNamespace(
+            match_id=match_id,
+            league_id=39,
+            league_name="Premier League",
+            country_name="England",
+            match_time="2026-06-10T18:00:00+00:00",
+            status="FT",
+            elapsed=90,
+            home_team="Team A",
+            home_team_id=1,
+            home_team_logo=None,
+            away_team="Team B",
+            away_team_id=2,
+            away_team_logo=None,
+            home_score=2,
+            away_score=1,
+            venue_name=None,
+            venue_city=None,
+            created_at=None,
+            updated_at=None,
+        )
+
+    async def fake_get_cached_statistics(db, match_id):
+        return {"error": "Statistics not found"}
+
+    async def override_get_db():
+        yield FakeDB()
+
+    monkeypatch.setattr("app.api.matches._assert_match_allowed", fake_assert_match_allowed)
+    monkeypatch.setattr("app.services.football.football_service.get_cached_statistics", fake_get_cached_statistics)
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        response = client.get("/api/matches/1")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "FT"
+    assert payload["has_lineups"] is True
+    assert payload["has_odds"] is True
+    assert payload["has_h2h"] is True
+    assert payload["has_standings"] is True
+
+
 def test_has_availability_data_accepts_cached_payload_shapes():
     from app.api.matches import _has_availability_data
 
