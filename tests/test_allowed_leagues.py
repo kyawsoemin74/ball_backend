@@ -435,6 +435,104 @@ def test_standing_service_sync_standings_skips_unallowed_league():
     assert result["message"] == "League is not allowed for synchronization"
 
 
+def test_standing_service_flatten_standings_groups_single_group():
+    service = StandingService(client=FakeStandingClient(), team_service=FakeTeamService(), cache_service=FakeCacheService())
+    api_result = {
+        "response": [
+            {
+                "league": {
+                    "standings": [
+                        [
+                            {
+                                "rank": 1,
+                                "team": {"id": 1, "name": "One", "logo": None, "country": "X"},
+                                "points": 10,
+                                "all": {"played": 5, "win": 3, "draw": 1, "lose": 1},
+                                "goalsDiff": 5,
+                            }
+                        ]
+                    ]
+                }
+            }
+        ]
+    }
+
+    flattened = service._flatten_standings_groups(api_result)
+    assert isinstance(flattened, list)
+    assert len(flattened) == 1
+    assert flattened[0]["team"]["id"] == 1
+
+
+def test_standing_service_flatten_standings_groups_multi_group():
+    service = StandingService(client=FakeStandingClient(), team_service=FakeTeamService(), cache_service=FakeCacheService())
+    api_result = {
+        "response": [
+            {
+                "league": {
+                    "standings": [
+                        [
+                            {"rank": 1, "team": {"id": 1, "name": "One", "logo": None, "country": "X"}, "points": 10, "all": {"played": 5, "win": 3, "draw": 1, "lose": 1}, "goalsDiff": 5},
+                            {"rank": 2, "team": {"id": 2, "name": "Two", "logo": None, "country": "Y"}, "points": 8, "all": {"played": 5, "win": 2, "draw": 2, "lose": 1}, "goalsDiff": 1},
+                        ],
+                        [
+                            {"rank": 1, "team": {"id": 3, "name": "Three", "logo": None, "country": "Z"}, "points": 12, "all": {"played": 5, "win": 4, "draw": 0, "lose": 1}, "goalsDiff": 8},
+                            {"rank": 2, "team": {"id": 4, "name": "Four", "logo": None, "country": "W"}, "points": 9, "all": {"played": 5, "win": 3, "draw": 0, "lose": 2}, "goalsDiff": 4},
+                        ],
+                    ]
+                }
+            }
+        ]
+    }
+
+    flattened = service._flatten_standings_groups(api_result)
+    assert isinstance(flattened, list)
+    assert len(flattened) == 4
+    assert {team["team"]["id"] for team in flattened} == {1, 2, 3, 4}
+
+
+def test_standing_service_sync_standings_multi_group_flattened_rows():
+    class FakeMultiGroupStandingClient:
+        async def get(self, path, params=None):
+            return {
+                "response": [
+                    {
+                        "league": {
+                            "standings": [
+                                [
+                                    {"rank": 1, "team": {"id": 1, "name": "One", "logo": None, "country": "X"}, "points": 10, "all": {"played": 5, "win": 3, "draw": 1, "lose": 1}, "goalsDiff": 5},
+                                ],
+                                [
+                                    {"rank": 1, "team": {"id": 2, "name": "Two", "logo": None, "country": "Y"}, "points": 12, "all": {"played": 5, "win": 4, "draw": 0, "lose": 1}, "goalsDiff": 8},
+                                ],
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    class RecordingMultiGroupStandingService(StandingService):
+        async def upsert_standings(self, db, standings_data, league_id, season):
+            self.recorded_standings = standings_data
+            await super().upsert_standings(db, standings_data, league_id, season)
+
+    service = RecordingMultiGroupStandingService(
+        client=FakeMultiGroupStandingClient(),
+        team_service=FakeTeamService(),
+        cache_service=FakeCacheService(),
+    )
+    service.allowed_league_repository = FakeAllowedIdsRepository([1])
+
+    async def run():
+        return await service.sync_standings(FakeSyncDB(), 1, 2026)
+
+    result = asyncio.run(run())
+    assert result["success"] is True
+    assert result["updated"] == 2
+    assert hasattr(service, "recorded_standings")
+    assert len(service.recorded_standings) == 2
+    assert {row["team"]["id"] for row in service.recorded_standings} == {1, 2}
+
+
 def test_allowed_leagues_admin_requires_admin_access():
     async def override_admin():
         raise HTTPException(status_code=403, detail="Forbidden")

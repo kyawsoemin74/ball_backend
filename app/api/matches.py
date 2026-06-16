@@ -80,15 +80,12 @@ async def _build_match_availability_flags(match: Match, db: AsyncSession) -> Dic
     flags["has_odds"] = await _has_odds_available(match.match_id, db)
     flags["has_h2h"] = await _has_h2h_available(match.home_team_id, match.away_team_id, match.match_id, db)
 
-    league = await db.get(League, match.league_id)
-    season = getattr(league, "season", None) if league else None
-    if season:
-        standings_result = await db.execute(
-            select(Standings)
-            .where(Standings.league_id == match.league_id, Standings.season == str(season))
-            .limit(1)
-        )
-        flags["has_standings"] = standings_result.scalar_one_or_none() is not None
+    standings_result = await db.execute(
+        select(Standings.id)
+        .where(Standings.league_id == match.league_id)
+        .limit(1)
+    )
+    flags["has_standings"] = standings_result.scalar_one_or_none() is not None
 
     league_name = (match.league_name or "").lower()
     if any(keyword in league_name for keyword in ("cup", "knockout", "playoff", "final", "semi")):

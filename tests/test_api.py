@@ -722,7 +722,7 @@ def test_finished_match_availability_flags_persist_with_stored_data(monkeypatch)
     class FakeDB:
         def __init__(self):
             self.calls = 0
-            self.league = SimpleNamespace(season=2026)
+            self.league = SimpleNamespace(season=2010)
 
         async def execute(self, query):
             self.calls += 1

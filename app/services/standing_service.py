@@ -28,6 +28,23 @@ class StandingService:
     async def get_league_standings(self, league_id: int, season: int) -> Optional[dict]:
         return await self.client.get("/standings", params={"league": league_id, "season": season})
 
+    def _flatten_standings_groups(self, api_result: dict) -> list:
+        standings_groups = api_result["response"][0].get("league", {}).get("standings", [])
+        if isinstance(standings_groups, list) and standings_groups and all(isinstance(item, dict) for item in standings_groups):
+            return standings_groups
+
+        flattened = []
+        if not isinstance(standings_groups, list):
+            raise TypeError("Unexpected standings format: expected a list of groups")
+
+        for group in standings_groups:
+            if isinstance(group, list):
+                flattened.extend(group)
+            else:
+                raise TypeError("Unexpected standings group element type: %s" % type(group))
+
+        return flattened
+
     async def upsert_standings(self, db: AsyncSession, standings_data: list, league_id: int, season: str):
         team_payload = []
         for standing in standings_data:
@@ -89,10 +106,10 @@ class StandingService:
             return {"success": False, "message": "No standings data found from API"}
 
         try:
-            standings_list = result["response"][0]["league"]["standings"][0]
+            standings_list = self._flatten_standings_groups(result)
             await self.upsert_standings(db, standings_list, league_id, str(season))
             return {"success": True, "league_id": league_id, "season": season, "updated": len(standings_list)}
-        except (KeyError, IndexError) as exc:
+        except (KeyError, IndexError, TypeError) as exc:
             logger.error("Error parsing standings response: %s", exc)
             return {"success": False, "message": "Unexpected API response format"}
 
@@ -113,7 +130,7 @@ class StandingService:
             api_res = await self.get_league_standings(league_id, int(season))
             if api_res and "response" in api_res and api_res["response"]:
                 try:
-                    standings_data = api_res["response"][0]["league"]["standings"][0]
+                    standings_data = self._flatten_standings_groups(api_res)
                     await self.upsert_standings(db, standings_data, league_id, str(season))
                     rows = await self.standing_repository.get_for_league_season(db, league_id, season)
                     payload = [StandingResponse.model_validate(row).model_dump(mode="json") for row in rows]
@@ -131,7 +148,7 @@ class StandingService:
             return None
 
         try:
-            standings_data = api_res["response"][0]["league"]["standings"][0]
+            standings_data = self._flatten_standings_groups(api_res)
             await self.upsert_standings(db, standings_data, league_id, str(season))
             rows = await self.standing_repository.get_for_league_season(db, league_id, season)
             payload = [StandingResponse.model_validate(row).model_dump(mode="json") for row in rows]
