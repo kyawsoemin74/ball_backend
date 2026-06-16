@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import asyncio
 
 import pytest
 from fastapi.testclient import TestClient
@@ -325,7 +326,7 @@ def test_home_endpoint_returns_payload(monkeypatch):
     assert response.json() == expected
 
 
-def test_matches_date_endpoint_filters_invisible_leagues(monkeypatch):
+def test_matches_date_endpoint_returns_all_matches(monkeypatch):
     from app.api import matches as matches_api
 
     visible_match = SimpleNamespace(
@@ -355,10 +356,15 @@ def test_matches_date_endpoint_filters_invisible_leagues(monkeypatch):
         league_obj=SimpleNamespace(display_order=201, is_featured=False, country="Test", name="Hidden League"),
     )
 
-    async def fake_get_matches_by_date(self, db, date_val):
+    async def fake_get_matches_by_date(self, db, date_val, allowed_ids=None):
+        assert allowed_ids == {1}
         return [hidden_match, visible_match]
 
+    async def fake_allowed_ids(self, db):
+        return {1}
+
     monkeypatch.setattr(matches_api.MatchRepository, "get_matches_by_date", fake_get_matches_by_date)
+    monkeypatch.setattr(matches_api.AllowedLeagueRepository, "get_allowed_ids", fake_allowed_ids)
 
     async def override_get_db():
         yield object()
@@ -371,7 +377,7 @@ def test_matches_date_endpoint_filters_invisible_leagues(monkeypatch):
 
     assert response.status_code == 200
     payload = response.json()
-    assert [item["match_id"] for item in payload] == [1]
+    assert [item["match_id"] for item in payload] == [1, 2]
 
 
 def test_matches_date_endpoint_uses_ordered_repository_results(monkeypatch):
@@ -381,14 +387,18 @@ def test_matches_date_endpoint_uses_ordered_repository_results(monkeypatch):
         {"match_id": 2, "league_id": 2, "league_name": "Ordered League", "country_name": "Test", "match_time": "2026-06-05T18:00:00+00:00", "status": "NS", "home_team": "A", "away_team": "B", "home_score": 0, "away_score": 0},
     ]
 
-    async def fake_get_matches_by_date(self, db, date_val):
+    async def fake_get_matches_by_date(self, db, date_val, allowed_ids=None):
         return []
 
     def fake_order_matches_for_date(matches):
         return ordered_matches
 
+    async def fake_allowed_ids(self, db):
+        return {2}
+
     monkeypatch.setattr(matches_api.MatchRepository, "get_matches_by_date", fake_get_matches_by_date)
     monkeypatch.setattr(matches_api.MatchRepository, "order_matches_for_date", staticmethod(fake_order_matches_for_date))
+    monkeypatch.setattr(matches_api.AllowedLeagueRepository, "get_allowed_ids", fake_allowed_ids)
 
     async def override_get_db():
         yield object()
@@ -406,8 +416,238 @@ def test_matches_date_endpoint_uses_ordered_repository_results(monkeypatch):
     assert payload[0]["league_name"] == "Ordered League"
 
 
-def test_date_matches_response_excludes_availability_flags():
-    response = client.get("/api/matches/date/2026-06-10")
+def test_live_matches_endpoint_returns_only_allowed_league(monkeypatch):
+    from app.api import matches as matches_api
+
+    visible_match = SimpleNamespace(match_id=1, league_id=2, league_name="Allowed League", country_name="Test", match_time="2026-06-16T18:00:00+00:00", status="LIVE", home_team="A", away_team="B", home_score=1, away_score=0)
+    hidden_match = SimpleNamespace(match_id=2, league_id=39, league_name="Hidden League", country_name="Test", match_time="2026-06-16T19:00:00+00:00", status="LIVE", home_team="C", away_team="D", home_score=0, away_score=0)
+
+    async def fake_get_live_matches(self, db, allowed_ids=None):
+        assert allowed_ids == {2}
+        return [visible_match]
+
+    async def fake_allowed_ids(self, db):
+        return {2}
+
+    async def fake_cache_get_json(key):
+        return None
+
+    monkeypatch.setattr(matches_api, "cache_get_json", fake_cache_get_json)
+    monkeypatch.setattr(matches_api.MatchRepository, "get_live_matches", fake_get_live_matches)
+    monkeypatch.setattr(matches_api.AllowedLeagueRepository, "get_allowed_ids", fake_allowed_ids)
+
+    async def override_get_db():
+        yield object()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        response = client.get("/api/matches/live_all")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["league_id"] == 2
+
+
+def test_matches_all_endpoint_filters_to_allowed_league(monkeypatch):
+    from app.api import matches as matches_api
+
+    visible_match = SimpleNamespace(match_id=1, league_id=2, league_name="Allowed League", country_name="Test", match_time="2026-06-16T18:00:00+00:00", status="NS", home_team="A", away_team="B", home_score=0, away_score=0)
+
+    async def fake_get_all_matches(self, db, allowed_ids=None, status=None, league_id=None, skip=0, limit=100):
+        assert allowed_ids == {2}
+        assert status == "NS"
+        return [visible_match]
+
+    async def fake_allowed_ids(self, db):
+        return {2}
+
+    monkeypatch.setattr(matches_api.MatchRepository, "get_all_matches", fake_get_all_matches)
+    monkeypatch.setattr(matches_api.AllowedLeagueRepository, "get_allowed_ids", fake_allowed_ids)
+
+    async def override_get_db():
+        yield object()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        response = client.get("/api/matches/?status=NS")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["league_id"] == 2
+
+
+def test_leagues_grouped_only_allowed_leagues(monkeypatch):
+    from app.api import leagues as leagues_api
+
+    league_allowed = SimpleNamespace(league_id=2, name="Allowed League", country="Spain", country_code=None, logo=None, season="2024", is_featured=False, display_order=1)
+    league_hidden = SimpleNamespace(league_id=39, name="Hidden League", country="England", country_code=None, logo=None, season="2024", is_featured=False, display_order=2)
+
+    async def fake_allowed_ids(self, db):
+        return {2}
+
+    async def fake_get_all_leagues(self, db, allowed_ids=None):
+        assert allowed_ids == {2}
+        return [league for league in [league_allowed, league_hidden] if league.league_id in allowed_ids]
+
+    async def fake_cache_get_json(key):
+        return None
+
+    async def fake_cache_set_json(key, payload, ttl):
+        return None
+
+    monkeypatch.setattr(leagues_api, "cache_get_json", fake_cache_get_json)
+    monkeypatch.setattr(leagues_api, "cache_set_json", fake_cache_set_json)
+    monkeypatch.setattr(leagues_api.AllowedLeagueRepository, "get_allowed_ids", fake_allowed_ids)
+    monkeypatch.setattr(leagues_api.LeagueRepository, "get_all_leagues", fake_get_all_leagues)
+
+    async def override_get_db():
+        yield object()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        response = client.get("/api/leagues/grouped")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 1
+    assert payload[0]["leagues"][0]["league_id"] == 2
+
+
+def test_league_detail_disallowed_returns_404(monkeypatch):
+    from app.api import leagues as leagues_api
+
+    async def fake_allowed_ids(self, db):
+        return {2}
+
+    async def fake_get_by_id(self, db, league_id, allowed_ids=None):
+        assert league_id == 39
+        assert allowed_ids == {2}
+        return None
+
+    async def fake_cache_get_json(key):
+        return None
+
+    monkeypatch.setattr(leagues_api, "cache_get_json", fake_cache_get_json)
+    monkeypatch.setattr(leagues_api.AllowedLeagueRepository, "get_allowed_ids", fake_allowed_ids)
+    monkeypatch.setattr(leagues_api.LeagueRepository, "get_by_id", fake_get_by_id)
+
+    async def override_get_db():
+        yield object()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        response = client.get("/api/leagues/39")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+
+
+def test_league_standings_disallowed_returns_404(monkeypatch):
+    from app.api import leagues as leagues_api
+
+    async def fake_allowed_ids(self, db):
+        return {2}
+
+    async def fake_get_cached_standings(db, league_id, season):
+        return [{"position": 1}]
+
+    monkeypatch.setattr(leagues_api.AllowedLeagueRepository, "get_allowed_ids", fake_allowed_ids)
+    monkeypatch.setattr(leagues_api.football_service, "get_cached_standings", fake_get_cached_standings)
+
+    async def override_get_db():
+        yield object()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        response = client.get("/api/leagues/39/standing/2025")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+
+
+def test_home_service_filters_allowed_leagues(monkeypatch):
+    from app.services.home_service import HomeService
+
+    captured = {}
+    league_allowed = SimpleNamespace(league_id=2, name="Allowed League", country="Spain", country_code=None, logo=None, season="2024", is_featured=False, display_order=1)
+    league_hidden = SimpleNamespace(league_id=39, name="Hidden League", country="England", country_code=None, logo=None, season="2024", is_featured=False, display_order=2)
+
+    async def fake_allowed_ids(self, db):
+        return {2}
+
+    async def fake_leagues_with_matches_today(self, db, allowed_ids=None):
+        captured['live_today_allowed_ids'] = allowed_ids
+        return [league_allowed, league_hidden]
+
+    async def fake_featured_leagues(self, db, allowed_ids=None):
+        captured['featured_allowed_ids'] = allowed_ids
+        return [league_allowed]
+
+    async def fake_all_leagues(self, db, allowed_ids=None):
+        captured['all_allowed_ids'] = allowed_ids
+        assert allowed_ids == {2}
+        return [league_allowed]
+
+    monkeypatch.setattr("app.services.home_service.AllowedLeagueRepository.get_allowed_ids", fake_allowed_ids)
+    monkeypatch.setattr("app.services.home_service.LeagueRepository.get_leagues_with_matches_today", fake_leagues_with_matches_today)
+    monkeypatch.setattr("app.services.home_service.LeagueRepository.get_featured_leagues", fake_featured_leagues)
+    monkeypatch.setattr("app.services.home_service.LeagueRepository.get_all_leagues", fake_all_leagues)
+
+    payload = asyncio.run(HomeService().get_home_payload(None))
+
+    assert payload["live_today"][0]["league_id"] == 2
+    assert payload["featured"][0]["league_id"] == 2
+    assert payload["countries"][0]["leagues"][0]["league_id"] == 2
+    assert captured["live_today_allowed_ids"] == {2}
+    assert captured["featured_allowed_ids"] == {2}
+    assert captured["all_allowed_ids"] == {2}
+
+
+def test_date_matches_response_excludes_availability_flags(monkeypatch):
+    from app.api import matches as matches_api
+
+    visible_match = SimpleNamespace(
+        match_id=1,
+        league_id=2,
+        league_name="Visible League",
+        country_name="Test",
+        match_time="2026-06-10T18:00:00+00:00",
+        status="NS",
+        home_team="A",
+        away_team="B",
+        home_score=0,
+        away_score=0,
+        league_obj=SimpleNamespace(display_order=10, is_featured=False, country="Test", name="Visible League"),
+    )
+
+    async def fake_get_matches_by_date(self, db, date_val, allowed_ids=None):
+        assert allowed_ids == {2}
+        return [visible_match]
+
+    async def fake_allowed_ids(self, db):
+        return {2}
+
+    monkeypatch.setattr(matches_api.MatchRepository, "get_matches_by_date", fake_get_matches_by_date)
+    monkeypatch.setattr(matches_api.AllowedLeagueRepository, "get_allowed_ids", fake_allowed_ids)
+
+    async def override_get_db():
+        yield object()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        response = client.get("/api/matches/date/2026-06-10")
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 200
     assert isinstance(response.json(), list)
@@ -525,7 +765,11 @@ def test_match_odds_endpoint_commits_db_session(monkeypatch):
         assert db is fake_db
         return {"source": "api", "odds": [], "updated": 1}
 
+    async def fake_assert_match_allowed(match_id, db):
+        return SimpleNamespace(match_id=match_id, league_id=2)
+
     monkeypatch.setattr("app.services.football.football_service.get_cached_odds", fake_get_cached_odds)
+    monkeypatch.setattr("app.api.matches._assert_match_allowed", fake_assert_match_allowed)
 
     async def override_get_db():
         yield fake_db

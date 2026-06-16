@@ -1,6 +1,6 @@
 from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
@@ -9,24 +9,35 @@ from app.models.match import Match
 
 
 class MatchRepository:
-    async def get_many_by_ids(self, db: AsyncSession, match_ids: list[int]) -> list[Match]:
+    async def get_many_by_ids(self, db: AsyncSession, match_ids: list[int], allowed_ids: set[int] | None = None) -> list[Match]:
         if not match_ids:
             return []
-        result = await db.execute(select(Match).where(Match.match_id.in_(match_ids)))
+        query = select(Match).where(Match.match_id.in_(match_ids))
+        if allowed_ids is not None:
+            if not allowed_ids:
+                return []
+            query = query.where(Match.league_id.in_(allowed_ids))
+        result = await db.execute(query)
         return list(result.scalars().all())
 
-    async def get_matches_by_date(self, db: AsyncSession, date_val: date) -> list[Match]:
+    async def get_matches_by_date(self, db: AsyncSession, date_val: date, allowed_ids: set[int] | None = None) -> list[Match]:
         start_dt = (datetime.combine(date_val, datetime.min.time()) - timedelta(hours=6, minutes=30)).replace(tzinfo=timezone.utc)
         end_dt = start_dt + timedelta(days=1)
 
-        result = await db.execute(
+        query = (
             select(Match)
             .join(League, Match.league_id == League.league_id)
             .options(joinedload(Match.league_obj))
             .where(Match.match_time >= start_dt)
             .where(Match.match_time < end_dt)
-            .where(or_(League.display_order <= 200, League.is_featured.is_(True)))
-            .order_by(
+        )
+        if allowed_ids is not None:
+            if not allowed_ids:
+                return []
+            query = query.where(Match.league_id.in_(allowed_ids))
+
+        result = await db.execute(
+            query.order_by(
                 League.is_featured.desc(),
                 League.display_order.asc(),
                 League.country.asc(),
@@ -37,13 +48,39 @@ class MatchRepository:
         )
         return list(result.scalars().all())
 
-    @staticmethod
-    def is_visible_league(match: Match) -> bool:
-        league = getattr(match, "league_obj", None)
-        if league is None:
-            return True
+    async def get_by_id(self, db: AsyncSession, match_id: int, allowed_ids: set[int] | None = None) -> Match | None:
+        query = select(Match).where(Match.match_id == match_id)
+        if allowed_ids is not None:
+            if not allowed_ids:
+                return None
+            query = query.where(Match.league_id.in_(allowed_ids))
+        result = await db.execute(query)
+        return result.scalar_one_or_none()
 
-        return bool(league.display_order <= 200 or league.is_featured)
+    async def get_live_matches(self, db: AsyncSession, allowed_ids: set[int] | None = None) -> list[Match]:
+        from app.services.football import LIVE_STATUSES
+
+        query = select(Match).where(Match.status.in_(LIVE_STATUSES))
+        if allowed_ids is not None:
+            if not allowed_ids:
+                return []
+            query = query.where(Match.league_id.in_(allowed_ids))
+
+        result = await db.execute(query)
+        return list(result.scalars().all())
+
+    async def get_all_matches(self, db: AsyncSession, allowed_ids: set[int] | None = None, status: str | None = None, league_id: int | None = None, skip: int = 0, limit: int = 100) -> list[Match]:
+        query = select(Match)
+        if status:
+            query = query.where(Match.status == status)
+        if league_id:
+            query = query.where(Match.league_id == league_id)
+        if allowed_ids is not None:
+            if not allowed_ids:
+                return []
+            query = query.where(Match.league_id.in_(allowed_ids))
+        result = await db.execute(query.offset(skip).limit(limit))
+        return list(result.scalars().all())
 
     @staticmethod
     def order_matches_for_date(matches: list[Match]) -> list[Match]:

@@ -11,6 +11,7 @@ from app.db import get_db
 from app.models.league import League
 from app.schemas.league import League as LeagueSchema, LeagueGroupResponse, TopScorersResponse
 from app.schemas.standing import StandingResponse
+from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.league_repository import LeagueRepository
 from app.services.football import football_service
 from app.services.league_grouping_service import LeagueGroupingService
@@ -35,12 +36,20 @@ async def get_league_top_scorers(
 @router.get("/grouped", response_model=List[LeagueGroupResponse])
 async def get_grouped_leagues(db: AsyncSession = Depends(get_db)):
     """Return leagues in a frontend-friendly, ordered, grouped structure."""
+    allowed_ids = await AllowedLeagueRepository().get_allowed_ids(db)
     cache_key = make_cache_key("leagues_grouped")
     cached = await cache_get_json(cache_key)
     if cached is not None:
-        return cached
+        if not allowed_ids:
+            return []
+        filtered = []
+        for group in cached:
+            filtered_leagues = [league for league in group.get("leagues", []) if league.get("league_id") in allowed_ids]
+            if filtered_leagues:
+                filtered.append({**group, "leagues": filtered_leagues})
+        return filtered
 
-    leagues = await LeagueRepository().get_all_leagues(db)
+    leagues = await LeagueRepository().get_all_leagues(db, allowed_ids)
     payload = LeagueGroupingService().build_groups(leagues)
     await cache_set_json(cache_key, payload, settings.REDIS_TTL_LEAGUE_TEAM)
     return payload
@@ -50,12 +59,13 @@ async def get_league_details(league_id: int, db: AsyncSession = Depends(get_db))
     """Get league details, caching in DB and Redis"""
     cache_key = make_cache_key("league", league_id)
     cached = await cache_get_json(cache_key)
+    allowed_ids = await AllowedLeagueRepository().get_allowed_ids(db)
     if cached is not None:
+        if league_id not in allowed_ids:
+            raise HTTPException(status_code=404, detail="League not found")
         return cached
 
-    # Check DB first
-    result = await db.execute(select(League).where(League.league_id == league_id))
-    league = result.scalar_one_or_none()
+    league = await LeagueRepository().get_by_id(db, league_id, allowed_ids)
     if league:
         logger.info(f"League {league_id} fetched from DB")
         payload = LeagueSchema.from_orm(league).dict()
@@ -63,6 +73,9 @@ async def get_league_details(league_id: int, db: AsyncSession = Depends(get_db))
         return payload
 
     # Fetch from API
+    if league_id not in allowed_ids:
+        raise HTTPException(status_code=404, detail="League not found")
+
     result = await football_service.get_league_details(league_id)
     if not result or "response" not in result or not result["response"]:
         raise HTTPException(status_code=404, detail="League not found")
@@ -82,6 +95,10 @@ async def get_league_standings(
     db: AsyncSession = Depends(get_db)
 ):
     """Get league standings, ensuring fresh data."""
+    allowed_ids = await AllowedLeagueRepository().get_allowed_ids(db)
+    if league_id not in allowed_ids:
+        raise HTTPException(status_code=404, detail="Standings not found")
+
     result = await football_service.get_cached_standings(db, league_id, season)
     if result is None:
         raise HTTPException(status_code=404, detail="Standings not found")

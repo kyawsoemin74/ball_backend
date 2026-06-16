@@ -10,13 +10,13 @@ class FakeLeagueRepository:
         self._featured = list(featured or [])
         self._all_leagues = list(all_leagues or [])
 
-    async def get_leagues_with_matches_today(self, db):
+    async def get_leagues_with_matches_today(self, db, allowed_ids=None):
         return list(self._live_today)
 
-    async def get_featured_leagues(self, db):
+    async def get_featured_leagues(self, db, allowed_ids=None):
         return list(self._featured)
 
-    async def get_all_leagues(self, db):
+    async def get_all_leagues(self, db, allowed_ids=None):
         return list(self._all_leagues)
 
 
@@ -53,7 +53,7 @@ def test_home_service_featured_and_live_today_are_ordered():
     assert [item["league_id"] for item in payload["featured"]] == [2, 4]
 
 
-def test_home_service_excludes_display_order_above_200_and_keeps_featured_leagues():
+def test_home_service_includes_all_leagues_in_read_payload():
     all_leagues = [
         make_league(10, "Hidden League", "England", False, 201),
         make_league(11, "Visible League", "England", False, 150),
@@ -71,9 +71,9 @@ def test_home_service_excludes_display_order_above_200_and_keeps_featured_league
     visible_ids = [item["league_id"] for item in payload["countries"][0]["leagues"]]
     featured_ids = [item["league_id"] for item in payload["featured"]]
 
+    assert 10 in visible_ids
     assert 11 in visible_ids
     assert 12 in featured_ids
-    assert 10 not in visible_ids
 
 
 def test_home_service_groups_non_featured_countries():

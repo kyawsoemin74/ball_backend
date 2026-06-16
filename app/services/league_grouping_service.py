@@ -8,14 +8,8 @@ class LeagueGroupingService:
     """Builds frontend-ready league groups with featured leagues first."""
 
     def build_groups(self, leagues: Iterable[League]) -> list[dict]:
-        visible = [
-            league
-            for league in leagues
-            if int(getattr(league, "display_order", 999) or 999) <= 200
-            or bool(getattr(league, "is_featured", False))
-        ]
         ordered = sorted(
-            visible,
+            leagues,
             key=lambda league: (
                 0 if getattr(league, "is_featured", False) else 1,
                 int(getattr(league, "display_order", 999) or 999),

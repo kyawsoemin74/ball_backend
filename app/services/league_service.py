@@ -104,7 +104,8 @@ class LeagueService:
                 existing.is_featured = bool(league_payload.get("is_featured", existing.is_featured))
             if "display_order" in league_payload:
                 existing.display_order = int(league_payload.get("display_order", existing.display_order))
-            await db.flush()
+            if db is not None:
+                await db.flush()
             self.cache_service.delete_sync(make_cache_key("league", league_id))
             return existing
 
@@ -118,9 +119,10 @@ class LeagueService:
             is_featured=bool(league_payload.get("is_featured", False)),
             display_order=int(league_payload.get("display_order", 999)),
         )
-        db.add(new_league)
-        await db.flush()
-        await db.refresh(new_league)
+        if db is not None:
+            db.add(new_league)
+            await db.flush()
+            await db.refresh(new_league)
         self.cache_service.delete_sync(make_cache_key("league", league_id))
         return new_league
 

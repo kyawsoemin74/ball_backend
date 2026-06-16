@@ -13,6 +13,7 @@ from app.models.match import Match
 from app.models.match_event import MatchEvent
 from app.models.match_lineup import MatchLineup
 from app.models.standing import Standings
+from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.match_repository import MatchRepository
 from app.schemas.match import MatchDateResponse, MatchResponse, MatchStatisticsResponse
 from app.services.football import football_service, LIVE_STATUSES
@@ -114,13 +115,15 @@ async def get_all_live_matches(
     Return cached active live matches from the database.
     Live data is kept fresh by the background scheduler polling every 2400 seconds (40 minutes).
     """
+    allowed_ids = await AllowedLeagueRepository().get_allowed_ids(db)
     cache_key = make_cache_key("live_matches")
     cached = await cache_get_json(cache_key)
     if cached is not None:
-        return cached
+        if not allowed_ids:
+            return []
+        return [item for item in cached if item.get("league_id") in allowed_ids]
 
-    result = await db.execute(select(Match).where(Match.status.in_(LIVE_STATUSES)))
-    live_matches = result.scalars().all()
+    live_matches = await MatchRepository().get_live_matches(db, allowed_ids)
     payload = [MatchResponse.model_validate(match).model_dump(mode="json") for match in live_matches]
     await cache_set_json(cache_key, payload, settings.REDIS_TTL_LIVE_MATCHES)
     return payload
@@ -137,14 +140,17 @@ async def get_all_matches(
     """
     ပွဲစဉ်အားလုံးကို Filter အသုံးပြု၍ ရယူရန်။
     """
-    query = select(Match)
-    if status:
-        query = query.where(Match.status == status)
-    if league_id:
-        query = query.where(Match.league_id == league_id)
+    allowed_ids = await AllowedLeagueRepository().get_allowed_ids(db)
+    matches = await MatchRepository().get_all_matches(db, allowed_ids=allowed_ids, status=status, league_id=league_id, skip=skip, limit=limit)
+    return matches
 
-    result = await db.execute(query.offset(skip).limit(limit))
-    return result.scalars().all()
+
+async def _assert_match_allowed(match_id: int, db: AsyncSession) -> Match:
+    allowed_ids = await AllowedLeagueRepository().get_allowed_ids(db)
+    match = await MatchRepository().get_by_id(db, match_id, allowed_ids)
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+    return match
 
 
 @router.get("/{match_id}", response_model=MatchResponse)
@@ -156,12 +162,7 @@ async def get_match_by_id(
     Match ID အသုံးပြုပြီး ပွဲစဉ်အသေးစိတ်ကို ရယူရန်။
     (Note: match_id သည် integer ဖြစ်ရပါမည်။)
     """
-    result = await db.execute(select(Match).where(Match.match_id == match_id))
-    match = result.scalar_one_or_none()
-
-    if not match:
-        raise HTTPException(status_code=404, detail="Match not found")
-
+    match = await _assert_match_allowed(match_id, db)
     availability_flags = await _build_match_availability_flags(match, db)
     response = MatchResponse.model_validate(match)
     return response.model_copy(update=availability_flags)
@@ -176,8 +177,8 @@ async def get_matches_by_date(
     သတ်မှတ်ထားသော ရက်စွဲအလိုက် ပွဲစဉ်များကို ရယူရန်။
     Myanmar Timezone (UTC+6:30) aware - returns matches for the full day in Myanmar time.
     """
-    matches = await MatchRepository().get_matches_by_date(db, date_val)
-    matches = [match for match in matches if MatchRepository.is_visible_league(match)]
+    allowed_ids = await AllowedLeagueRepository().get_allowed_ids(db)
+    matches = await MatchRepository().get_matches_by_date(db, date_val, allowed_ids)
     return MatchRepository.order_matches_for_date(matches)
 
 
@@ -189,6 +190,7 @@ async def get_match_events(
     """
     Get match events with smart caching and DB persistence for finished matches.
     """
+    await _assert_match_allowed(match_id, db)
     result = await football_service.get_cached_match_events(db, match_id)
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Events not found")
@@ -203,6 +205,7 @@ async def get_match_lineup(
     """
     Get match lineup for a specific match.
     """
+    await _assert_match_allowed(match_id, db)
     result = await football_service.get_cached_match_lineup(db, match_id)
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lineup not found")
@@ -219,6 +222,7 @@ async def get_match_h2h_symmetric(
     """
     Get head-to-head statistics with symmetric team key logic and smart persistence.
     """
+    await _assert_match_allowed(match_id, db)
     result = await football_service.get_cached_h2h(db, team1_id, team2_id, match_id)
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="H2H data not found")
@@ -233,6 +237,7 @@ async def get_match_statistics(
     """
     Get normalized match statistics for a specific match using the existing cached API-Football data.
     """
+    await _assert_match_allowed(match_id, db)
     result = await football_service.get_normalized_statistics(db, match_id)
     if not result or "error" in result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Statistics not found")
@@ -245,6 +250,7 @@ async def get_match_odds(match_id: int = Path(..., gt=0), db: AsyncSession = Dep
     Get betting odds for a specific match with smart caching (30-min rule, no API after match start).
     """
     # Fallback to Service logic (DB check -> API fetch if needed)
+    await _assert_match_allowed(match_id, db)
     result = await football_service.get_cached_odds(db, match_id)
     if "error" in result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["error"])
