@@ -9,6 +9,9 @@ class StandingBase(BaseModel):
     team_id: int
     team_name: str
     team_logo: Optional[str] = None
+    group_name: Optional[str] = None
+    form: Optional[str] = None
+    description: Optional[str] = None
     points: int
     played: int
     won: int

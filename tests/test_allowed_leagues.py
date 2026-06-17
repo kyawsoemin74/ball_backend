@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from app.services.allowed_league_service import AllowedLeagueService
 from app.services.league_service import LeagueService
 from app.services.match_service import MatchService
 from app.services.standing_service import StandingService
+from app.schemas.standing import StandingResponse
 
 client = TestClient(app)
 
@@ -290,6 +292,9 @@ class RecordingStandingService(StandingService):
 
 
 class FakeSyncDB:
+    def __init__(self):
+        self.added = []
+
     async def execute(self, query):
         class FakeScalars:
             def all(self):
@@ -314,7 +319,7 @@ class FakeSyncDB:
         return None
 
     def add(self, obj):
-        return None
+        self.added.append(obj)
 
 
 class FakeCacheService:
@@ -531,6 +536,90 @@ def test_standing_service_sync_standings_multi_group_flattened_rows():
     assert hasattr(service, "recorded_standings")
     assert len(service.recorded_standings) == 2
     assert {row["team"]["id"] for row in service.recorded_standings} == {1, 2}
+
+
+def test_standing_service_persists_standing_metadata_fields():
+    class FakeStandingClientWithMetadata:
+        async def get(self, path, params=None):
+            return {
+                "response": [
+                    {
+                        "league": {
+                            "standings": [
+                                [
+                                    {
+                                        "rank": 1,
+                                        "team": {"id": 1, "name": "One", "logo": None, "country": "X"},
+                                        "points": 10,
+                                        "group": "Group A",
+                                        "form": "WWDLW",
+                                        "description": "Promotion - World Cup",
+                                        "all": {"played": 5, "win": 3, "draw": 1, "lose": 1},
+                                        "goalsDiff": 5,
+                                    }
+                                ]
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    service = StandingService(
+        client=FakeStandingClientWithMetadata(),
+        team_service=FakeTeamService(),
+        cache_service=FakeCacheService(),
+    )
+    service.allowed_league_repository = FakeAllowedIdsRepository([1])
+    db = FakeSyncDB()
+
+    async def run():
+        return await service.sync_standings(db, 1, 2026)
+
+    result = asyncio.run(run())
+
+    assert result["success"] is True
+    assert result["updated"] == 1
+    assert len(db.added) == 1
+
+    standing = db.added[0]
+    assert standing.group_name == "Group A"
+    assert standing.form == "WWDLW"
+    assert standing.description == "Promotion - World Cup"
+
+
+def test_standing_response_includes_metadata_fields():
+    row = type(
+        "StandingRow",
+        (),
+        {
+            "id": 1,
+            "league_id": 1,
+            "season": "2026",
+            "team_id": 1,
+            "team_name": "One",
+            "team_logo": None,
+            "group_name": "Group A",
+            "form": "WWDLW",
+            "description": "Promotion - World Cup",
+            "position": 1,
+            "points": 10,
+            "played": 5,
+            "won": 3,
+            "drawn": 1,
+            "lost": 1,
+            "goals_for": 8,
+            "goals_against": 3,
+            "goal_difference": 5,
+            "created_at": datetime(2026, 6, 18, 0, 0),
+            "updated_at": datetime(2026, 6, 18, 0, 0),
+        },
+    )()
+
+    payload = StandingResponse.model_validate(row).model_dump(mode="json")
+
+    assert payload["group_name"] == "Group A"
+    assert payload["form"] == "WWDLW"
+    assert payload["description"] == "Promotion - World Cup"
 
 
 def test_allowed_leagues_admin_requires_admin_access():
