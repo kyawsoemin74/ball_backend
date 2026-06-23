@@ -14,6 +14,7 @@ class Match(Base):
     
     # League Info
     league_id = Column(Integer, ForeignKey("leagues.league_id"), nullable=False, index=True)
+    season = Column(Integer, nullable=True)
     league_name = Column(String(255), nullable=True)
     league_logo = Column(String(500), nullable=True)
     

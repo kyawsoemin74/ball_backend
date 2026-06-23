@@ -49,7 +49,7 @@ class MatchRepository:
         return list(result.scalars().all())
 
     async def get_by_id(self, db: AsyncSession, match_id: int, allowed_ids: set[int] | None = None) -> Match | None:
-        query = select(Match).where(Match.match_id == match_id)
+        query = select(Match).options(joinedload(Match.league_obj)).where(Match.match_id == match_id)
         if allowed_ids is not None:
             if not allowed_ids:
                 return None

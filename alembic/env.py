@@ -31,7 +31,8 @@ from app.models import (
     News, 
     MatchEvent, 
     MatchH2H, 
-    MatchLineup
+    MatchLineup,
+    LineupRefreshState,
 )
 
 from sqlalchemy import engine_from_config, pool, MetaData

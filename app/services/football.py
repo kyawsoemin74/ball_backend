@@ -87,6 +87,9 @@ class FootballAPIService:
     async def get_cached_match_lineup(self, db: AsyncSession, match_id: int) -> Optional[List[Dict[str, Any]]]:
         return await self.lineup_service.get_cached_match_lineup(db, match_id)
 
+    async def sync_match_lineup(self, db: AsyncSession, match_id: int) -> Dict[str, Any]:
+        return await self.lineup_service.sync_lineup(db, match_id)
+
     async def get_match_h2h(self, match_id: int) -> Optional[dict]:
         return await self.h2h_service.get_match_h2h(match_id)
 

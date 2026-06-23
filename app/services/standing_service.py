@@ -1,5 +1,4 @@
 import logging
-from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,21 +44,41 @@ class StandingService:
 
         return flattened
 
-    async def upsert_standings(self, db: AsyncSession, standings_data: list, league_id: int, season: str):
-        team_payload = []
+    def _prepare_standings_rows(self, standings_data: list) -> list[dict]:
+        prepared_rows = []
+        seen_team_ids: set[int] = set()
+
         for standing in standings_data:
             team = standing.get("team") or {}
             if not isinstance(team, dict):
                 logger.warning("Skipping standings row with invalid team payload: %r", standing)
                 continue
+
             team_id = team.get("id")
             if team_id is None:
                 logger.warning("Skipping standings row with missing team_id: %r", standing)
                 continue
-            if not team.get("name"):
-                logger.warning("Skipping standings row with missing team name for team_id=%s", team_id)
+
+            normalized_team_id = int(team_id)
+            if normalized_team_id in seen_team_ids:
+                logger.warning("Skipping duplicate standings row for team_id=%s", normalized_team_id)
                 continue
-            team_payload.append({"team_id": int(team_id), "name": team.get("name"), "logo": team.get("logo"), "country": team.get("country")})
+
+            if not team.get("name"):
+                logger.warning("Skipping standings row with missing team name for team_id=%s", normalized_team_id)
+                continue
+
+            seen_team_ids.add(normalized_team_id)
+            prepared_rows.append(standing)
+
+        return prepared_rows
+
+    async def upsert_standings(self, db: AsyncSession, standings_data: list, league_id: int, season: str):
+        prepared_rows = self._prepare_standings_rows(standings_data)
+        team_payload = []
+        for standing in prepared_rows:
+            team = standing.get("team") or {}
+            team_payload.append({"team_id": int(team["id"]), "name": team.get("name"), "logo": team.get("logo"), "country": team.get("country")})
 
         await self.team_service.ensure_teams_exist(db, team_payload)
         logger.info("Standings sync ensured %s teams before insert", len(team_payload))
@@ -67,7 +86,7 @@ class StandingService:
         await self.standing_repository.delete_for_league_season(db, league_id, season)
         await db.flush()
 
-        for standing in standings_data:
+        for standing in prepared_rows:
             goals_for = standing.get("all", {}).get("goals", {}).get("for", 0)
             goals_against = standing.get("all", {}).get("goals", {}).get("against", 0)
             db.add(Standings(
@@ -92,6 +111,7 @@ class StandingService:
 
         await db.flush()
         self.cache_service.delete_sync(make_cache_key("standings", league_id, season))
+        return len(prepared_rows)
 
     async def sync_standings(self, db: AsyncSession, league_id: int, season: int) -> dict:
         allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
@@ -110,8 +130,10 @@ class StandingService:
 
         try:
             standings_list = self._flatten_standings_groups(result)
-            await self.upsert_standings(db, standings_list, league_id, str(season))
-            return {"success": True, "league_id": league_id, "season": season, "updated": len(standings_list)}
+            updated_count = await self.upsert_standings(db, standings_list, league_id, str(season))
+            if updated_count is None:
+                updated_count = len(self._prepare_standings_rows(standings_list))
+            return {"success": True, "league_id": league_id, "season": season, "updated": updated_count}
         except (KeyError, IndexError, TypeError) as exc:
             logger.error("Error parsing standings response: %s", exc)
             return {"success": False, "message": "Unexpected API response format"}
@@ -124,39 +146,8 @@ class StandingService:
 
         standings_rows = await self.standing_repository.get_for_league_season(db, league_id, season)
         if standings_rows:
-            latest_update = max((row.updated_at for row in standings_rows if row.updated_at), default=None)
-            if latest_update and (datetime.now(timezone.utc) - latest_update) < timedelta(seconds=int(settings.REDIS_TTL_STANDINGS)):
-                payload = [StandingResponse.model_validate(row).model_dump(mode="json") for row in standings_rows]
-                await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_STANDINGS)
-                return payload
-
-            api_res = await self.get_league_standings(league_id, int(season))
-            if api_res and "response" in api_res and api_res["response"]:
-                try:
-                    standings_data = self._flatten_standings_groups(api_res)
-                    await self.upsert_standings(db, standings_data, league_id, str(season))
-                    rows = await self.standing_repository.get_for_league_season(db, league_id, season)
-                    payload = [StandingResponse.model_validate(row).model_dump(mode="json") for row in rows]
-                    await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_STANDINGS)
-                    return payload
-                except Exception as exc:
-                    logger.error("Error refreshing standings for league %s season %s: %s", league_id, season, exc)
-
             payload = [StandingResponse.model_validate(row).model_dump(mode="json") for row in standings_rows]
             await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_STANDINGS)
             return payload
 
-        api_res = await self.get_league_standings(league_id, int(season))
-        if not api_res or "response" not in api_res or not api_res["response"]:
-            return None
-
-        try:
-            standings_data = self._flatten_standings_groups(api_res)
-            await self.upsert_standings(db, standings_data, league_id, str(season))
-            rows = await self.standing_repository.get_for_league_season(db, league_id, season)
-            payload = [StandingResponse.model_validate(row).model_dump(mode="json") for row in rows]
-            await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_STANDINGS)
-            return payload
-        except Exception as exc:
-            logger.error("Error fetching/upserting standings for league %s season %s: %s", league_id, season, exc)
-            return None
+        return None

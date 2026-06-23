@@ -73,6 +73,9 @@ class FakeCacheService:
     def delete_sync(self, key):
         return None
 
+    async def delete(self, key):
+        return None
+
 
 def test_admin_allowed_leagues_route_exists():
     assert "get_allowed_leagues" in [route.name for route in admin_leagues_router.routes]
@@ -236,12 +239,12 @@ class FakeMatchClient:
     async def get(self, path, params=None):
         return {"response": [
             {"fixture": {"id": 1001, "date": "2026-06-15T18:00:00+00:00", "status": {"short": "NS", "elapsed": 0}, "venue": {"name": "A", "city": "B"}},
-             "league": {"id": 39, "name": "Allowed League", "country": "X", "logo": None, "flag": None},
+             "league": {"id": 39, "season": 2026, "name": "Allowed League", "country": "X", "logo": None, "flag": None},
              "teams": {"home": {"id": 1, "name": "Home", "logo": None}, "away": {"id": 2, "name": "Away", "logo": None}},
              "goals": {"home": 0, "away": 0},
             },
             {"fixture": {"id": 1002, "date": "2026-06-15T18:00:00+00:00", "status": {"short": "NS", "elapsed": 0}, "venue": {"name": "A", "city": "B"}},
-             "league": {"id": 999, "name": "Blocked League", "country": "Y", "logo": None, "flag": None},
+             "league": {"id": 999, "season": 2026, "name": "Blocked League", "country": "Y", "logo": None, "flag": None},
              "teams": {"home": {"id": 3, "name": "Home2", "logo": None}, "away": {"id": 4, "name": "Away2", "logo": None}},
              "goals": {"home": 0, "away": 0},
             },
@@ -254,11 +257,11 @@ class RecordingMatchService(MatchService):
         self.allowed_league_repository = FakeAllowedIdsRepository(allowed_ids)
         self.seen_fixtures = None
 
-    async def _process_sync(self, db, fixtures):
+    async def _process_sync_with_candidates(self, db, fixtures):
         allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
         filtered = [fixture for fixture in fixtures if int((fixture.get("league") or {}).get("id", 0)) in allowed_ids]
         self.seen_fixtures = filtered
-        return {"success": True, "inserted": len(filtered), "updated": 0, "total": len(filtered)}
+        return {"success": True, "inserted": len(filtered), "updated": 0, "total": len(filtered)}, set()
 
 
 class FakeStandingClient:
@@ -294,6 +297,8 @@ class RecordingStandingService(StandingService):
 class FakeSyncDB:
     def __init__(self):
         self.added = []
+        self.commit_calls = 0
+        self.rollback_calls = 0
 
     async def execute(self, query):
         class FakeScalars:
@@ -318,6 +323,12 @@ class FakeSyncDB:
     async def refresh(self, obj):
         return None
 
+    async def commit(self):
+        self.commit_calls += 1
+
+    async def rollback(self):
+        self.rollback_calls += 1
+
     def add(self, obj):
         self.added.append(obj)
 
@@ -329,10 +340,74 @@ class FakeCacheService:
     def delete_sync(self, key):
         self.deleted.append(key)
 
+    async def delete(self, key):
+        self.deleted.append(key)
+
 
 class FakeTeamService:
     async def ensure_teams_exist(self, db, teams):
         return None
+
+
+class StaticFixtureClient:
+    def __init__(self, fixtures):
+        self.fixtures = fixtures
+
+    async def get(self, path, params=None):
+        return {"response": list(self.fixtures)}
+
+
+class FakeStandingRepositoryForPrewarm:
+    def __init__(self, existing_pairs=None):
+        self.existing_pairs = set(existing_pairs or [])
+        self.calls = []
+
+    async def get_for_league_season(self, db, league_id, season):
+        pair = (league_id, int(season))
+        self.calls.append(pair)
+        if pair in self.existing_pairs:
+            return [object()]
+        return []
+
+
+class FakeStandingServiceForPrewarm:
+    def __init__(self, existing_pairs=None, fail_pairs=None):
+        self.standing_repository = FakeStandingRepositoryForPrewarm(existing_pairs=existing_pairs)
+        self.fail_pairs = set(fail_pairs or [])
+        self.sync_calls = []
+
+    async def sync_standings(self, db, league_id, season):
+        pair = (league_id, int(season))
+        self.sync_calls.append(pair)
+        if pair in self.fail_pairs:
+            raise RuntimeError("standings sync failed")
+        return {"success": True, "league_id": league_id, "season": season, "updated": 1}
+
+
+class AsyncEmptyMatchRepository:
+    async def get_many_by_ids(self, db, match_ids, allowed_ids=None):
+        return []
+
+
+def make_fixture(fixture_id, league_id=39, season=2026):
+    league_payload = {"id": league_id, "name": "Allowed League", "country": "X", "logo": None, "flag": None}
+    if season is not None:
+        league_payload["season"] = season
+
+    return {
+        "fixture": {
+            "id": fixture_id,
+            "date": "2026-06-15T18:00:00+00:00",
+            "status": {"short": "NS", "elapsed": 0},
+            "venue": {"name": "A", "city": "B"},
+        },
+        "league": league_payload,
+        "teams": {
+            "home": {"id": fixture_id * 10 + 1, "name": f"Home{fixture_id}", "logo": None},
+            "away": {"id": fixture_id * 10 + 2, "name": f"Away{fixture_id}", "logo": None},
+        },
+        "goals": {"home": 0, "away": 0},
+    }
 
 
 class CountingAllowedLeagueRepository:
@@ -408,6 +483,246 @@ def test_match_service_sync_daily_fixtures_filters_unallowed_leagues_before_writ
     assert result["inserted"] == 1
     assert len(service.seen_fixtures) == 1
     assert service.seen_fixtures[0]["league"]["id"] == 39
+
+
+def test_match_service_daily_sync_prewarm_collapses_duplicate_league_season_pairs():
+    fixtures = [
+        make_fixture(3001, league_id=72, season=2026),
+        make_fixture(3002, league_id=72, season=2026),
+        make_fixture(3003, league_id=72, season=None),
+    ]
+    standing_service = FakeStandingServiceForPrewarm()
+    service = MatchService(
+        client=StaticFixtureClient(fixtures),
+        team_service=FakeTeamService(),
+        cache_service=FakeCacheService(),
+        standing_service=standing_service,
+    )
+    service.allowed_league_repository = FakeAllowedIdsRepository([72])
+    service.match_repository = AsyncEmptyMatchRepository()
+    db = FakeSyncDB()
+
+    async def run():
+        return await service.sync_daily_fixtures(db, "2026-06-15")
+
+    result = asyncio.run(run())
+
+    assert result["success"] is True
+    assert result["inserted"] == 3
+    assert result["standings_prewarm_candidates"] == 1
+    assert result["standings_prewarm_synced"] == 1
+    assert result["standings_prewarm_skipped"] == 0
+    assert result["standings_prewarm_failed"] == 0
+    assert standing_service.standing_repository.calls == [(72, 2026)]
+    assert standing_service.sync_calls == [(72, 2026)]
+
+
+def test_match_service_daily_sync_prewarm_all_skipped(caplog):
+    fixtures = [
+        make_fixture(3011, league_id=72, season=2026),
+        make_fixture(3012, league_id=75, season=2026),
+    ]
+    standing_service = FakeStandingServiceForPrewarm(existing_pairs={(72, 2026), (75, 2026)})
+    service = MatchService(
+        client=StaticFixtureClient(fixtures),
+        team_service=FakeTeamService(),
+        cache_service=FakeCacheService(),
+        standing_service=standing_service,
+    )
+    service.allowed_league_repository = FakeAllowedIdsRepository([72, 75])
+    service.match_repository = AsyncEmptyMatchRepository()
+    db = FakeSyncDB()
+
+    async def run():
+        return await service.sync_daily_fixtures(db, "2026-06-15")
+
+    with caplog.at_level("INFO"):
+        result = asyncio.run(run())
+
+    assert result["success"] is True
+    assert result["standings_prewarm_candidates"] == 2
+    assert result["standings_prewarm_synced"] == 0
+    assert result["standings_prewarm_skipped"] == 2
+    assert result["standings_prewarm_failed"] == 0
+    assert standing_service.standing_repository.calls == [(72, 2026), (75, 2026)]
+    assert standing_service.sync_calls == []
+    assert db.commit_calls == 1
+    assert "PREWARM_CANDIDATE league_id=72 season=2026" in caplog.text
+    assert "PREWARM_CANDIDATE league_id=75 season=2026" in caplog.text
+    assert "PREWARM_SKIPPED league_id=72 season=2026" in caplog.text
+    assert "PREWARM_SKIPPED league_id=75 season=2026" in caplog.text
+
+
+def test_match_service_daily_sync_prewarm_all_synced(caplog):
+    fixtures = [
+        make_fixture(3021, league_id=72, season=2026),
+        make_fixture(3022, league_id=75, season=2026),
+    ]
+    standing_service = FakeStandingServiceForPrewarm()
+    service = MatchService(
+        client=StaticFixtureClient(fixtures),
+        team_service=FakeTeamService(),
+        cache_service=FakeCacheService(),
+        standing_service=standing_service,
+    )
+    service.allowed_league_repository = FakeAllowedIdsRepository([72, 75])
+    service.match_repository = AsyncEmptyMatchRepository()
+    db = FakeSyncDB()
+
+    async def run():
+        return await service.sync_daily_fixtures(db, "2026-06-15")
+
+    with caplog.at_level("INFO"):
+        result = asyncio.run(run())
+
+    assert result["success"] is True
+    assert result["standings_prewarm_candidates"] == 2
+    assert result["standings_prewarm_synced"] == 2
+    assert result["standings_prewarm_skipped"] == 0
+    assert result["standings_prewarm_failed"] == 0
+    assert standing_service.sync_calls == [(72, 2026), (75, 2026)]
+    assert db.commit_calls == 3
+    assert "PREWARM_SYNCED league_id=72 season=2026" in caplog.text
+    assert "PREWARM_SYNCED league_id=75 season=2026" in caplog.text
+
+
+def test_match_service_daily_sync_prewarm_mixed_synced_and_skipped():
+    fixtures = [
+        make_fixture(3031, league_id=72, season=2026),
+        make_fixture(3032, league_id=75, season=2026),
+    ]
+    standing_service = FakeStandingServiceForPrewarm(existing_pairs={(72, 2026)})
+    service = MatchService(
+        client=StaticFixtureClient(fixtures),
+        team_service=FakeTeamService(),
+        cache_service=FakeCacheService(),
+        standing_service=standing_service,
+    )
+    service.allowed_league_repository = FakeAllowedIdsRepository([72, 75])
+    service.match_repository = AsyncEmptyMatchRepository()
+    db = FakeSyncDB()
+
+    async def run():
+        return await service.sync_daily_fixtures(db, "2026-06-15")
+
+    result = asyncio.run(run())
+
+    assert result["success"] is True
+    assert result["standings_prewarm_candidates"] == 2
+    assert result["standings_prewarm_synced"] == 1
+    assert result["standings_prewarm_skipped"] == 1
+    assert result["standings_prewarm_failed"] == 0
+    assert standing_service.standing_repository.calls == [(72, 2026), (75, 2026)]
+    assert standing_service.sync_calls == [(75, 2026)]
+    assert db.commit_calls == 2
+    assert db.rollback_calls == 0
+
+
+def test_match_service_daily_sync_prewarm_failure_does_not_break_fixture_sync(caplog):
+    fixtures = [
+        make_fixture(3041, league_id=72, season=2026),
+        make_fixture(3042, league_id=75, season=2026),
+    ]
+    standing_service = FakeStandingServiceForPrewarm(fail_pairs={(72, 2026)})
+    service = MatchService(
+        client=StaticFixtureClient(fixtures),
+        team_service=FakeTeamService(),
+        cache_service=FakeCacheService(),
+        standing_service=standing_service,
+    )
+    service.allowed_league_repository = FakeAllowedIdsRepository([72, 75])
+    service.match_repository = AsyncEmptyMatchRepository()
+    db = FakeSyncDB()
+
+    async def run():
+        return await service.sync_daily_fixtures(db, "2026-06-15")
+
+    with caplog.at_level("INFO"):
+        result = asyncio.run(run())
+
+    assert result["success"] is True
+    assert result["inserted"] == 2
+    assert result["standings_prewarm_candidates"] == 2
+    assert result["standings_prewarm_synced"] == 1
+    assert result["standings_prewarm_skipped"] == 0
+    assert result["standings_prewarm_failed"] == 1
+    assert standing_service.sync_calls == [(72, 2026), (75, 2026)]
+    assert db.commit_calls == 2
+    assert db.rollback_calls == 1
+    assert "PREWARM_FAILED league_id=72 season=2026" in caplog.text
+    assert "PREWARM_SYNCED league_id=75 season=2026" in caplog.text
+
+
+def test_match_service_parse_fixture_persists_season_on_match_create():
+    service = MatchService(client=FakeMatchClient(), team_service=FakeTeamService(), cache_service=FakeCacheService())
+    fixture = {
+        "fixture": {
+            "id": 2001,
+            "date": "2026-06-15T18:00:00+00:00",
+            "status": {"short": "NS", "elapsed": 0},
+            "venue": {"name": "A", "city": "B"},
+        },
+        "league": {"id": 39, "season": 2027, "name": "Allowed League", "country": "X", "logo": None, "flag": None},
+        "teams": {
+            "home": {"id": 1, "name": "Home", "logo": None},
+            "away": {"id": 2, "name": "Away", "logo": None},
+        },
+        "goals": {"home": 0, "away": 0},
+    }
+
+    parsed = service.parse_fixture_to_match(fixture)
+
+    assert parsed is not None
+    assert parsed.season == 2027
+
+
+def test_match_service_process_sync_persists_season_on_inserted_match():
+    class FakeMatchRepository:
+        async def get_many_by_ids(self, db, match_ids, allowed_ids=None):
+            return []
+
+    class RecordingCacheService:
+        def __init__(self):
+            self.deleted = []
+
+        async def delete(self, key):
+            self.deleted.append(key)
+
+    service = MatchService(client=FakeMatchClient(), team_service=FakeTeamService(), cache_service=RecordingCacheService())
+    service.allowed_league_repository = FakeAllowedIdsRepository([39])
+    service.match_repository = FakeMatchRepository()
+
+    fixture = {
+        "fixture": {
+            "id": 2002,
+            "date": "2026-06-15T18:00:00+00:00",
+            "status": {"short": "NS", "elapsed": 0},
+            "venue": {"name": "A", "city": "B"},
+        },
+        "league": {"id": 39, "season": 2028, "name": "Allowed League", "country": "X", "logo": None, "flag": None},
+        "teams": {
+            "home": {"id": 1, "name": "Home", "logo": None},
+            "away": {"id": 2, "name": "Away", "logo": None},
+        },
+        "goals": {"home": 0, "away": 0},
+    }
+
+    async def run():
+        return await service._process_sync(FakeSyncDB(), [fixture])
+
+    result = asyncio.run(run())
+
+    assert result["inserted"] == 1
+    assert result["standings_prewarm_candidates"] == 1
+
+    sync_db = FakeSyncDB()
+
+    async def run_db_assertion():
+        await service._process_sync(sync_db, [fixture])
+
+    asyncio.run(run_db_assertion())
+    assert len(sync_db.added) == 1
+    assert sync_db.added[0].season == 2028
 
 
 def test_league_service_sync_all_leagues_skips_unallowed_leagues():

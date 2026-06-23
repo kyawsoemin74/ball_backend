@@ -10,6 +10,7 @@ class MatchCreate(BaseModel):
     
     # League Info
     league_id: int = Field(..., description="League ID")
+    season: Optional[int] = Field(None, description="Match season year")
     league_name: Optional[str] = Field(None, max_length=255, description="League name")
     league_logo: Optional[str] = Field(None, max_length=500, description="League logo URL")
     
@@ -49,6 +50,7 @@ class MatchCreate(BaseModel):
 class MatchUpdate(BaseModel):
     # League Info
     league_id: Optional[int] = Field(None, description="League ID")
+    season: Optional[int] = Field(None, description="Match season year")
     league_name: Optional[str] = Field(None, max_length=255, description="League name")
     league_logo: Optional[str] = Field(None, max_length=500, description="League logo URL")
     
@@ -105,6 +107,7 @@ class MatchDateResponse(BaseModel):
 
     # League Info
     league_id: int = Field(..., description="League ID")
+    season: Optional[int] = Field(None, description="Match season year")
     league_name: Optional[str] = Field(None, description="League name")
     league_logo: Optional[str] = Field(None, description="League logo URL")
 
@@ -169,6 +172,7 @@ class MatchResponse(BaseModel):
     
     # League Info
     league_id: int = Field(..., description="League ID")
+    season: Optional[int] = Field(None, description="Match season year")
     league_name: Optional[str] = Field(None, description="League name")
     league_logo: Optional[str] = Field(None, description="League logo URL")
     

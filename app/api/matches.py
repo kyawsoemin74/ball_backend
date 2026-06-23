@@ -14,13 +14,14 @@ from app.models.match_event import MatchEvent
 from app.models.match_h2h import MatchH2H
 from app.models.match_lineup import MatchLineup
 from app.models.odds import Odds
-from app.models.standing import Standings
 from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.match_repository import MatchRepository
 from app.schemas.match import MatchDateResponse, MatchResponse, MatchStatisticsResponse
+from app.services.league_structure_resolver import LeagueStructureResolver
 from app.services.football import football_service, LIVE_STATUSES
 
 router = APIRouter(prefix="/matches", tags=["matches"])
+league_structure_resolver = LeagueStructureResolver()
 
 
 def _has_availability_data(payload: Any) -> bool:
@@ -80,16 +81,10 @@ async def _build_match_availability_flags(match: Match, db: AsyncSession) -> Dic
     flags["has_odds"] = await _has_odds_available(match.match_id, db)
     flags["has_h2h"] = await _has_h2h_available(match.home_team_id, match.away_team_id, match.match_id, db)
 
-    standings_result = await db.execute(
-        select(Standings.id)
-        .where(Standings.league_id == match.league_id)
-        .limit(1)
-    )
-    flags["has_standings"] = standings_result.scalar_one_or_none() is not None
-
-    league_name = (match.league_name or "").lower()
-    if any(keyword in league_name for keyword in ("cup", "knockout", "playoff", "final", "semi")):
-        flags["is_knockout"] = True
+    structure = await league_structure_resolver.resolve(match, db)
+    flags["has_standings"] = structure.has_standings
+    flags["is_knockout"] = structure.is_knockout
+    flags["has_bracket"] = structure.has_bracket
 
     return flags
 

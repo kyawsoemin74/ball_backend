@@ -6,6 +6,7 @@ from app.models.odds import Odds
 from app.models.match_lineup import MatchLineup
 from app.models.match_h2h import MatchH2H
 from app.models.match_event import MatchEvent
+from app.models.lineup_refresh_state import LineupRefreshState
 from app.models.ad import Ad
 from app.models.news import News
 from app.models.user import User

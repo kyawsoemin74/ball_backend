@@ -1,9 +1,13 @@
-from sqlalchemy import Column, Integer, String, DateTime
+from sqlalchemy import Column, DateTime, Index, Integer, String, UniqueConstraint
 from sqlalchemy.sql import func
 from app.db import Base
 
 class Standings(Base):
     __tablename__ = "standings"
+    __table_args__ = (
+        Index("ix_standings_league_id_season_position", "league_id", "season", "position"),
+        UniqueConstraint("league_id", "season", "team_id", name="uq_standings_league_id_season_team_id"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     league_id = Column(Integer, index=True, nullable=False)

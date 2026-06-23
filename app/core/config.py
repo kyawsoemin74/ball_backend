@@ -23,9 +23,11 @@ class Settings(BaseSettings):
     REDIS_CACHE_PREFIX: str = "fover"
     REDIS_TTL_LIVE_MATCHES: int = 20
     REDIS_TTL_LEAGUE_TEAM: int = 3600
-    REDIS_TTL_STANDINGS: int = 300
-    REDIS_TTL_ODDS: int = 30
+    REDIS_TTL_STANDINGS: int = 21600
+    REDIS_TTL_LINEUP: int = 21600
+    REDIS_TTL_ODDS: int = 3000
     REDIS_TTL_NEWS: int = 120
+    LINEUP_REFRESH_COOLDOWN_SECONDS: int = 900
     GOOGLE_CLIENT_ID: str
 
     # Upload settings for admin and public image storage
