@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status, Path, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,10 +20,12 @@ from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.match_repository import MatchRepository
 from app.schemas.match import MatchDateResponse, MatchResponse, MatchStatisticsResponse
 from app.services.league_structure_resolver import LeagueStructureResolver
+from app.services.active_match_service import active_match_service
 from app.services.football import football_service, LIVE_STATUSES
 
 router = APIRouter(prefix="/matches", tags=["matches"])
 league_structure_resolver = LeagueStructureResolver()
+logger = logging.getLogger(__name__)
 
 
 def _has_availability_data(payload: Any) -> bool:
@@ -67,7 +71,21 @@ async def _build_match_availability_flags(match: Match, db: AsyncSession) -> Dic
     }
 
     events_result = await db.execute(select(MatchEvent).where(MatchEvent.match_id == match.match_id).limit(1))
-    flags["has_events"] = events_result.scalar_one_or_none() is not None
+    if events_result.scalar_one_or_none() is not None:
+        logger.info("HAS_EVENTS_DB_HIT", extra={"match_id": match.match_id})
+        flags["has_events"] = True
+    else:
+        logger.info("HAS_EVENTS_FALLBACK_CHECK", extra={"match_id": match.match_id})
+        try:
+            cached_or_fresh_events = await football_service.get_cached_match_events(db, match.match_id)
+        except Exception:
+            cached_or_fresh_events = []
+
+        flags["has_events"] = bool(cached_or_fresh_events)
+        if flags["has_events"]:
+            logger.info("HAS_EVENTS_FALLBACK_TRUE", extra={"match_id": match.match_id})
+        else:
+            logger.info("HAS_EVENTS_FALLBACK_FALSE", extra={"match_id": match.match_id})
 
     try:
         stats_payload = await football_service.get_cached_statistics(db, match.match_id)
@@ -274,6 +292,19 @@ async def get_match_odds(match_id: int = Path(..., gt=0), db: AsyncSession = Dep
 
     await db.commit()
     return result
+
+
+@router.post("/{match_id}/heartbeat")
+async def heartbeat_match(
+    match_id: int = Path(..., gt=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Mark a match as actively viewed and refresh the active-match TTL.
+    """
+    await _assert_match_allowed(match_id, db)
+    ttl_seconds = await active_match_service.mark_match_active(match_id)
+    return {"success": True, "match_id": match_id, "ttl_seconds": ttl_seconds}
 
 
 # --- POST/Sync Routes (Grouped Together) ---

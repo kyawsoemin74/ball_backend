@@ -434,6 +434,294 @@ def test_scheduler_registers_refresh_lineups_job():
     assert fake_engine.started is True
 
 
+def test_scheduler_registers_refresh_events_job():
+    scheduler = LiveUpdateScheduler()
+    fake_engine = FakeSchedulerEngine()
+    scheduler.scheduler = fake_engine
+
+    scheduler.start()
+
+    job_ids = [job["id"] for job in fake_engine.jobs]
+    assert "refresh_events" in job_ids
+    refresh_job = next(job for job in fake_engine.jobs if job["id"] == "refresh_events")
+    assert refresh_job["name"] == "Refresh Active Match Events"
+    assert refresh_job["max_instances"] == 1
+
+
+class FakeEventRefreshCacheService:
+    def __init__(self):
+        self.delete_calls = []
+
+    async def delete(self, key):
+        self.delete_calls.append(key)
+
+
+def test_event_refresh_uses_active_match_discovery_and_status_gate(monkeypatch, caplog):
+    scheduler = LiveUpdateScheduler()
+    db = FakeSchedulerDB()
+    scheduler.cache_service = FakeEventRefreshCacheService()
+
+    status_map = {501: "NS", 502: "1H", 503: "FT", 504: "LIVE"}
+    synced = []
+
+    async def fake_get_active_matches():
+        return [501, 502, 503, 504]
+
+    async def fake_get_status(_db, match_id):
+        return status_map.get(match_id)
+
+    async def fake_sync_events(_db, match_id):
+        synced.append(match_id)
+        return {"success": True, "count": 5}
+
+    monkeypatch.setattr(scheduler_module.active_match_service, "get_active_matches", fake_get_active_matches)
+    monkeypatch.setattr(scheduler, "_get_match_status_for_event_refresh", fake_get_status)
+    monkeypatch.setattr(scheduler_module, "async_session", lambda: FakeAsyncSessionContext(db))
+    monkeypatch.setattr(scheduler_module.football_service, "sync_match_events", fake_sync_events)
+
+    with caplog.at_level(logging.INFO):
+        metrics = asyncio.run(scheduler._refresh_events_job())
+
+    assert metrics == {
+        "active_matches": 4,
+        "processed_matches": 2,
+        "synced_matches": 2,
+        "skipped_matches": 2,
+        "failed_matches": 0,
+    }
+    assert synced == [502, 504]
+    assert db.commit_calls == 2
+    assert db.rollback_calls == 0
+    assert scheduler.cache_service.delete_calls == [
+        "fover:match:502:events",
+        "fover:match:504:events",
+    ]
+    assert "EVENT_REFRESH_START" in caplog.text
+    assert "EVENT_REFRESH_SKIPPED match_id=501 reason=status_blocked status=NS" in caplog.text
+    assert "EVENT_REFRESH_SKIPPED match_id=503 reason=status_blocked status=FT" in caplog.text
+    assert "EVENT_REFRESH_SYNCED match_id=502" in caplog.text
+    assert "EVENT_REFRESH_SYNCED match_id=504" in caplog.text
+    assert "EVENT_REFRESH_COMPLETE" in caplog.text
+
+
+def test_event_refresh_failure_isolation_and_metrics(monkeypatch, caplog):
+    scheduler = LiveUpdateScheduler()
+    db = FakeSchedulerDB()
+    scheduler.cache_service = FakeEventRefreshCacheService()
+    synced = []
+
+    async def fake_get_active_matches():
+        return [601, 602, 603]
+
+    async def fake_get_status(_db, _match_id):
+        return "1H"
+
+    async def fake_sync_events(_db, match_id):
+        if match_id == 602:
+            raise RuntimeError("boom")
+        if match_id == 603:
+            return {"success": False, "message": "API error"}
+        synced.append(match_id)
+        return {"success": True, "count": 3}
+
+    monkeypatch.setattr(scheduler_module.active_match_service, "get_active_matches", fake_get_active_matches)
+    monkeypatch.setattr(scheduler, "_get_match_status_for_event_refresh", fake_get_status)
+    monkeypatch.setattr(scheduler_module, "async_session", lambda: FakeAsyncSessionContext(db))
+    monkeypatch.setattr(scheduler_module.football_service, "sync_match_events", fake_sync_events)
+
+    with caplog.at_level(logging.INFO):
+        metrics = asyncio.run(scheduler._refresh_events_job())
+
+    assert metrics == {
+        "active_matches": 3,
+        "processed_matches": 3,
+        "synced_matches": 1,
+        "skipped_matches": 0,
+        "failed_matches": 2,
+    }
+    assert synced == [601]
+    assert db.commit_calls == 1
+    assert db.rollback_calls == 2
+    assert scheduler.cache_service.delete_calls == ["fover:match:601:events"]
+    assert "EVENT_REFRESH_FAILED match_id=602" in caplog.text
+    assert "EVENT_REFRESH_FAILED match_id=603 reason=API error" in caplog.text
+
+
+def test_event_refresh_uses_active_matches_only(monkeypatch):
+    scheduler = LiveUpdateScheduler()
+    db = FakeSchedulerDB()
+    scheduler.cache_service = FakeEventRefreshCacheService()
+    called = {"active": 0, "status": 0}
+
+    async def fake_get_active_matches():
+        called["active"] += 1
+        return []
+
+    async def fake_get_status(_db, _match_id):
+        called["status"] += 1
+        return "1H"
+
+    async def fake_sync_events(_db, _match_id):
+        raise AssertionError("sync_match_events should not be called when no active matches")
+
+    monkeypatch.setattr(scheduler_module.active_match_service, "get_active_matches", fake_get_active_matches)
+    monkeypatch.setattr(scheduler, "_get_match_status_for_event_refresh", fake_get_status)
+    monkeypatch.setattr(scheduler_module, "async_session", lambda: FakeAsyncSessionContext(db))
+    monkeypatch.setattr(scheduler_module.football_service, "sync_match_events", fake_sync_events)
+
+    metrics = asyncio.run(scheduler._refresh_events_job())
+
+    assert metrics == {
+        "active_matches": 0,
+        "processed_matches": 0,
+        "synced_matches": 0,
+        "skipped_matches": 0,
+        "failed_matches": 0,
+    }
+    assert called["active"] == 1
+    assert called["status"] == 0
+
+
+def test_scheduler_registers_refresh_statistics_job():
+    scheduler = LiveUpdateScheduler()
+    fake_engine = FakeSchedulerEngine()
+    scheduler.scheduler = fake_engine
+
+    scheduler.start()
+
+    job_ids = [job["id"] for job in fake_engine.jobs]
+    assert "refresh_statistics" in job_ids
+    refresh_job = next(job for job in fake_engine.jobs if job["id"] == "refresh_statistics")
+    assert refresh_job["name"] == "Refresh Active Match Statistics"
+    assert refresh_job["max_instances"] == 1
+
+
+def test_statistics_refresh_uses_active_match_discovery_and_status_gate(monkeypatch, caplog):
+    scheduler = LiveUpdateScheduler()
+    db = FakeSchedulerDB()
+    scheduler.cache_service = FakeEventRefreshCacheService()
+
+    status_map = {701: "NS", 702: "1H", 703: "FT", 704: "LIVE"}
+    synced = []
+
+    async def fake_get_active_matches():
+        return [701, 702, 703, 704]
+
+    async def fake_get_status(_db, match_id):
+        return status_map.get(match_id)
+
+    async def fake_sync_statistics(_db, match_id):
+        synced.append(match_id)
+        return {"success": True, "match_id": match_id}
+
+    monkeypatch.setattr(scheduler_module.active_match_service, "get_active_matches", fake_get_active_matches)
+    monkeypatch.setattr(scheduler, "_get_match_status_for_event_refresh", fake_get_status)
+    monkeypatch.setattr(scheduler_module, "async_session", lambda: FakeAsyncSessionContext(db))
+    monkeypatch.setattr(scheduler_module.football_service, "sync_match_statistics", fake_sync_statistics)
+
+    with caplog.at_level(logging.INFO):
+        metrics = asyncio.run(scheduler._refresh_statistics_job())
+
+    assert metrics == {
+        "active_matches": 4,
+        "processed_matches": 2,
+        "synced_matches": 2,
+        "skipped_matches": 2,
+        "failed_matches": 0,
+    }
+    assert synced == [702, 704]
+    assert db.commit_calls == 2
+    assert db.rollback_calls == 0
+    assert scheduler.cache_service.delete_calls == [
+        "fover:match:702:statistics",
+        "fover:match:704:statistics",
+    ]
+    assert "STATISTICS_REFRESH_START" in caplog.text
+    assert "STATISTICS_REFRESH_SKIPPED match_id=701 reason=status_blocked status=NS" in caplog.text
+    assert "STATISTICS_REFRESH_SKIPPED match_id=703 reason=status_blocked status=FT" in caplog.text
+    assert "STATISTICS_REFRESH_SYNCED match_id=702" in caplog.text
+    assert "STATISTICS_REFRESH_SYNCED match_id=704" in caplog.text
+    assert "STATISTICS_REFRESH_COMPLETE" in caplog.text
+
+
+def test_statistics_refresh_failure_isolation_and_metrics(monkeypatch, caplog):
+    scheduler = LiveUpdateScheduler()
+    db = FakeSchedulerDB()
+    scheduler.cache_service = FakeEventRefreshCacheService()
+    synced = []
+
+    async def fake_get_active_matches():
+        return [801, 802, 803]
+
+    async def fake_get_status(_db, _match_id):
+        return "1H"
+
+    async def fake_sync_statistics(_db, match_id):
+        if match_id == 802:
+            raise RuntimeError("boom")
+        if match_id == 803:
+            return {"success": False, "message": "Statistics not found"}
+        synced.append(match_id)
+        return {"success": True, "match_id": match_id}
+
+    monkeypatch.setattr(scheduler_module.active_match_service, "get_active_matches", fake_get_active_matches)
+    monkeypatch.setattr(scheduler, "_get_match_status_for_event_refresh", fake_get_status)
+    monkeypatch.setattr(scheduler_module, "async_session", lambda: FakeAsyncSessionContext(db))
+    monkeypatch.setattr(scheduler_module.football_service, "sync_match_statistics", fake_sync_statistics)
+
+    with caplog.at_level(logging.INFO):
+        metrics = asyncio.run(scheduler._refresh_statistics_job())
+
+    assert metrics == {
+        "active_matches": 3,
+        "processed_matches": 3,
+        "synced_matches": 1,
+        "skipped_matches": 0,
+        "failed_matches": 2,
+    }
+    assert synced == [801]
+    assert db.commit_calls == 1
+    assert db.rollback_calls == 2
+    assert scheduler.cache_service.delete_calls == ["fover:match:801:statistics"]
+    assert "STATISTICS_REFRESH_FAILED match_id=802" in caplog.text
+    assert "STATISTICS_REFRESH_FAILED match_id=803 reason=Statistics not found" in caplog.text
+
+
+def test_statistics_refresh_uses_active_matches_only(monkeypatch):
+    scheduler = LiveUpdateScheduler()
+    db = FakeSchedulerDB()
+    scheduler.cache_service = FakeEventRefreshCacheService()
+    called = {"active": 0, "status": 0}
+
+    async def fake_get_active_matches():
+        called["active"] += 1
+        return []
+
+    async def fake_get_status(_db, _match_id):
+        called["status"] += 1
+        return "1H"
+
+    async def fake_sync_statistics(_db, _match_id):
+        raise AssertionError("sync_match_statistics should not be called when no active matches")
+
+    monkeypatch.setattr(scheduler_module.active_match_service, "get_active_matches", fake_get_active_matches)
+    monkeypatch.setattr(scheduler, "_get_match_status_for_event_refresh", fake_get_status)
+    monkeypatch.setattr(scheduler_module, "async_session", lambda: FakeAsyncSessionContext(db))
+    monkeypatch.setattr(scheduler_module.football_service, "sync_match_statistics", fake_sync_statistics)
+
+    metrics = asyncio.run(scheduler._refresh_statistics_job())
+
+    assert metrics == {
+        "active_matches": 0,
+        "processed_matches": 0,
+        "synced_matches": 0,
+        "skipped_matches": 0,
+        "failed_matches": 0,
+    }
+    assert called["active"] == 1
+    assert called["status"] == 0
+
+
 def test_lineup_refresh_state_migration_exists():
     migration_path = Path("alembic/versions/f4a5b6c7d8e9_create_lineup_refresh_state_table.py")
     migration_text = migration_path.read_text(encoding="utf-8")

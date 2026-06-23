@@ -14,6 +14,10 @@ def make_cache_key(*parts: Any) -> str:
     )
 
 
+def make_active_match_key(match_id: int) -> str:
+    return make_cache_key("active_match", match_id)
+
+
 def _serialize(value: Any) -> str:
     return json.dumps(
         jsonable_encoder(value),

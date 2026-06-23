@@ -4,15 +4,23 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import select, func
+from app.cache import make_cache_key
 from app.core.config import settings
 from app.db import async_session
 from app.models.allowed_league import AllowedLeague
 from app.models.match import Match
 from app.monitoring import SCHEDULER_JOB_ERRORS, SCHEDULER_JOB_RUNS
 from app.repositories.lineup_refresh_state_repository import LineupRefreshStateRepository
+from app.services.active_match_service import active_match_service
+from app.services.cache_service import CacheService
 from app.services.football import football_service, FINISHED_STATUSES, LIVE_STATUSES
 
 logger = logging.getLogger(__name__)
+
+EVENT_REFRESH_ALLOWED_STATUSES = {"1H", "HT", "2H", "LIVE"}
+EVENT_REFRESH_BLOCKED_STATUSES = {"NS", "FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"}
+STATISTICS_REFRESH_ALLOWED_STATUSES = {"1H", "HT", "2H", "LIVE"}
+STATISTICS_REFRESH_BLOCKED_STATUSES = {"NS", "FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"}
 
 # Myanmar Timezone Offset (UTC+6:30)
 MM_TZ = timezone(timedelta(hours=6, minutes=30))
@@ -22,6 +30,7 @@ class LiveUpdateScheduler:
         self.scheduler = AsyncIOScheduler()
         self.is_running = False
         self.lineup_refresh_state_repository = LineupRefreshStateRepository()
+        self.cache_service = CacheService()
         
     def start(self):
         """Start the live update scheduler"""
@@ -70,6 +79,22 @@ class LiveUpdateScheduler:
             trigger=IntervalTrigger(minutes=15),
             id="refresh_lineups",
             name="Refresh Lineups",
+            max_instances=1,
+        )
+
+        self.scheduler.add_job(
+            self._refresh_events_job,
+            trigger=IntervalTrigger(seconds=60),
+            id="refresh_events",
+            name="Refresh Active Match Events",
+            max_instances=1,
+        )
+
+        self.scheduler.add_job(
+            self._refresh_statistics_job,
+            trigger=IntervalTrigger(seconds=120),
+            id="refresh_statistics",
+            name="Refresh Active Match Statistics",
             max_instances=1,
         )
         
@@ -327,6 +352,129 @@ class LiveUpdateScheduler:
         except Exception:
             SCHEDULER_JOB_ERRORS.labels(job="refresh_lineups").inc()
             logger.exception("Error in lineup refresh job")
+            return metrics
+
+    async def _get_match_status_for_event_refresh(self, db, match_id: int) -> str | None:
+        result = await db.execute(select(Match.status).where(Match.match_id == match_id))
+        status = result.scalar_one_or_none()
+        return str(status).upper() if status else None
+
+    async def _refresh_events_job(self):
+        metrics = {
+            "active_matches": 0,
+            "processed_matches": 0,
+            "synced_matches": 0,
+            "skipped_matches": 0,
+            "failed_matches": 0,
+        }
+
+        try:
+            active_matches = await active_match_service.get_active_matches()
+            metrics["active_matches"] = len(active_matches)
+            logger.info("EVENT_REFRESH_START total_active=%s metrics=%s", len(active_matches), metrics)
+
+            async with async_session() as db:
+                for match_id in active_matches:
+                    logger.info("EVENT_REFRESH_MATCH match_id=%s", match_id)
+                    status = await self._get_match_status_for_event_refresh(db, match_id)
+
+                    if not status or status in EVENT_REFRESH_BLOCKED_STATUSES or status not in EVENT_REFRESH_ALLOWED_STATUSES:
+                        metrics["skipped_matches"] += 1
+                        logger.info(
+                            "EVENT_REFRESH_SKIPPED match_id=%s reason=status_blocked status=%s",
+                            match_id,
+                            status,
+                        )
+                        continue
+
+                    metrics["processed_matches"] += 1
+
+                    try:
+                        result = await football_service.sync_match_events(db, match_id)
+                        if result.get("success"):
+                            await db.commit()
+                            await self.cache_service.delete(make_cache_key("match", match_id, "events"))
+                            metrics["synced_matches"] += 1
+                            logger.info("EVENT_REFRESH_SYNCED match_id=%s", match_id)
+                            continue
+
+                        await db.rollback()
+                        metrics["failed_matches"] += 1
+                        logger.error(
+                            "EVENT_REFRESH_FAILED match_id=%s reason=%s",
+                            match_id,
+                            result.get("message", "event_sync_failed"),
+                        )
+                    except Exception:
+                        await db.rollback()
+                        metrics["failed_matches"] += 1
+                        logger.exception("EVENT_REFRESH_FAILED match_id=%s", match_id)
+
+                SCHEDULER_JOB_RUNS.labels(job="refresh_events").inc()
+                logger.info("EVENT_REFRESH_COMPLETE metrics=%s", metrics)
+                return metrics
+        except Exception:
+            SCHEDULER_JOB_ERRORS.labels(job="refresh_events").inc()
+            logger.exception("Error in active events refresh job")
+            return metrics
+
+    async def _refresh_statistics_job(self):
+        metrics = {
+            "active_matches": 0,
+            "processed_matches": 0,
+            "synced_matches": 0,
+            "skipped_matches": 0,
+            "failed_matches": 0,
+        }
+
+        try:
+            active_matches = await active_match_service.get_active_matches()
+            metrics["active_matches"] = len(active_matches)
+            logger.info("STATISTICS_REFRESH_START total_active=%s metrics=%s", len(active_matches), metrics)
+
+            async with async_session() as db:
+                for match_id in active_matches:
+                    logger.info("STATISTICS_REFRESH_MATCH match_id=%s", match_id)
+                    status = await self._get_match_status_for_event_refresh(db, match_id)
+
+                    if not status or status in STATISTICS_REFRESH_BLOCKED_STATUSES or status not in STATISTICS_REFRESH_ALLOWED_STATUSES:
+                        metrics["skipped_matches"] += 1
+                        logger.info(
+                            "STATISTICS_REFRESH_SKIPPED match_id=%s reason=status_blocked status=%s",
+                            match_id,
+                            status,
+                        )
+                        continue
+
+                    metrics["processed_matches"] += 1
+
+                    try:
+                        result = await football_service.sync_match_statistics(db, match_id)
+                        if result.get("success"):
+                            await db.commit()
+                            await self.cache_service.delete(make_cache_key("match", match_id, "statistics"))
+                            metrics["synced_matches"] += 1
+                            logger.info("STATISTICS_REFRESH_SYNCED match_id=%s", match_id)
+                            continue
+
+                        await db.rollback()
+                        metrics["failed_matches"] += 1
+                        logger.error(
+                            "STATISTICS_REFRESH_FAILED match_id=%s reason=%s",
+                            match_id,
+                            result.get("message", "statistics_sync_failed"),
+                        )
+                    except Exception:
+                        await db.rollback()
+                        metrics["failed_matches"] += 1
+                        logger.exception("STATISTICS_REFRESH_FAILED match_id=%s", match_id)
+
+                SCHEDULER_JOB_RUNS.labels(job="refresh_statistics").inc()
+                logger.info("STATISTICS_REFRESH_COMPLETE metrics=%s", metrics)
+                return metrics
+        except Exception:
+            SCHEDULER_JOB_ERRORS.labels(job="refresh_statistics").inc()
+            logger.exception("Error in active statistics refresh job")
             return metrics
 
 # Global scheduler instance

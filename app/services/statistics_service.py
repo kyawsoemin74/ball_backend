@@ -148,6 +148,17 @@ class StatisticsService:
     async def get_match_statistics(self, match_id: int) -> Optional[dict]:
         return await self.client.get("/fixtures/statistics", params={"fixture": match_id})
 
+    async def sync_match_statistics(self, db: AsyncSession, match_id: int) -> dict:
+        api_res = await self.get_match_statistics(match_id)
+        if not api_res or "response" not in api_res:
+            return {"success": False, "message": "Statistics not found"}
+
+        statistics_data = api_res.get("response")
+        if not statistics_data:
+            return {"success": False, "message": "Statistics not found"}
+
+        return {"success": True, "match_id": match_id}
+
     async def get_cached_statistics(self, db: AsyncSession, match_id: int) -> dict:
         from app.cache import make_cache_key
 

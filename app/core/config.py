@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     REDIS_TTL_ODDS: int = 3000
     REDIS_TTL_NEWS: int = 120
     LINEUP_REFRESH_COOLDOWN_SECONDS: int = 900
+    ACTIVE_MATCH_TTL_SECONDS: int = 300
     GOOGLE_CLIENT_ID: str
 
     # Upload settings for admin and public image storage

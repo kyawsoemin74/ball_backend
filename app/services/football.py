@@ -99,6 +99,9 @@ class FootballAPIService:
     async def get_normalized_statistics(self, db: AsyncSession, match_id: int) -> Optional[dict]:
         return await self.statistics_service.get_normalized_statistics(db, match_id)
 
+    async def sync_match_statistics(self, db: AsyncSession, match_id: int) -> Dict[str, Any]:
+        return await self.statistics_service.sync_match_statistics(db, match_id)
+
     async def get_cached_h2h(self, db: AsyncSession, team1_id: int, team2_id: int, match_id: int) -> Optional[dict]:
         return await self.h2h_service.get_cached_h2h(db, team1_id, team2_id, match_id)
 
