@@ -29,6 +29,8 @@ from app.services.socket_service import broker as redis_broker
 from scheduler_service import start_scheduler, stop_scheduler
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 @asynccontextmanager

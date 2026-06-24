@@ -1175,6 +1175,62 @@ def test_statistics_normalization_uses_team_ids_not_response_order():
     assert normalized["statistics"][0]["away_value"] == "38%"
 
 
+@pytest.mark.parametrize(
+    "status,expected_ttl",
+    [
+        ("FT", 172800),
+        ("AET", 172800),
+        ("PEN", 172800),
+        ("LIVE", 600),
+        ("HT", 600),
+        ("NS", 600),
+    ],
+)
+def test_statistics_cache_ttl_by_match_status(status, expected_ttl):
+    from app.services.statistics_service import StatisticsService
+
+    class FakeClient:
+        async def get(self, *_args, **_kwargs):
+            return {
+                "response": [
+                    {
+                        "team": {"id": 1},
+                        "statistics": [{"type": "Ball Possession", "value": "50%"}],
+                    },
+                    {
+                        "team": {"id": 2},
+                        "statistics": [{"type": "Ball Possession", "value": "50%"}],
+                    },
+                ]
+            }
+
+    class FakeCacheService:
+        def __init__(self):
+            self.last_ttl = None
+
+        async def get_json(self, _key):
+            return None
+
+        async def set_json(self, _key, _value, ttl):
+            self.last_ttl = ttl
+
+    class FakeResult:
+        def scalar_one_or_none(self):
+            return SimpleNamespace(status=status)
+
+    class FakeDB:
+        async def execute(self, _query):
+            return FakeResult()
+
+    cache = FakeCacheService()
+    service = StatisticsService(client=FakeClient(), cache_service=cache)
+
+    result = asyncio.run(service.get_cached_statistics(FakeDB(), 123))
+
+    assert "response" in result
+    assert cache.last_ttl == expected_ttl
+
+
 def test_match_odds_endpoint_commits_db_session(monkeypatch):
     class FakeSession:
         def __init__(self):

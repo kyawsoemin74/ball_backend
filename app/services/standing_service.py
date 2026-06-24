@@ -120,10 +120,10 @@ class StandingService:
             return {"success": True, "league_id": league_id, "season": season, "updated": 0, "message": "League is not allowed for synchronization"}
 
         if league_id not in allowed_ids:
-            logger.info("SKIPPED LEAGUE: league_id=%s league_name=%s", league_id, "requested league")
+            logger.debug("SKIPPED LEAGUE: league_id=%s league_name=%s", league_id, "requested league")
             return {"success": True, "league_id": league_id, "season": season, "updated": 0, "message": "League is not allowed for synchronization"}
 
-        logger.info("ALLOWED LEAGUE: league_id=%s league_name=%s", league_id, "requested league")
+        logger.debug("ALLOWED LEAGUE: league_id=%s league_name=%s", league_id, "requested league")
         result = await self.get_league_standings(league_id, season)
         if not result or "response" not in result or not result["response"]:
             return {"success": False, "message": "No standings data found from API"}

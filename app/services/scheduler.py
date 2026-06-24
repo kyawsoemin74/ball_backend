@@ -133,7 +133,7 @@ class LiveUpdateScheduler:
 
         should_sync = live_match_count > 0 or kickoff_window_count > 0
 
-        logger.info(
+        logger.debug(
             "Live sync gate evaluated",
             extra={
                 "live_match_count": live_match_count,
@@ -371,7 +371,8 @@ class LiveUpdateScheduler:
         try:
             active_matches = await active_match_service.get_active_matches()
             metrics["active_matches"] = len(active_matches)
-            logger.info("EVENT_REFRESH_START total_active=%s metrics=%s", len(active_matches), metrics)
+            if active_matches:
+                logger.info("EVENT_REFRESH_START total_active=%s metrics=%s", len(active_matches), metrics)
 
             async with async_session() as db:
                 for match_id in active_matches:
@@ -411,7 +412,8 @@ class LiveUpdateScheduler:
                         logger.exception("EVENT_REFRESH_FAILED match_id=%s", match_id)
 
                 SCHEDULER_JOB_RUNS.labels(job="refresh_events").inc()
-                logger.info("EVENT_REFRESH_COMPLETE metrics=%s", metrics)
+                if active_matches:
+                    logger.info("EVENT_REFRESH_COMPLETE metrics=%s", metrics)
                 return metrics
         except Exception:
             SCHEDULER_JOB_ERRORS.labels(job="refresh_events").inc()
@@ -430,7 +432,8 @@ class LiveUpdateScheduler:
         try:
             active_matches = await active_match_service.get_active_matches()
             metrics["active_matches"] = len(active_matches)
-            logger.info("STATISTICS_REFRESH_START total_active=%s metrics=%s", len(active_matches), metrics)
+            if active_matches:
+                logger.info("STATISTICS_REFRESH_START total_active=%s metrics=%s", len(active_matches), metrics)
 
             async with async_session() as db:
                 for match_id in active_matches:
@@ -470,7 +473,8 @@ class LiveUpdateScheduler:
                         logger.exception("STATISTICS_REFRESH_FAILED match_id=%s", match_id)
 
                 SCHEDULER_JOB_RUNS.labels(job="refresh_statistics").inc()
-                logger.info("STATISTICS_REFRESH_COMPLETE metrics=%s", metrics)
+                if active_matches:
+                    logger.info("STATISTICS_REFRESH_COMPLETE metrics=%s", metrics)
                 return metrics
         except Exception:
             SCHEDULER_JOB_ERRORS.labels(job="refresh_statistics").inc()

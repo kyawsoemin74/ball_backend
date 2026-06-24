@@ -189,10 +189,10 @@ class MatchService:
                 logger.warning("Skipping fixture %s with missing league_id", fixture_raw.get("fixture", {}).get("id"))
                 continue
             if int(league_id) not in allowed_ids:
-                logger.info("SKIPPED LEAGUE: league_id=%s league_name=%s", league_id, league_name)
+                logger.debug("SKIPPED LEAGUE: league_id=%s league_name=%s", league_id, league_name)
                 continue
 
-            logger.info("ALLOWED LEAGUE: league_id=%s league_name=%s", league_id, league_name)
+            logger.debug("ALLOWED LEAGUE: league_id=%s league_name=%s", league_id, league_name)
             filtered_fixtures.append(fixture_raw)
 
         if not filtered_fixtures:
@@ -258,7 +258,7 @@ class MatchService:
     async def sync_full_season(self, db: AsyncSession, league: int, season: int) -> dict:
         allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
         if league not in allowed_ids:
-            logger.info("SKIPPED LEAGUE: league_id=%s league_name=%s", league, "requested league")
+            logger.debug("SKIPPED LEAGUE: league_id=%s league_name=%s", league, "requested league")
             return {"success": True, "inserted": 0, "updated": 0, "total": 0, "message": "League is not allowed for synchronization"}
 
         result = await self.client.get("/fixtures", params={"league": league, "season": season})

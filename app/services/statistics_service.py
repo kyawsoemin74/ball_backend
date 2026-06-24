@@ -13,6 +13,10 @@ logger = logging.getLogger(__name__)
 
 
 class StatisticsService:
+    _FINISHED_STATUSES = {"FT", "AET", "PEN"}
+    _FINISHED_TTL_SECONDS = 172800
+    _LIVE_TTL_SECONDS = 600
+
     _STAT_LABEL_OVERRIDES = {
         "ball possession": "Ball Possession",
         "shots on goal": "Shots on Goal",
@@ -175,7 +179,23 @@ class StatisticsService:
         if not statistics_data:
             return {"error": "Statistics not found"}
 
-        await self.cache_service.set_json(cache_key, api_res, 3600)
+        match = (await db.execute(select(Match).where(Match.match_id == match_id))).scalar_one_or_none()
+        status = (getattr(match, "status", None) or "").upper()
+
+        if status in self._FINISHED_STATUSES:
+            ttl = self._FINISHED_TTL_SECONDS
+            logger.info(
+                "STATISTICS_CACHE_SET_FT",
+                extra={"match_id": match_id, "status": status, "ttl": ttl},
+            )
+        else:
+            ttl = self._LIVE_TTL_SECONDS
+            logger.info(
+                "STATISTICS_CACHE_SET_LIVE",
+                extra={"match_id": match_id, "status": status, "ttl": ttl},
+            )
+
+        await self.cache_service.set_json(cache_key, api_res, ttl)
         return api_res
 
     async def get_normalized_statistics(self, db: AsyncSession, match_id: int) -> dict:

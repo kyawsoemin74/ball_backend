@@ -66,7 +66,7 @@ class LeagueService:
             raise ValueError("League payload is missing the id field")
 
         if allowed_ids is not None and (not allowed_ids or int(league_id) not in allowed_ids):
-            logger.info("SKIPPED LEAGUE: league_id=%s league_name=%s", league_id, league_payload.get("name"))
+            logger.debug("SKIPPED LEAGUE: league_id=%s league_name=%s", league_id, league_payload.get("name"))
             return None
 
         return await self._upsert_league(db, league_data)
@@ -149,10 +149,10 @@ class LeagueService:
 
             league_id_int = int(league_id)
             if league_id_int not in allowed_ids:
-                logger.info("SKIPPED LEAGUE: league_id=%s league_name=%s", league_id_int, league_payload.get("name"))
+                logger.debug("SKIPPED LEAGUE: league_id=%s league_name=%s", league_id_int, league_payload.get("name"))
                 continue
 
-            logger.info("ALLOWED LEAGUE: league_id=%s league_name=%s", league_id_int, league_payload.get("name"))
+            logger.debug("ALLOWED LEAGUE: league_id=%s league_name=%s", league_id_int, league_payload.get("name"))
             filtered_leagues.append(league_data)
 
         if not filtered_leagues:

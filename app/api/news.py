@@ -53,14 +53,6 @@ async def get_transfer_news(
     """Get transfer news specifically"""
     return await get_news_by_tab_logic("transfers", limit, offset, db)
 
-@router.get("/tips", response_model=NewsResponse)
-async def get_betting_tips(
-    limit: int = Query(10, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get football tips specifically"""
-    return await get_news_by_tab_logic("tips", limit, offset, db)
 
 
 @router.get(

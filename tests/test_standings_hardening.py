@@ -582,6 +582,34 @@ def test_event_refresh_uses_active_matches_only(monkeypatch):
     assert called["status"] == 0
 
 
+def test_event_refresh_suppresses_start_complete_info_logs_when_no_active_matches(monkeypatch, caplog):
+    scheduler = LiveUpdateScheduler()
+    db = FakeSchedulerDB()
+    scheduler.cache_service = FakeEventRefreshCacheService()
+
+    async def fake_get_active_matches():
+        return []
+
+    async def fake_get_status(_db, _match_id):
+        raise AssertionError("status lookup should not run when no active matches")
+
+    async def fake_sync_events(_db, _match_id):
+        raise AssertionError("sync_match_events should not run when no active matches")
+
+    monkeypatch.setattr(scheduler_module.active_match_service, "get_active_matches", fake_get_active_matches)
+    monkeypatch.setattr(scheduler, "_get_match_status_for_event_refresh", fake_get_status)
+    monkeypatch.setattr(scheduler_module, "async_session", lambda: FakeAsyncSessionContext(db))
+    monkeypatch.setattr(scheduler_module.football_service, "sync_match_events", fake_sync_events)
+
+    with caplog.at_level(logging.INFO):
+        metrics = asyncio.run(scheduler._refresh_events_job())
+
+    assert metrics["active_matches"] == 0
+    assert "EVENT_REFRESH_START" not in caplog.text
+    assert "EVENT_REFRESH_COMPLETE" not in caplog.text
+    assert "EVENT_REFRESH_SYNCED" not in caplog.text
+
+
 def test_scheduler_registers_refresh_statistics_job():
     scheduler = LiveUpdateScheduler()
     fake_engine = FakeSchedulerEngine()
