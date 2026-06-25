@@ -76,6 +76,7 @@ async def _build_match_availability_flags(match: Match, db: AsyncSession) -> Dic
         flags["has_events"] = True
     else:
         logger.info("HAS_EVENTS_FALLBACK_CHECK", extra={"match_id": match.match_id})
+        # Keep EventService as the single source of truth for event availability across all statuses.
         try:
             cached_or_fresh_events = await football_service.get_cached_match_events(db, match.match_id)
         except Exception:

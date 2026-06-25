@@ -1142,6 +1142,112 @@ def test_has_events_db_empty_and_no_events_sets_false(monkeypatch):
     assert called["events"] == 1
 
 
+@pytest.mark.parametrize("status", ["NS", "1H", "HT", "2H", "ET", "LIVE", "FT", "AET", "PEN"])
+def test_has_events_uses_event_service_fallback_for_all_statuses(monkeypatch, status):
+    from app.api.matches import _build_match_availability_flags
+
+    class FakeResult:
+        def __init__(self, value):
+            self._value = value
+
+        def scalar_one_or_none(self):
+            return self._value
+
+    class FakeDB:
+        async def execute(self, query):
+            descriptions = getattr(query, "column_descriptions", [])
+            entity = descriptions[0].get("entity") if descriptions else None
+            model_name = getattr(entity, "__name__", None)
+            if model_name == "MatchEvent":
+                return FakeResult(None)
+            if model_name == "MatchLineup":
+                return FakeResult(None)
+            return FakeResult(None)
+
+    called = {"events": 0}
+
+    async def fake_get_cached_match_events(db, match_id):
+        called["events"] += 1
+        return [{"id": None, "match_id": match_id, "team_name": "Fallback Team"}]
+
+    async def fake_get_cached_statistics(db, match_id):
+        return {"error": "Statistics not found"}
+
+    async def fake_has_odds(match_id, db):
+        return False
+
+    async def fake_has_h2h(home_team_id, away_team_id, match_id, db):
+        return False
+
+    async def fake_resolve(match, db):
+        return SimpleNamespace(has_standings=False, is_knockout=False, has_bracket=False)
+
+    monkeypatch.setattr("app.services.football.football_service.get_cached_match_events", fake_get_cached_match_events)
+    monkeypatch.setattr("app.services.football.football_service.get_cached_statistics", fake_get_cached_statistics)
+    monkeypatch.setattr("app.api.matches._has_odds_available", fake_has_odds)
+    monkeypatch.setattr("app.api.matches._has_h2h_available", fake_has_h2h)
+    monkeypatch.setattr("app.api.matches.league_structure_resolver.resolve", fake_resolve)
+
+    match = SimpleNamespace(match_id=105, home_team_id=1, away_team_id=2, status=status)
+    flags = asyncio.run(_build_match_availability_flags(match, FakeDB()))
+
+    assert flags["has_events"] is True
+    assert called["events"] == 1
+
+
+@pytest.mark.parametrize("status", ["NS", "1H", "HT", "2H", "ET", "LIVE", "FT", "AET", "PEN"])
+def test_has_events_returns_false_when_event_service_fallback_is_empty_for_all_statuses(monkeypatch, status):
+    from app.api.matches import _build_match_availability_flags
+
+    class FakeResult:
+        def __init__(self, value):
+            self._value = value
+
+        def scalar_one_or_none(self):
+            return self._value
+
+    class FakeDB:
+        async def execute(self, query):
+            descriptions = getattr(query, "column_descriptions", [])
+            entity = descriptions[0].get("entity") if descriptions else None
+            model_name = getattr(entity, "__name__", None)
+            if model_name == "MatchEvent":
+                return FakeResult(None)
+            if model_name == "MatchLineup":
+                return FakeResult(None)
+            return FakeResult(None)
+
+    called = {"events": 0}
+
+    async def fake_get_cached_match_events(db, match_id):
+        called["events"] += 1
+        return []
+
+    async def fake_get_cached_statistics(db, match_id):
+        return {"error": "Statistics not found"}
+
+    async def fake_has_odds(match_id, db):
+        return False
+
+    async def fake_has_h2h(home_team_id, away_team_id, match_id, db):
+        return False
+
+    async def fake_resolve(match, db):
+        return SimpleNamespace(has_standings=False, is_knockout=False, has_bracket=False)
+
+    monkeypatch.setattr("app.services.football.football_service.get_cached_match_events", fake_get_cached_match_events)
+    monkeypatch.setattr("app.services.football.football_service.get_cached_statistics", fake_get_cached_statistics)
+    monkeypatch.setattr("app.api.matches._has_odds_available", fake_has_odds)
+    monkeypatch.setattr("app.api.matches._has_h2h_available", fake_has_h2h)
+    monkeypatch.setattr("app.api.matches.league_structure_resolver.resolve", fake_resolve)
+
+    match = SimpleNamespace(match_id=106, home_team_id=1, away_team_id=2, status=status)
+    flags = asyncio.run(_build_match_availability_flags(match, FakeDB()))
+
+    assert flags["has_events"] is False
+    assert called["events"] == 1
+
+
 def test_match_statistics_route_exists():
     path = app.url_path_for("get_match_statistics", match_id="1")
     assert path == "/api/matches/1/statistics"
