@@ -22,6 +22,6 @@ class Odds(Base):
             "bookmaker_name",
             "market_name",
             "selection",
-            name="uq_fixture_bookmaker_market_selection"
+            name="uq_odds_fixture_bookmaker_market_selection"
         ),
     )

@@ -19,7 +19,7 @@ class OddsRepository:
 
         insert_stmt = pg_insert(Odds).values(rows)
         upsert_stmt = insert_stmt.on_conflict_do_update(
-            constraint="uq_fixture_bookmaker_market_selection",
+            constraint="uq_odds_fixture_bookmaker_market_selection",
             set_={
                 "odd_value": insert_stmt.excluded.odd_value,
                 "myanmar_odd": insert_stmt.excluded.myanmar_odd,
