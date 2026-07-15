@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -28,7 +29,9 @@ from app.services.notification import notification_worker
 from app.services.socket_service import broker as redis_broker
 from scheduler_service import start_scheduler, stop_scheduler
 
-logging.basicConfig(level=logging.INFO)
+log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, log_level_name, logging.INFO)
+logging.basicConfig(level=log_level)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 

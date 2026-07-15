@@ -52,6 +52,16 @@ class FakeCacheService:
             del self.store[key]
 
 
+class FakeLineupSyncService:
+    def __init__(self, result: Dict[str, Any]):
+        self.result = result
+        self.calls: List[tuple[Any, int, Any, str, Any]] = []
+
+    async def sync_lineup(self, db, match_id: int, *, cache_service, cache_key, validate_lineup) -> Dict[str, Any]:
+        self.calls.append((db, match_id, cache_service, cache_key, validate_lineup))
+        return self.result
+
+
 class FakeSession:
     def __init__(self, statuses: Dict[int, str] | None = None):
         self.records: Dict[int, List[MatchLineup]] = {}
@@ -74,7 +84,9 @@ class FakeSession:
         self._pending.append(row)
 
     async def flush(self):
-        return None
+        for row in self._pending:
+            self.records.setdefault(row.match_id, []).append(row)
+        self._pending.clear()
 
     async def commit(self):
         for row in self._pending:
@@ -116,6 +128,30 @@ def _valid_lineup(team_id: int, coach_name: str) -> Dict[str, Any]:
             }
         ]
     }
+
+
+def test_sync_lineup_delegates_to_sync_service():
+    db = FakeSession()
+    cache = FakeCacheService()
+    expected = {"success": True, "match_id": 123, "created": False, "updated": True}
+    sync_service = FakeLineupSyncService(expected)
+    service = LineupService(
+        client=FakeClient([]),
+        cache_service=cache,
+        lineup_sync_service=sync_service,
+    )
+
+    result = asyncio.run(service.sync_lineup(db, 123))
+
+    assert result == expected
+    assert len(sync_service.calls) == 1
+    delegated_db, delegated_match_id, delegated_cache_service, delegated_cache_key, delegated_validator = sync_service.calls[0]
+    assert delegated_db is db
+    assert delegated_match_id == 123
+    assert delegated_cache_service is cache
+    assert delegated_cache_key == make_lineup_cache_key(123)
+    assert delegated_validator([{"team": {"id": 1}, "startXI": [], "substitutes": []}]) is True
+    assert delegated_validator([{"team": {"id": 1}, "startXI": "bad", "substitutes": []}]) is False
 
 
 def test_sync_lineup_creates_new_row():
@@ -307,27 +343,39 @@ def test_get_cached_match_lineup_cache_miss_syncs_and_sets_cache_with_ttl():
     client = FakeClient([_valid_lineup(1, "Coach A")])
     cache = FakeCacheService()
     db = FakeSession(statuses={123: "NS"})
-    service = LineupService(client=client, cache_service=cache)
+    sync_service = FakeLineupSyncService({"success": True, "match_id": 123, "created": True, "updated": False})
+    service = LineupService(
+        client=client,
+        cache_service=cache,
+        lineup_sync_service=sync_service,
+    )
 
     result = asyncio.run(service.get_cached_match_lineup(db, 123))
 
-    assert result is not None
-    assert client.calls == 1
-    assert len(cache.set_calls) == 1
-    assert cache.set_calls[0][0] == make_lineup_cache_key(123)
-    assert cache.set_calls[0][2] == settings.REDIS_TTL_LINEUP
+    assert result is None
+    assert client.calls == 0
+    assert sync_service.calls == []
+    assert cache.get_calls == [make_lineup_cache_key(123)]
+    assert cache.set_calls == []
 
 
 def test_get_cached_match_lineup_database_fallback_returns_none_when_no_data():
     client = FakeClient([{"response": []}])
     cache = FakeCacheService()
     db = FakeSession(statuses={123: "NS"})
-    service = LineupService(client=client, cache_service=cache)
+    sync_service = FakeLineupSyncService({"success": True, "match_id": 123, "created": True, "updated": False})
+    service = LineupService(
+        client=client,
+        cache_service=cache,
+        lineup_sync_service=sync_service,
+    )
 
     result = asyncio.run(service.get_cached_match_lineup(db, 123))
 
     assert result is None
-    assert client.calls == 1
+    assert client.calls == 0
+    assert sync_service.calls == []
+    assert cache.get_calls == [make_lineup_cache_key(123)]
     assert cache.set_calls == []
 
 

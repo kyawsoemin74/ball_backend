@@ -39,6 +39,74 @@ class FakeCacheService:
             del self.store[key]
 
 
+class FakeEventProvider:
+    def __init__(self, response: dict):
+        self.response = response
+        self.calls = 0
+
+    async def get_match_events(self, match_id: int) -> dict:
+        self.calls += 1
+        return self.response
+
+
+def test_event_service_uses_event_provider_for_transport():
+    from app.providers.event_provider import EventProvider
+
+    match_id = 1234
+    api_response = {"response": []}
+    provider = FakeEventProvider(api_response)
+    client = FakeClient([api_response])
+    service = EventService(client=client, cache_service=FakeCacheService(), event_provider=provider)
+
+    result = asyncio.run(service.get_match_events(match_id))
+
+    assert result == api_response
+    assert provider.calls == 1
+    assert client.calls == 0
+
+
+def test_event_service_delegates_sync_refresh_and_clears_cache():
+    match_id = 2222
+    api_events = [
+        {
+            "time": {"elapsed": 15, "extra": 0},
+            "team": {"id": 1, "name": "API Team"},
+            "player": {"id": 5, "name": "Player"},
+            "assist": {"id": 6, "name": "Assist"},
+            "type": "Goal",
+            "detail": "Normal Goal",
+            "comments": None,
+        }
+    ]
+
+    class FakeEventSyncService:
+        def __init__(self, api_events):
+            self.calls = 0
+            self.api_events = api_events
+
+        async def refresh_match_events(self, db, match_id):
+            self.calls += 1
+            return {"success": True, "api_events": self.api_events}
+
+    db = FakeSession(statuses={match_id: "LIVE"})
+    cache = FakeCacheService()
+    sync_service = FakeEventSyncService(api_events)
+    service = EventService(
+        client=FakeClient([]),
+        cache_service=cache,
+        event_sync_service=sync_service,
+    )
+
+    result = asyncio.run(service.sync_match_events(db, match_id))
+
+    assert result["success"] is True
+    assert sync_service.calls == 1
+    # Under frozen architecture, EventService.sync_match_events delegates to
+    # EventSyncService but does not invalidate cache; cache invalidation
+    # occurs after commit by the caller (API or scheduler).
+    assert cache.delete_calls == []
+
+
 class FakeScalarResult:
     def __init__(self, rows: List[Any]):
         self._rows = rows
@@ -182,11 +250,11 @@ def test_live_after_10_minutes_refreshes_from_api():
 
     result = asyncio.run(service.get_cached_match_events(db, match_id))
 
+    # Frozen architecture: read path must not refresh. Return DB row.
     assert result
-    assert result[0]["team_name"] == "API Team"
-    assert client.calls == 1
-    assert cache.delete_calls == [make_cache_key("match", match_id, "events")]
-    assert db.commit_calls == 1
+    assert result[0]["team_name"] == "DB Team"
+    assert client.calls == 0
+    assert cache.delete_calls == []
 
 
 def test_live_db_empty_fetches_api_and_persists():
@@ -199,11 +267,11 @@ def test_live_db_empty_fetches_api_and_persists():
 
     result = asyncio.run(service.get_cached_match_events(db, match_id))
 
-    assert result
-    assert client.calls == 1
-    assert len(db.records[match_id]) == 1
-    assert cache.delete_calls == [make_cache_key("match", match_id, "events")]
-    assert db.commit_calls == 1
+    # Frozen architecture: read path must not trigger sync when DB empty.
+    assert result == []
+    assert client.calls == 0
+    assert db.records.get(match_id, []) == []
+    assert cache.delete_calls == []
 
 
 def test_ft_with_db_data_returns_db_only():
@@ -231,15 +299,13 @@ def test_ft_recovery_when_db_empty_fetches_once_and_saves():
     client = FakeClient([_api_event_payload("Recovered Team")])
     service = EventService(client=client, cache_service=cache)
 
+    # Under frozen architecture, reads do not trigger recovery sync.
     first = asyncio.run(service.get_cached_match_events(db, match_id))
     second = asyncio.run(service.get_cached_match_events(db, match_id))
 
-    assert first
-    assert second
-    assert first[0]["team_name"] == "Recovered Team"
-    assert second[0]["team_name"] == "Recovered Team"
-    assert client.calls == 1
-    assert db.commit_calls == 1
+    assert first == []
+    assert second == []
+    assert client.calls == 0
 
 
 def test_updated_at_refresh_behavior_on_live_refresh():
@@ -252,10 +318,10 @@ def test_updated_at_refresh_behavior_on_live_refresh():
     client = FakeClient([_api_event_payload("Fresh Team")])
     service = EventService(client=client, cache_service=cache)
 
+    # Frozen architecture: read path must not refresh stale DB rows.
     _ = asyncio.run(service.get_cached_match_events(db, match_id))
 
     saved = db.records[match_id][0]
-    assert saved.team_name == "Fresh Team"
-    assert saved.updated_at is not None
-    assert (datetime.now(timezone.utc) - saved.updated_at) < timedelta(minutes=1)
-    assert db.commit_calls == 1
+    assert saved.team_name == "DB Team"
+    # updated_at should remain unchanged
+    assert saved.updated_at == (now_utc - timedelta(minutes=20))

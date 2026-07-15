@@ -82,6 +82,24 @@ class MatchRepository:
         result = await db.execute(query.offset(skip).limit(limit))
         return list(result.scalars().all())
 
+    async def get_team_matches(self, db: AsyncSession, team_id: int, allowed_ids: set[int] | None = None) -> list[Match]:
+        query = select(Match).where((Match.home_team_id == team_id) | (Match.away_team_id == team_id))
+        if allowed_ids is not None:
+            if not allowed_ids:
+                return []
+            query = query.where(Match.league_id.in_(allowed_ids))
+        result = await db.execute(query.order_by(Match.match_time.asc(), Match.match_id.asc()))
+        return list(result.scalars().all())
+
+    async def get_team_matches_recent(self, db: AsyncSession, team_id: int, allowed_ids: set[int] | None = None) -> list[Match]:
+        query = select(Match).where((Match.home_team_id == team_id) | (Match.away_team_id == team_id))
+        if allowed_ids is not None:
+            if not allowed_ids:
+                return []
+            query = query.where(Match.league_id.in_(allowed_ids))
+        result = await db.execute(query.order_by(Match.match_time.desc(), Match.match_id.desc()))
+        return list(result.scalars().all())
+
     @staticmethod
     def order_matches_for_date(matches: list[Match]) -> list[Match]:
         return sorted(

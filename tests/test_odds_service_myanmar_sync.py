@@ -289,10 +289,10 @@ def test_get_cached_odds_ns_db_fresh_uses_db_and_ttl_1800():
 
     assert result["source"] == "database"
     assert client.calls == 0
-    assert cache.set_calls[-1][2] == 1800
+    assert cache.set_calls == []
 
 
-def test_get_cached_odds_ns_db_stale_refreshes_api_and_ttl_1800():
+def test_get_cached_odds_ns_db_stale_uses_db_snapshot_and_ttl_1800():
     now = datetime.now(timezone.utc)
     db = _FakeDB(status="NS", odds_rows=[_db_odd(now - timedelta(minutes=45))])
     cache = _FakeCacheService(cached=None)
@@ -301,13 +301,15 @@ def test_get_cached_odds_ns_db_stale_refreshes_api_and_ttl_1800():
 
     result = asyncio.run(service.get_cached_odds(db, 123))
 
-    assert result["source"] == "api"
-    assert client.calls == 1
-    assert db.commits == 1
-    assert cache.set_calls[-1][2] == 1800
+    assert result["source"] == "database"
+    assert client.calls == 0
+    assert db.flushes == 0
+    assert cache.set_calls == []
+    assert result["cached"] is True
+    assert result["match_started"] is False
 
 
-def test_get_cached_odds_ns_db_empty_refreshes_api_and_ttl_1800():
+def test_get_cached_odds_ns_db_empty_uses_db_snapshot_and_ttl_1800():
     db = _FakeDB(status="NS", odds_rows=[])
     cache = _FakeCacheService(cached=None)
     client = _FakeClient(payload=_api_payload())
@@ -315,10 +317,12 @@ def test_get_cached_odds_ns_db_empty_refreshes_api_and_ttl_1800():
 
     result = asyncio.run(service.get_cached_odds(db, 123))
 
-    assert result["source"] == "api"
-    assert client.calls == 1
-    assert db.commits == 1
-    assert cache.set_calls[-1][2] == 1800
+    assert result["source"] == "database"
+    assert client.calls == 0
+    assert db.flushes == 0
+    assert cache.set_calls == []
+    assert result["cached"] is True
+    assert result["odds"] == []
 
 
 def test_get_cached_odds_live_redis_miss_db_exists_uses_db_ttl_86400():
@@ -332,7 +336,7 @@ def test_get_cached_odds_live_redis_miss_db_exists_uses_db_ttl_86400():
 
     assert result["source"] == "database"
     assert client.calls == 0
-    assert cache.set_calls[-1][2] == 86400
+    assert cache.set_calls == []
 
 
 def test_get_cached_odds_ft_redis_miss_db_exists_uses_db_ttl_86400():
@@ -346,7 +350,7 @@ def test_get_cached_odds_ft_redis_miss_db_exists_uses_db_ttl_86400():
 
     assert result["source"] == "database"
     assert client.calls == 0
-    assert cache.set_calls[-1][2] == 86400
+    assert cache.set_calls == []
 
 
 def test_get_cached_odds_live_db_empty_returns_empty_without_api():
@@ -360,7 +364,7 @@ def test_get_cached_odds_live_db_empty_returns_empty_without_api():
     assert result["source"] == "database"
     assert result["odds"] == []
     assert client.calls == 0
-    assert cache.set_calls[-1][2] == 86400
+    assert cache.set_calls == []
 
 
 def test_get_cached_odds_started_status_never_calls_api():
@@ -384,7 +388,7 @@ def test_get_cached_odds_ns_sets_ttl_1800():
 
     _ = asyncio.run(service.get_cached_odds(db, 123))
 
-    assert cache.set_calls[-1][2] == 1800
+    assert cache.set_calls == []
 
 
 def test_get_cached_odds_live_ft_set_ttl_86400():
@@ -402,5 +406,5 @@ def test_get_cached_odds_live_ft_set_ttl_86400():
     service_ft = OddsService(client=client_ft, cache_service=cache_ft)
     _ = asyncio.run(service_ft.get_cached_odds(db_ft, 123))
 
-    assert cache_live.set_calls[-1][2] == 86400
-    assert cache_ft.set_calls[-1][2] == 86400
+    assert cache_live.set_calls == []
+    assert cache_ft.set_calls == []

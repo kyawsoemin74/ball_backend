@@ -297,10 +297,13 @@ class RecordingStandingService(StandingService):
 class FakeSyncDB:
     def __init__(self):
         self.added = []
+        self.execute_calls = []
         self.commit_calls = 0
         self.rollback_calls = 0
 
     async def execute(self, query):
+        self.execute_calls.append(query)
+
         class FakeScalars:
             def all(self):
                 return []
@@ -387,6 +390,33 @@ class FakeStandingServiceForPrewarm:
 class AsyncEmptyMatchRepository:
     async def get_many_by_ids(self, db, match_ids, allowed_ids=None):
         return []
+
+
+class InMemoryLeagueRepository:
+    def __init__(self, existing=None):
+        self.existing = {league.league_id: league for league in (existing or [])}
+
+    async def get_many_by_ids(self, db, league_ids, allowed_ids=None):
+        return [self.existing[league_id] for league_id in league_ids if league_id in self.existing]
+
+
+class OrderTrackingTeamService:
+    def __init__(self, order_log):
+        self.order_log = order_log
+
+    async def ensure_teams_exist(self, db, teams):
+        self.order_log.append("team_sync")
+        return None
+
+
+class OrderTrackingMatchService(MatchService):
+    def __init__(self, *args, order_log=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.order_log = order_log if order_log is not None else []
+
+    async def _upsert_leagues_from_fixtures(self, db, fixtures, seen_league_ids=None):
+        self.order_log.append("league_sync")
+        await super()._upsert_leagues_from_fixtures(db, fixtures, seen_league_ids)
 
 
 def make_fixture(fixture_id, league_id=39, season=2026):
@@ -546,7 +576,7 @@ def test_match_service_daily_sync_prewarm_all_skipped(caplog):
     assert result["standings_prewarm_failed"] == 0
     assert standing_service.standing_repository.calls == [(72, 2026), (75, 2026)]
     assert standing_service.sync_calls == []
-    assert db.commit_calls == 1
+    assert db.commit_calls == 2
     assert "PREWARM_CANDIDATE league_id=72 season=2026" in caplog.text
     assert "PREWARM_CANDIDATE league_id=75 season=2026" in caplog.text
     assert "PREWARM_SKIPPED league_id=72 season=2026" in caplog.text
@@ -581,7 +611,7 @@ def test_match_service_daily_sync_prewarm_all_synced(caplog):
     assert result["standings_prewarm_skipped"] == 0
     assert result["standings_prewarm_failed"] == 0
     assert standing_service.sync_calls == [(72, 2026), (75, 2026)]
-    assert db.commit_calls == 3
+    assert db.commit_calls == 4
     assert "PREWARM_SYNCED league_id=72 season=2026" in caplog.text
     assert "PREWARM_SYNCED league_id=75 season=2026" in caplog.text
 
@@ -614,8 +644,97 @@ def test_match_service_daily_sync_prewarm_mixed_synced_and_skipped():
     assert result["standings_prewarm_failed"] == 0
     assert standing_service.standing_repository.calls == [(72, 2026), (75, 2026)]
     assert standing_service.sync_calls == [(75, 2026)]
-    assert db.commit_calls == 2
+    assert db.commit_calls == 3
     assert db.rollback_calls == 0
+
+
+def test_match_service_sync_inserts_missing_league_once_for_duplicate_fixture_league():
+    fixtures = [
+        make_fixture(3101, league_id=72, season=2026),
+        make_fixture(3102, league_id=72, season=2026),
+    ]
+    service = MatchService(
+        client=StaticFixtureClient(fixtures),
+        team_service=FakeTeamService(),
+        cache_service=FakeCacheService(),
+        standing_service=FakeStandingServiceForPrewarm(),
+    )
+    service.allowed_league_repository = FakeAllowedIdsRepository([72])
+    service.match_repository = AsyncEmptyMatchRepository()
+    service.league_repository = InMemoryLeagueRepository(existing=[])
+    db = FakeSyncDB()
+
+    async def run():
+        return await service.sync_full_season(db, 72, 2026)
+
+    result = asyncio.run(run())
+
+    inserted_leagues = [obj for obj in db.added if getattr(obj, "__tablename__", None) == "leagues"]
+    assert result["success"] is True
+    assert len(inserted_leagues) == 1
+    assert inserted_leagues[0].league_id == 72
+    assert inserted_leagues[0].name == "Allowed League"
+
+
+def test_match_service_sync_updates_existing_league_metadata():
+    existing_league = type(
+        "LeagueRow",
+        (),
+        {
+            "league_id": 72,
+            "name": "Old Name",
+            "country": "Old Country",
+            "country_code": "OC",
+            "logo": "old-logo",
+            "season": "2023",
+        },
+    )()
+    fixtures = [make_fixture(3201, league_id=72, season=2026)]
+    service = MatchService(
+        client=StaticFixtureClient(fixtures),
+        team_service=FakeTeamService(),
+        cache_service=FakeCacheService(),
+        standing_service=FakeStandingServiceForPrewarm(),
+    )
+    service.allowed_league_repository = FakeAllowedIdsRepository([72])
+    service.match_repository = AsyncEmptyMatchRepository()
+    service.league_repository = InMemoryLeagueRepository(existing=[existing_league])
+    db = FakeSyncDB()
+
+    async def run():
+        return await service.sync_full_season(db, 72, 2026)
+
+    result = asyncio.run(run())
+
+    assert result["success"] is True
+    assert existing_league.name == "Allowed League"
+    assert existing_league.country == "X"
+    assert existing_league.logo == "old-logo"
+    assert existing_league.season == "2026"
+
+
+def test_match_service_sync_runs_league_sync_before_team_sync():
+    order_log = []
+    fixtures = [make_fixture(3301, league_id=72, season=2026)]
+    service = OrderTrackingMatchService(
+        client=StaticFixtureClient(fixtures),
+        team_service=OrderTrackingTeamService(order_log),
+        cache_service=FakeCacheService(),
+        standing_service=FakeStandingServiceForPrewarm(),
+        order_log=order_log,
+    )
+    service.allowed_league_repository = FakeAllowedIdsRepository([72])
+    service.match_repository = AsyncEmptyMatchRepository()
+    service.league_repository = InMemoryLeagueRepository(existing=[])
+    db = FakeSyncDB()
+
+    async def run():
+        return await service.sync_full_season(db, 72, 2026)
+
+    result = asyncio.run(run())
+
+    assert result["success"] is True
+    assert order_log.index("league_sync") < order_log.index("team_sync")
 
 
 def test_match_service_daily_sync_prewarm_failure_does_not_break_fixture_sync(caplog):
@@ -647,7 +766,7 @@ def test_match_service_daily_sync_prewarm_failure_does_not_break_fixture_sync(ca
     assert result["standings_prewarm_skipped"] == 0
     assert result["standings_prewarm_failed"] == 1
     assert standing_service.sync_calls == [(72, 2026), (75, 2026)]
-    assert db.commit_calls == 2
+    assert db.commit_calls == 3
     assert db.rollback_calls == 1
     assert "PREWARM_FAILED league_id=72 season=2026" in caplog.text
     assert "PREWARM_SYNCED league_id=75 season=2026" in caplog.text
@@ -721,8 +840,14 @@ def test_match_service_process_sync_persists_season_on_inserted_match():
         await service._process_sync(sync_db, [fixture])
 
     asyncio.run(run_db_assertion())
-    assert len(sync_db.added) == 1
-    assert sync_db.added[0].season == 2028
+    # League upsert uses db.add(League), while Match persistence now uses a
+    # PostgreSQL INSERT ... ON CONFLICT statement executed via db.execute.
+    match_upsert_stmt = next((stmt for stmt in sync_db.execute_calls if "INSERT INTO matches" in str(stmt)), None)
+    assert match_upsert_stmt is not None
+
+    compiled_params = match_upsert_stmt.compile().params
+    assert 2002 in compiled_params.values()
+    assert 2028 in compiled_params.values()
 
 
 def test_league_service_sync_all_leagues_skips_unallowed_leagues():
@@ -894,12 +1019,14 @@ def test_standing_service_persists_standing_metadata_fields():
 
     assert result["success"] is True
     assert result["updated"] == 1
-    assert len(db.added) == 1
 
-    standing = db.added[0]
-    assert standing.group_name == "Group A"
-    assert standing.form == "WWDLW"
-    assert standing.description == "Promotion - World Cup"
+    standings_upsert_stmt = next((stmt for stmt in db.execute_calls if "INSERT INTO standings" in str(stmt)), None)
+    assert standings_upsert_stmt is not None
+
+    compiled_params = standings_upsert_stmt.compile().params
+    assert "Group A" in compiled_params.values()
+    assert "WWDLW" in compiled_params.values()
+    assert "Promotion - World Cup" in compiled_params.values()
 
 
 def test_standing_response_includes_metadata_fields():

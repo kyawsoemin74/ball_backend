@@ -7,8 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.cache import make_cache_key
 from app.models.match import Match
 from app.models.odds import Odds
+from app.providers.odds_provider import OddsProvider
 from app.services.base.football_client import FootballAPIClient
 from app.services.cache_service import CacheService
+from app.services.odds_sync_service import OddsSyncService
 from myanmar_odds.services.myanmar_odds_service import MyanmarOddsService
 from myanmar_odds.utils.handicap_parser import parse_handicap_value
 
@@ -16,10 +18,17 @@ logger = logging.getLogger(__name__)
 
 
 class OddsService:
-    def __init__(self, client: FootballAPIClient, cache_service: CacheService | None = None) -> None:
+    def __init__(
+        self,
+        client: FootballAPIClient,
+        cache_service: CacheService | None = None,
+        odds_provider: OddsProvider | None = None,
+    ) -> None:
         self.client = client
         self.cache_service = cache_service or CacheService()
+        self.odds_provider = odds_provider or OddsProvider(client)
         self.myanmar_odds_service = MyanmarOddsService()
+        self.odds_sync_service = OddsSyncService(self, cache_service=self.cache_service, odds_provider=self.odds_provider)
 
     @staticmethod
     def _canonical_handicap_key(handicap_text: str, handicap: float, side: Optional[str] = None) -> str:
@@ -208,15 +217,13 @@ class OddsService:
         return filtered_odds
 
     async def get_match_odds(self, match_id: int) -> Optional[dict]:
-        return await self.client.get("/odds", params={"fixture": match_id})
+        return {"error": "Read-only odds access", "match_id": match_id}
 
     async def get_cached_odds(self, db: AsyncSession, fixture_id: int) -> dict:
-        from datetime import datetime, timedelta, timezone
-
         cache_key = make_cache_key("match", fixture_id, "odds")
         cached = await self.cache_service.get_json(cache_key)
         if cached is not None:
-            logger.info("ODDS_CACHE_HIT", extra={"fixture_id": fixture_id, "status": "UNKNOWN", "ttl": None})
+            logger.debug("ODDS_CACHE_HIT", extra={"fixture_id": fixture_id, "status": "UNKNOWN", "ttl": None})
             return cached
 
         match = (await db.execute(select(Match).where(Match.match_id == fixture_id))).scalar_one_or_none()
@@ -224,11 +231,6 @@ class OddsService:
             return {"error": "Match not found"}
 
         status = (getattr(match, "status", None) or "").upper()
-        pre_match_statuses = {"NS", "TBD", "PST"}
-        pre_match_ttl = 1800
-        started_ttl = 86400
-        match_started = status not in pre_match_statuses
-
         existing_odds = (await db.execute(select(Odds).where(Odds.fixture_id == fixture_id))).scalars().all()
 
         def _serialize_odds(rows: list[Odds]) -> list[dict]:
@@ -244,83 +246,11 @@ class OddsService:
                 for o in rows
             ]
 
-        if match_started:
-            result = {
-                "source": "database",
-                "odds": _serialize_odds(existing_odds),
-                "cached": True,
-                "match_started": True,
-                "reason": "match_started",
-            }
-            logger.info("ODDS_MATCH_STARTED_DB_ONLY", extra={"fixture_id": fixture_id, "status": status, "ttl": started_ttl})
-            await self.cache_service.set_json(cache_key, result, started_ttl)
-            return result
-
-        latest_update = max((o.last_updated for o in existing_odds if o.last_updated), default=None)
-        if existing_odds and latest_update and (datetime.now(timezone.utc) - latest_update) < timedelta(minutes=30):
-            result = {
-                "source": "database",
-                "odds": _serialize_odds(existing_odds),
-                "cached": True,
-                "match_started": False,
-            }
-            logger.info("ODDS_DB_FRESH", extra={"fixture_id": fixture_id, "status": status, "ttl": pre_match_ttl})
-            await self.cache_service.set_json(cache_key, result, pre_match_ttl)
-            return result
-
-        logger.info("ODDS_DB_STALE", extra={"fixture_id": fixture_id, "status": status, "ttl": pre_match_ttl})
-        logger.info("ODDS_API_REFRESH", extra={"fixture_id": fixture_id, "status": status, "ttl": pre_match_ttl})
-
-        result = await self.get_match_odds(fixture_id)
-        if not result or "response" not in result:
-            return {"error": "API error"}
-
-        responses = result.get("response", [])
-        if not responses:
-            empty_result = {"odds": [], "source": "api", "cached": False, "match_started": False, "reason": "no_data"}
-            await self.cache_service.set_json(cache_key, empty_result, pre_match_ttl)
-            return empty_result
-
-        odds_to_upsert = []
-        one_xbet_missing = True
-        for item in responses:
-            if item.get("fixture", {}).get("id") != fixture_id:
-                continue
-            bookmaker = self._get_1xbet_bookmaker(item.get("bookmakers", []))
-            if not bookmaker:
-                continue
-            one_xbet_missing = False
-            for record in self._filter_main_lines(bookmaker):
-                record["fixture_id"] = fixture_id
-                odds_to_upsert.append(record)
-
-        now_utc = datetime.now(timezone.utc)
-        if odds_to_upsert:
-            await db.execute(delete(Odds).where(Odds.fixture_id == fixture_id))
-            for record in odds_to_upsert:
-                record["last_updated"] = now_utc
-                db.add(Odds(**record))
-            await db.commit()
-        else:
-            await db.flush()
-
-        if not odds_to_upsert:
-            reason = "1xbet_data_not_found" if one_xbet_missing else "filtered_no_odds"
-            empty_result = {"odds": [], "source": "api", "cached": False, "match_started": False, "reason": reason}
-            await self.cache_service.set_json(cache_key, empty_result, pre_match_ttl)
-            return empty_result
-
-        odds_data = [
-            {
-                "bookmaker": r["bookmaker_name"],
-                "market": r["market_name"],
-                "selection": r["selection"],
-                "odd": r["odd_value"],
-                "myanmar_odd": r.get("myanmar_odd"),
-                "updated_at": now_utc.isoformat(),
-            }
-            for r in odds_to_upsert
-        ]
-        refresh_result = {"source": "api", "odds": odds_data, "cached": False, "match_started": False, "updated": len(odds_to_upsert)}
-        await self.cache_service.set_json(cache_key, refresh_result, pre_match_ttl)
-        return refresh_result
+        result = {
+            "source": "database",
+            "odds": _serialize_odds(existing_odds),
+            "cached": True,
+            "match_started": status not in {"NS", "TBD", "PST"},
+        }
+        logger.debug("ODDS_DB_READ_ONLY", extra={"fixture_id": fixture_id, "status": status, "ttl": None})
+        return result

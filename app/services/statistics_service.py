@@ -6,8 +6,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.match import Match
+from app.providers.statistics_provider import StatisticsProvider
+from app.repositories.statistics_repository import StatisticsRepository
 from app.services.base.football_client import FootballAPIClient
 from app.services.cache_service import CacheService
+from app.services.statistics_sync_service import StatisticsSyncService
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +42,22 @@ class StatisticsService:
         "dangerous attacks": "Dangerous Attacks",
     }
 
-    def __init__(self, client: FootballAPIClient, cache_service: CacheService | None = None) -> None:
+    def __init__(
+        self,
+        client: FootballAPIClient,
+        cache_service: CacheService | None = None,
+        statistics_provider: StatisticsProvider | None = None,
+        statistics_sync_service: StatisticsSyncService | None = None,
+        statistics_repository: StatisticsRepository | None = None,
+    ) -> None:
         self.client = client
         self.cache_service = cache_service or CacheService()
+        self.statistics_provider = statistics_provider or StatisticsProvider(client)
+        self.statistics_repository = statistics_repository or StatisticsRepository()
+        self.statistics_sync_service = statistics_sync_service or StatisticsSyncService(
+            statistics_provider=self.statistics_provider,
+            statistics_repository=self.statistics_repository,
+        )
 
     @staticmethod
     def _normalize_data_name(raw_name: str) -> str:
@@ -150,18 +166,10 @@ class StatisticsService:
         }
 
     async def get_match_statistics(self, match_id: int) -> Optional[dict]:
-        return await self.client.get("/fixtures/statistics", params={"fixture": match_id})
+        return await self.statistics_provider.get_match_statistics(match_id)
 
     async def sync_match_statistics(self, db: AsyncSession, match_id: int) -> dict:
-        api_res = await self.get_match_statistics(match_id)
-        if not api_res or "response" not in api_res:
-            return {"success": False, "message": "Statistics not found"}
-
-        statistics_data = api_res.get("response")
-        if not statistics_data:
-            return {"success": False, "message": "Statistics not found"}
-
-        return {"success": True, "match_id": match_id}
+        return await self.statistics_sync_service.sync_match_statistics(db, match_id)
 
     async def get_cached_statistics(self, db: AsyncSession, match_id: int) -> dict:
         from app.cache import make_cache_key
@@ -171,26 +179,25 @@ class StatisticsService:
         if cached is not None:
             return cached
 
-        api_res = await self.get_match_statistics(match_id)
-        if not api_res or "response" not in api_res:
+        record = await self.statistics_repository.get_by_match_id(db, match_id)
+        if record is None or not getattr(record, "data", None):
             return {"error": "Statistics not found"}
 
-        statistics_data = api_res.get("response")
-        if not statistics_data:
-            return {"error": "Statistics not found"}
+        statistics_data = record.data
+        api_res = {"response": statistics_data}
 
         match = (await db.execute(select(Match).where(Match.match_id == match_id))).scalar_one_or_none()
         status = (getattr(match, "status", None) or "").upper()
 
         if status in self._FINISHED_STATUSES:
             ttl = self._FINISHED_TTL_SECONDS
-            logger.info(
+            logger.debug(
                 "STATISTICS_CACHE_SET_FT",
                 extra={"match_id": match_id, "status": status, "ttl": ttl},
             )
         else:
             ttl = self._LIVE_TTL_SECONDS
-            logger.info(
+            logger.debug(
                 "STATISTICS_CACHE_SET_LIVE",
                 extra={"match_id": match_id, "status": status, "ttl": ttl},
             )

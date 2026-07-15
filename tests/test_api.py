@@ -432,7 +432,11 @@ def test_live_matches_endpoint_returns_only_allowed_league(monkeypatch):
     async def fake_cache_get_json(key):
         return None
 
+    async def fake_cache_set_json(key, payload, ttl):
+        return None
+
     monkeypatch.setattr(matches_api, "cache_get_json", fake_cache_get_json)
+    monkeypatch.setattr(matches_api, "cache_set_json", fake_cache_set_json)
     monkeypatch.setattr(matches_api.MatchRepository, "get_live_matches", fake_get_live_matches)
     monkeypatch.setattr(matches_api.AllowedLeagueRepository, "get_allowed_ids", fake_allowed_ids)
 
@@ -1295,8 +1299,11 @@ def test_statistics_normalization_uses_team_ids_not_response_order():
 def test_statistics_cache_ttl_by_match_status(status, expected_ttl):
     from app.services.statistics_service import StatisticsService
 
+    provider_calls = {"count": 0}
+
     class FakeClient:
         async def get(self, *_args, **_kwargs):
+            provider_calls["count"] += 1
             return {
                 "response": [
                     {
@@ -1309,6 +1316,13 @@ def test_statistics_cache_ttl_by_match_status(status, expected_ttl):
                     },
                 ]
             }
+
+    class FakeRepository:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def get_by_match_id(self, _db, _match_id):
+            return SimpleNamespace(data=self.payload)
 
     class FakeCacheService:
         def __init__(self):
@@ -1329,21 +1343,40 @@ def test_statistics_cache_ttl_by_match_status(status, expected_ttl):
             return FakeResult()
 
     cache = FakeCacheService()
-    service = StatisticsService(client=FakeClient(), cache_service=cache)
+    repository = FakeRepository([
+        {
+            "team": {"id": 1},
+            "statistics": [{"type": "Ball Possession", "value": "50%"}],
+        },
+        {
+            "team": {"id": 2},
+            "statistics": [{"type": "Ball Possession", "value": "50%"}],
+        },
+    ])
+    service = StatisticsService(
+        client=FakeClient(),
+        cache_service=cache,
+        statistics_repository=repository,
+    )
 
     result = asyncio.run(service.get_cached_statistics(FakeDB(), 123))
 
     assert "response" in result
     assert cache.last_ttl == expected_ttl
+    assert provider_calls["count"] == 0
 
 
-def test_match_odds_endpoint_commits_db_session(monkeypatch):
+def test_match_odds_endpoint_stays_read_only(monkeypatch):
     class FakeSession:
         def __init__(self):
             self.committed = False
+            self.rolled_back = False
 
         async def commit(self):
             self.committed = True
+
+        async def rollback(self):
+            self.rolled_back = True
 
     fake_db = FakeSession()
 
@@ -1367,7 +1400,8 @@ def test_match_odds_endpoint_commits_db_session(monkeypatch):
         app.dependency_overrides.clear()
 
     assert response.status_code == 200
-    assert fake_db.committed is True
+    assert fake_db.committed is False
+    assert fake_db.rolled_back is False
 
 
 def test_old_match_standing_route_removed():

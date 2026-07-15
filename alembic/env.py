@@ -32,6 +32,7 @@ from app.models import (
     MatchEvent, 
     MatchH2H, 
     MatchLineup,
+    MatchStatistics,
     LineupRefreshState,
 )
 

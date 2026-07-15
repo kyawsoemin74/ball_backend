@@ -19,6 +19,7 @@ from app.models.odds import Odds
 from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.match_repository import MatchRepository
 from app.schemas.match import MatchDateResponse, MatchResponse, MatchStatisticsResponse
+from app.services.cache_service import CacheService
 from app.services.league_structure_resolver import LeagueStructureResolver
 from app.services.active_match_service import active_match_service
 from app.services.football import football_service, LIVE_STATUSES
@@ -283,7 +284,7 @@ async def get_match_statistics(
 @router.get("/{match_id}/odds")
 async def get_match_odds(match_id: int = Path(..., gt=0), db: AsyncSession = Depends(get_db)):
     """
-    Get betting odds for a specific match with smart caching (30-min rule, no API after match start).
+    Get stored betting odds for a specific match from the read-only snapshot path.
     """
     # Fallback to Service logic (DB check -> API fetch if needed)
     await _assert_match_allowed(match_id, db)
@@ -291,7 +292,6 @@ async def get_match_odds(match_id: int = Path(..., gt=0), db: AsyncSession = Dep
     if "error" in result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["error"])
 
-    await db.commit()
     return result
 
 
@@ -310,6 +310,30 @@ async def heartbeat_match(
 
 # --- POST/Sync Routes (Grouped Together) ---
 
+@router.post("/sync/{match_id}/lineup", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
+async def sync_match_lineup_route(
+    match_id: int = Path(..., gt=0),
+    db: AsyncSession = Depends(get_db)
+) -> Dict[str, Any]:
+    """
+    Sync lineup for a specific match from the API and persist it to the database.
+    """
+    try:
+        result = await football_service.sync_match_lineup(db=db, match_id=match_id)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    try:
+        await CacheService().delete(make_cache_key("lineup", match_id))
+    except Exception:
+        # Cache failures should not affect the response
+        pass
+
+    return result
+
+
 @router.post("/sync/{match_id}/events", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
 async def sync_match_events(
     match_id: int = Path(..., gt=0),
@@ -320,6 +344,36 @@ async def sync_match_events(
     """
     result = await football_service.sync_match_events(db=db, match_id=match_id)
     await db.commit()
+    # Invalidate cache after successful commit per frozen architecture
+    try:
+        await CacheService().delete(make_cache_key("match", match_id, "events"))
+    except Exception:
+        # Cache failures should not affect the response
+        pass
+    return result
+
+
+@router.post("/sync/{match_id}/statistics", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
+async def sync_match_statistics_route(
+    match_id: int = Path(..., gt=0),
+    db: AsyncSession = Depends(get_db)
+) -> Dict[str, Any]:
+    """
+    Sync statistics for a specific match from the API and persist them to the database.
+    """
+    try:
+        result = await football_service.sync_match_statistics(db=db, match_id=match_id)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    try:
+        await CacheService().delete(make_cache_key("match", match_id, "statistics"))
+    except Exception:
+        # Cache failures should not affect the response
+        pass
+
     return result
 
 

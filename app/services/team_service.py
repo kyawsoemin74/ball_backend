@@ -5,20 +5,52 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache import make_cache_key
+from app.core.config import settings
 from app.models.match import Match
-from app.models.team import Team
+from app.providers.team_provider import TeamProvider
 from app.repositories.team_repository import TeamRepository
 from app.services.base.football_client import FootballAPIClient
 from app.services.cache_service import CacheService
+from app.services.team_sync_service import TeamSyncService
 
 logger = logging.getLogger(__name__)
 
 
 class TeamService:
-    def __init__(self, client: FootballAPIClient, cache_service: CacheService | None = None) -> None:
-        self.client = client
+    def __init__(
+        self,
+        client: FootballAPIClient,
+        cache_service: CacheService | None = None,
+        team_provider: TeamProvider | None = None,
+    ) -> None:
+        self.team_provider = team_provider or TeamProvider(client)
         self.cache_service = cache_service or CacheService()
-        self.team_repository = TeamRepository()
+        self._team_repository = TeamRepository()
+        self.team_sync_service = TeamSyncService(
+            cache_service=self.cache_service,
+            team_repository=self._team_repository,
+        )
+        self._team_sync_ensure_impl = self.team_sync_service.ensure_teams_exist
+        self._team_sync_upsert_impl = self.team_sync_service.upsert_team
+        self.team_sync_service.ensure_teams_exist = self._ensure_teams_exist_bridge
+        self.team_sync_service.upsert_team = self._upsert_team_bridge
+
+    @property
+    def team_repository(self):
+        return self._team_repository
+
+    @team_repository.setter
+    def team_repository(self, value):
+        self._team_repository = value
+        self.team_sync_service.team_repository = value
+
+    async def _ensure_teams_exist_bridge(self, db: AsyncSession, teams_data: list[dict]) -> dict:
+        # Compatibility hook: preserve TeamService subclass interception.
+        return await self.ensure_teams_exist(db, teams_data)
+
+    async def _upsert_team_bridge(self, db: AsyncSession, team_data: dict):
+        # Compatibility hook: preserve TeamService subclass interception.
+        return await self.upsert_team(db, team_data)
 
     @staticmethod
     def _normalize_fixture_result(fixture: dict, team_id: int) -> Optional[str]:
@@ -61,7 +93,7 @@ class TeamService:
         }
 
     async def get_team_details(self, team_id: int) -> Optional[dict]:
-        return await self.client.get("/teams", params={"id": team_id})
+        return await self.team_provider.get_team_details(team_id)
 
     @staticmethod
     def _normalize_db_fixture_item(match: Match, team_id: int) -> dict[str, Any]:
@@ -136,7 +168,7 @@ class TeamService:
         upcoming = [self._normalize_db_fixture_item(item, team_id) for item in upcoming_result.scalars().all()]
 
         payload = {"team_id": team_id, "recent": recent, "upcoming": upcoming}
-        await self.cache_service.set_json(cache_key, payload, 21600)
+        await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_TEAM_FIXTURES)
         return payload
 
     async def get_cached_team_squad(self, team_id: int) -> Optional[dict]:
@@ -147,7 +179,7 @@ class TeamService:
         if cached is not None:
             return cached
 
-        result = await self.client.get("/players/squads", params={"team": team_id})
+        result = await self.team_provider.get_team_squad(team_id)
         if not result or "response" not in result or not result["response"]:
             return {"team_id": team_id, "team_name": None, "players": []}
 
@@ -169,7 +201,7 @@ class TeamService:
             "team_name": team_data.get("team", {}).get("name") if isinstance(team_data.get("team"), dict) else None,
             "players": players,
         }
-        await self.cache_service.set_json(cache_key, payload, 86400)
+        await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_TEAM_SQUAD)
         return payload
 
     async def get_cached_team_statistics(self, team_id: int, league_id: int, season: int) -> Optional[dict]:
@@ -180,10 +212,7 @@ class TeamService:
         if cached is not None:
             return cached
 
-        result = await self.client.get(
-            "/teams/statistics",
-            params={"team": team_id, "league": league_id, "season": season},
-        )
+        result = await self.team_provider.get_team_statistics(team_id, league_id, season)
         if not result or "response" not in result or not result["response"]:
             return {"error": "Statistics not found"}
 
@@ -211,94 +240,11 @@ class TeamService:
             "average_goals_scored": float(average_goals_scored) if average_goals_scored is not None else None,
             "average_goals_conceded": float(average_goals_conceded) if average_goals_conceded is not None else None,
         }
-        await self.cache_service.set_json(cache_key, payload, 86400)
+        await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_TEAM_STATISTICS)
         return payload
 
     async def ensure_teams_exist(self, db: AsyncSession, teams_data: list[dict]) -> dict:
-        """Ensure referenced teams exist in the database with one read + bulk insert."""
-        if not teams_data:
-            return {"created": 0, "existing": 0, "total": 0}
+        return await self._team_sync_ensure_impl(db, teams_data)
 
-        normalized_teams = []
-        seen_team_ids = set()
-
-        for item in teams_data:
-            if not isinstance(item, dict):
-                logger.warning("Skipping invalid team payload: %r", item)
-                continue
-
-            team_id = item.get("team_id", item.get("id"))
-            name = item.get("name")
-
-            if team_id is None:
-                logger.warning("Skipping team payload without team_id: %r", item)
-                continue
-            if not name:
-                logger.warning("Skipping team payload without name for team_id=%s", team_id)
-                continue
-            if team_id in seen_team_ids:
-                logger.warning("Skipping duplicate team_id=%s in request payload", team_id)
-                continue
-
-            seen_team_ids.add(team_id)
-            normalized_teams.append({
-                "team_id": int(team_id),
-                "name": str(name),
-                "country": item.get("country"),
-                "logo": item.get("logo"),
-                "stadium": item.get("stadium"),
-                "founded": item.get("founded"),
-            })
-
-        if not normalized_teams:
-            return {"created": 0, "existing": 0, "total": 0}
-
-        existing_teams = await self.team_repository.get_many_by_ids(db, [t["team_id"] for t in normalized_teams])
-        existing_ids = {team.team_id for team in existing_teams}
-        missing_teams = [team for team in normalized_teams if team["team_id"] not in existing_ids]
-
-        if missing_teams:
-            db.add_all([
-                Team(
-                    team_id=team["team_id"],
-                    name=team["name"],
-                    country=team.get("country"),
-                    logo=team.get("logo"),
-                    stadium=team.get("stadium"),
-                    founded=team.get("founded"),
-                )
-                for team in missing_teams
-            ])
-            await db.flush()
-
-        created = len(missing_teams)
-        existing = len(normalized_teams) - created
-        logger.info("ensure_teams_exist: created=%s, existing=%s", created, existing)
-        return {"created": created, "existing": existing, "total": len(normalized_teams)}
-
-    async def upsert_team(self, db: AsyncSession, team_data: dict) -> Team:
-        team_id = team_data["team"]["id"]
-        existing = await self.team_repository.get_by_id(db, team_id)
-
-        if existing:
-            existing.name = team_data["team"]["name"]
-            existing.country = team_data["team"].get("country")
-            existing.logo = team_data["team"].get("logo")
-            existing.stadium = team_data.get("venue", {}).get("name") if team_data.get("venue") else None
-            existing.founded = team_data["team"].get("founded")
-            await db.flush()
-            self.cache_service.delete_sync(make_cache_key("team", team_id))
-            return existing
-
-        new_team = Team(
-            team_id=team_id,
-            name=team_data["team"]["name"],
-            country=team_data["team"].get("country"),
-            logo=team_data["team"].get("logo"),
-            stadium=team_data.get("venue", {}).get("name") if team_data.get("venue") else None,
-            founded=team_data["team"].get("founded"),
-        )
-        db.add(new_team)
-        await db.flush()
-        self.cache_service.delete_sync(make_cache_key("team", team_id))
-        return new_team
+    async def upsert_team(self, db: AsyncSession, team_data: dict):
+        return await self._team_sync_upsert_impl(db, team_data)

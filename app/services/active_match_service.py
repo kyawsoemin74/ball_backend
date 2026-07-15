@@ -17,6 +17,11 @@ class ActiveMatchService:
         logger.info("ACTIVE_MATCH_REGISTERED", extra={"match_id": match_id, "ttl": ttl})
         return ttl
 
+    async def remove_match_active(self, match_id: int) -> None:
+        key = make_active_match_key(match_id)
+        await async_redis.delete(key)
+        logger.debug("ACTIVE_MATCH_REMOVED", extra={"match_id": match_id})
+
     async def get_active_matches(self) -> List[int]:
         pattern = make_cache_key("active_match", "*")
         match_ids: List[int] = []

@@ -13,6 +13,8 @@ class Team(Base):
     logo = Column(String(500), nullable=True)
     stadium = Column(String(255), nullable=True)
     founded = Column(Integer, nullable=True)  # year
+    current_league_id = Column(Integer, nullable=True)
+    current_season = Column(String(10), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

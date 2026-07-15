@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.league import League
@@ -69,3 +70,25 @@ class LeagueRepository:
         query = query.distinct().order_by(League.display_order.asc(), League.name.asc())
         result = await db.execute(query)
         return list(result.scalars().all())
+
+    async def upsert_one(self, db: AsyncSession, row: dict) -> League:
+        insert_stmt = pg_insert(League).values(row)
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            constraint="leagues_pkey",
+            set_={
+                "name": insert_stmt.excluded.name,
+                "country": insert_stmt.excluded.country,
+                "country_code": insert_stmt.excluded.country_code,
+                "logo": insert_stmt.excluded.logo,
+                "season": insert_stmt.excluded.season,
+                "is_featured": insert_stmt.excluded.is_featured,
+                "display_order": insert_stmt.excluded.display_order,
+            },
+        )
+        await db.execute(upsert_stmt)
+
+        result = await db.execute(select(League).where(League.league_id == int(row["league_id"])))
+        league = result.scalar_one_or_none()
+        if league is None:
+            raise RuntimeError(f"League upsert failed for league_id={row['league_id']}")
+        return league

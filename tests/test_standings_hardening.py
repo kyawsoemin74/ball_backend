@@ -5,8 +5,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.models.standing import Standings
+from app.repositories.standing_repository import StandingRepository
 from app.services.scheduler import LiveUpdateScheduler
 from app.services.standing_service import StandingService
+from app.services import standing_sync_service as standing_sync_module
+from app.services.standing_sync_service import (
+    _STANDINGS_POST_COMMIT_CACHE_KEYS,
+    _clear_standings_post_commit_cache_invalidation,
+    _run_standings_post_commit_cache_invalidation,
+)
 import app.services.scheduler as scheduler_module
 
 
@@ -57,25 +64,22 @@ class StaticStandingRepository:
         return list(self.rows)
 
 
-class DeleteTrackingStandingRepository:
+class UpsertTrackingStandingRepository:
     def __init__(self):
-        self.deleted_pairs = []
+        self.calls = []
+        self.rows = []
 
-    async def delete_for_league_season(self, db, league_id, season):
-        self.deleted_pairs.append((league_id, str(season)))
+    async def upsert_for_league_season(self, db, league_id, season, rows):
+        self.calls.append((league_id, str(season)))
+        self.rows.extend(rows)
 
 
 class FakeStandingWriteDB:
     def __init__(self):
-        self.added = []
         self.flush_calls = 0
 
     async def flush(self):
         self.flush_calls += 1
-
-    def add(self, instance):
-        self.added.append(instance)
-
 
 def make_standing_row(team_id=1, position=1):
     timestamp = datetime(2026, 6, 23, tzinfo=timezone.utc)
@@ -138,7 +142,7 @@ def test_upsert_standings_deduplicates_duplicate_team_rows():
         team_service=FakeTeamService(),
         cache_service=RecordingCacheService(),
     )
-    service.standing_repository = DeleteTrackingStandingRepository()
+    service.standing_repository = UpsertTrackingStandingRepository()
     db = FakeStandingWriteDB()
     standings_data = [
         {
@@ -160,9 +164,130 @@ def test_upsert_standings_deduplicates_duplicate_team_rows():
     inserted = asyncio.run(service.upsert_standings(db, standings_data, 39, "2026"))
 
     assert inserted == 1
-    assert len(db.added) == 1
-    assert db.added[0].team_id == 7
-    assert service.standing_repository.deleted_pairs == [(39, "2026")]
+    assert len(service.standing_repository.rows) == 1
+    assert service.standing_repository.rows[0]["team_id"] == 7
+    assert service.standing_repository.calls == [(39, "2026")]
+
+
+class ExecuteTrackingDB:
+    def __init__(self):
+        self.execute_calls = []
+
+    async def execute(self, query):
+        self.execute_calls.append(query)
+
+        class FakeResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []
+
+        return FakeResult()
+
+
+class FakeSessionWithInfo:
+    def __init__(self):
+        self.info = {}
+
+
+def test_standing_repository_upsert_uses_real_conflict_constraint():
+    repository = StandingRepository()
+    db = ExecuteTrackingDB()
+    rows = [
+        {
+            "league_id": 39,
+            "season": "2026",
+            "team_id": 7,
+            "position": 1,
+            "team_name": "Seven",
+            "team_logo": None,
+            "group_name": None,
+            "form": None,
+            "description": None,
+            "points": 20,
+            "played": 8,
+            "won": 6,
+            "drawn": 2,
+            "lost": 0,
+            "goals_for": 15,
+            "goals_against": 5,
+            "goal_difference": 10,
+        }
+    ]
+
+    asyncio.run(repository.upsert_for_league_season(db, 39, "2026", rows))
+
+    sql_text = "\n".join(str(stmt) for stmt in db.execute_calls)
+    assert "ON CONFLICT ON CONSTRAINT uq_standings_league_id_season_team_id" in sql_text
+    assert "DO UPDATE SET" in sql_text
+
+
+def test_standing_repository_upsert_cleans_stale_rows_by_team_scope():
+    repository = StandingRepository()
+    db = ExecuteTrackingDB()
+    rows = [
+        {
+            "league_id": 39,
+            "season": "2026",
+            "team_id": 7,
+            "position": 1,
+            "team_name": "Seven",
+            "team_logo": None,
+            "group_name": None,
+            "form": None,
+            "description": None,
+            "points": 20,
+            "played": 8,
+            "won": 6,
+            "drawn": 2,
+            "lost": 0,
+            "goals_for": 15,
+            "goals_against": 5,
+            "goal_difference": 10,
+        }
+    ]
+
+    asyncio.run(repository.upsert_for_league_season(db, 39, "2026", rows))
+
+    sql_text = "\n".join(str(stmt) for stmt in db.execute_calls)
+    assert "DELETE FROM standings" in sql_text
+    assert "standings.team_id NOT IN" in sql_text
+
+
+def test_standings_cache_invalidation_runs_only_after_commit(monkeypatch):
+    deleted_keys = []
+
+    def fake_cache_delete_sync(key):
+        deleted_keys.append(key)
+
+    monkeypatch.setattr(standing_sync_module, "cache_delete_sync", fake_cache_delete_sync)
+
+    session = FakeSessionWithInfo()
+    cache_key = "fover:standings:39:2026"
+    session.info[_STANDINGS_POST_COMMIT_CACHE_KEYS] = {cache_key}
+
+    _run_standings_post_commit_cache_invalidation(session)
+
+    assert deleted_keys == [cache_key]
+    assert _STANDINGS_POST_COMMIT_CACHE_KEYS not in session.info
+
+
+def test_standings_cache_invalidation_cleared_on_rollback(monkeypatch):
+    deleted_keys = []
+
+    def fake_cache_delete_sync(key):
+        deleted_keys.append(key)
+
+    monkeypatch.setattr(standing_sync_module, "cache_delete_sync", fake_cache_delete_sync)
+
+    session = FakeSessionWithInfo()
+    session.info[_STANDINGS_POST_COMMIT_CACHE_KEYS] = {"fover:standings:39:2026"}
+
+    _clear_standings_post_commit_cache_invalidation(session)
+    _run_standings_post_commit_cache_invalidation(session)
+
+    assert deleted_keys == []
 
 
 class QueryInspectResult:
@@ -209,6 +334,26 @@ class FakeSchedulerDB:
     def __init__(self):
         self.commit_calls = 0
         self.rollback_calls = 0
+
+    async def execute(self, query, params=None):
+        class FakeResult:
+            def __init__(self, value):
+                self.value = value
+
+            def scalar_one_or_none(self):
+                return self.value
+
+            def scalar_one(self):
+                return self.value
+
+        query_text = str(query)
+        if "pg_try_advisory_lock" in query_text:
+            return FakeResult(True)
+
+        if "pg_advisory_unlock" in query_text:
+            return FakeResult(True)
+
+        return FakeResult(None)
 
     async def commit(self):
         self.commit_calls += 1
@@ -259,6 +404,60 @@ def test_refresh_job_isolates_failures_and_continues(monkeypatch, caplog):
     assert "STANDINGS_REFRESH_SUCCESS" in caplog.text
     assert "STANDINGS_REFRESH_FAILED" in caplog.text
     assert "STANDINGS_REFRESH_COMPLETE" in caplog.text
+
+
+def test_refresh_job_skips_when_advisory_lock_not_acquired(monkeypatch, caplog):
+    scheduler = LiveUpdateScheduler()
+    db = FakeSchedulerDB()
+
+    async def fake_get_pairs(_db):
+        raise AssertionError("Pairs query should not run when lock is unavailable")
+
+    async def fake_acquire(_db):
+        return False
+
+    async def fake_release(_db):
+        raise AssertionError("Lock release should not run when lock was never acquired")
+
+    monkeypatch.setattr(scheduler, "_get_allowed_standings_pairs", fake_get_pairs)
+    monkeypatch.setattr(scheduler, "_acquire_standings_refresh_lock", fake_acquire)
+    monkeypatch.setattr(scheduler, "_release_standings_refresh_lock", fake_release)
+    monkeypatch.setattr(scheduler_module, "async_session", lambda: FakeAsyncSessionContext(db))
+
+    with caplog.at_level(logging.INFO):
+        metrics = asyncio.run(scheduler._refresh_standings_job())
+
+    assert metrics == {"processed_pairs": 0, "success_pairs": 0, "failed_pairs": 0}
+    assert "STANDINGS_REFRESH_SKIPPED reason=lock_not_acquired" in caplog.text
+
+
+def test_refresh_job_releases_advisory_lock_after_processing(monkeypatch):
+    scheduler = LiveUpdateScheduler()
+    db = FakeSchedulerDB()
+    released = {"count": 0}
+
+    async def fake_get_pairs(_db):
+        return [(39, 2026)]
+
+    async def fake_sync_standings(_db, league_id, season):
+        return {"success": True, "updated": 1}
+
+    async def fake_acquire(_db):
+        return True
+
+    async def fake_release(_db):
+        released["count"] += 1
+
+    monkeypatch.setattr(scheduler, "_get_allowed_standings_pairs", fake_get_pairs)
+    monkeypatch.setattr(scheduler, "_acquire_standings_refresh_lock", fake_acquire)
+    monkeypatch.setattr(scheduler, "_release_standings_refresh_lock", fake_release)
+    monkeypatch.setattr(scheduler_module, "async_session", lambda: FakeAsyncSessionContext(db))
+    monkeypatch.setattr(scheduler_module.football_service, "sync_standings", fake_sync_standings)
+
+    metrics = asyncio.run(scheduler._refresh_standings_job())
+
+    assert metrics == {"processed_pairs": 1, "success_pairs": 1, "failed_pairs": 0}
+    assert released["count"] == 1
 
 
 def test_standings_model_declares_index_and_unique_constraint():
@@ -502,6 +701,42 @@ def test_event_refresh_uses_active_match_discovery_and_status_gate(monkeypatch, 
     assert "EVENT_REFRESH_SYNCED match_id=502" in caplog.text
     assert "EVENT_REFRESH_SYNCED match_id=504" in caplog.text
     assert "EVENT_REFRESH_COMPLETE" in caplog.text
+
+
+def test_event_refresh_skips_before_refresh_interval(monkeypatch, caplog):
+    scheduler = LiveUpdateScheduler()
+    db = FakeSchedulerDB()
+    scheduler.cache_service = FakeEventRefreshCacheService()
+
+    async def fake_get_active_matches():
+        return [901]
+
+    async def fake_get_status(_db, _match_id):
+        return "LIVE"
+
+    async def fake_should_refresh(_db, _match_id):
+        return False
+
+    async def fake_sync_events(_db, _match_id):
+        raise AssertionError("sync_match_events should not be called before refresh interval")
+
+    monkeypatch.setattr(scheduler_module.active_match_service, "get_active_matches", fake_get_active_matches)
+    monkeypatch.setattr(scheduler, "_get_match_status_for_event_refresh", fake_get_status)
+    monkeypatch.setattr(scheduler, "_should_refresh_match_events", fake_should_refresh)
+    monkeypatch.setattr(scheduler_module, "async_session", lambda: FakeAsyncSessionContext(db))
+    monkeypatch.setattr(scheduler_module.football_service, "sync_match_events", fake_sync_events)
+
+    with caplog.at_level(logging.INFO):
+        metrics = asyncio.run(scheduler._refresh_events_job())
+
+    assert metrics == {
+        "active_matches": 1,
+        "processed_matches": 1,
+        "synced_matches": 0,
+        "skipped_matches": 1,
+        "failed_matches": 0,
+    }
+    assert "EVENT_REFRESH_SKIPPED match_id=901 reason=refresh_window" in caplog.text
 
 
 def test_event_refresh_failure_isolation_and_metrics(monkeypatch, caplog):
