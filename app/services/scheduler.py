@@ -51,7 +51,7 @@ class LiveUpdateScheduler:
         
         self.scheduler.add_job(
             self._sync_live_matches_job,
-            trigger=IntervalTrigger(seconds=60),
+            trigger=IntervalTrigger(seconds=120),
             id="sync_live_matches",
             name="Sync Live Matches",
             max_instances=1  # Prevent overlapping jobs
@@ -87,7 +87,7 @@ class LiveUpdateScheduler:
 
         self.scheduler.add_job(
             self._refresh_odds_job,
-            trigger=IntervalTrigger(minutes=1),
+            trigger=IntervalTrigger(minutes=360),
             id="refresh_odds",
             name="Refresh Odds Snapshots",
             max_instances=1,
@@ -103,7 +103,7 @@ class LiveUpdateScheduler:
 
         self.scheduler.add_job(
             self._refresh_events_job,
-            trigger=IntervalTrigger(seconds=60),
+            trigger=IntervalTrigger(seconds=600),
             id="refresh_events",
             name="Refresh Active Match Events",
             max_instances=1,
