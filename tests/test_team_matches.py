@@ -174,6 +174,36 @@ def test_match_service_returns_cached_payload_without_repository_call():
     assert repository.calls == []
 
 
+def test_match_service_orders_upcoming_and_finished_buckets_descending_by_time():
+    cache_service = RecordingCacheService(cached=None)
+    rows = [
+        make_match(1, "NS", datetime(2026, 1, 1, tzinfo=timezone.utc), home_team_id=7, away_team_id=8),
+        make_match(2, "FT", datetime(2026, 1, 2, tzinfo=timezone.utc), home_team_id=7, away_team_id=8),
+        make_match(3, "NS", datetime(2026, 1, 3, tzinfo=timezone.utc), home_team_id=7, away_team_id=8),
+        make_match(4, "FT", datetime(2026, 1, 4, tzinfo=timezone.utc), home_team_id=7, away_team_id=8),
+    ]
+    repository = RecordingMatchRepository(rows=rows)
+    fixture_sync_service = FakeFixtureSyncService(match_repository=repository, cache_service=cache_service)
+    service = MatchService(
+        client=object(),
+        team_service=SimpleNamespace(),
+        cache_service=cache_service,
+        standing_service=SimpleNamespace(),
+        fixture_provider=SimpleNamespace(),
+        fixture_sync_service=fixture_sync_service,
+    )
+
+    result = asyncio.run(service.get_team_matches(object(), 7))
+
+    assert [item["match_id"] for item in result] == [3, 1, 4, 2]
+    assert [item["match_time"] for item in result] == [
+        "2026-01-03T00:00:00Z",
+        "2026-01-01T00:00:00Z",
+        "2026-01-04T00:00:00Z",
+        "2026-01-02T00:00:00Z",
+    ]
+
+
 def test_football_service_delegates_team_matches_to_match_service():
     captured = {}
 

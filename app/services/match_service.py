@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache import make_cache_key
@@ -175,6 +177,9 @@ class MatchService:
                 finished.append(response.model_dump(mode="json"))
             else:
                 upcoming.append(response.model_dump(mode="json"))
+
+        upcoming.sort(key=lambda item: item.get("match_time") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        finished.sort(key=lambda item: item.get("match_time") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
 
         payload = upcoming + finished
         await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_TEAM_FIXTURES)
