@@ -203,3 +203,23 @@ def test_sync_daily_fixtures_removes_terminal_matches_from_scheduler(monkeypatch
     assert result["success"] is True
     assert fake_active_service.marked == []
     assert fake_active_service.removed == [5001]
+
+
+def test_sync_daily_fixtures_skips_cleanup_when_finalization_fails(monkeypatch):
+    fixtures = [make_fixture(6001)]
+    fixtures[0]["fixture"]["status"]["short"] = "FT"
+    service = build_service(fixtures, FakeTeamService())
+    db = FakeDB()
+    fake_active_service = RecordingActiveMatchService()
+
+    async def fake_finalize(_db, _match_id, _status):
+        return False
+
+    monkeypatch.setattr(service, "_finalize_terminal_match_events", fake_finalize)
+    monkeypatch.setattr(fixture_sync_module, "active_match_service", fake_active_service)
+
+    result = asyncio.run(service.sync_daily_fixtures(db, "2026-06-15"))
+
+    assert result["success"] is True
+    assert fake_active_service.marked == []
+    assert fake_active_service.removed == []

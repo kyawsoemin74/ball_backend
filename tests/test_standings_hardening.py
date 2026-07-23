@@ -662,6 +662,7 @@ def test_event_refresh_uses_active_match_discovery_and_status_gate(monkeypatch, 
 
     status_map = {501: "NS", 502: "1H", 503: "FT", 504: "LIVE"}
     synced = []
+    removed = []
 
     async def fake_get_active_matches():
         return [501, 502, 503, 504]
@@ -673,8 +674,12 @@ def test_event_refresh_uses_active_match_discovery_and_status_gate(monkeypatch, 
         synced.append(match_id)
         return {"success": True, "count": 5}
 
+    async def fake_remove_match_active(match_id):
+        removed.append(match_id)
+
     monkeypatch.setattr(scheduler_module.active_match_service, "get_active_matches", fake_get_active_matches)
     monkeypatch.setattr(scheduler, "_get_match_status_for_event_refresh", fake_get_status)
+    monkeypatch.setattr(scheduler_module.active_match_service, "remove_match_active", fake_remove_match_active)
     monkeypatch.setattr(scheduler_module, "async_session", lambda: FakeAsyncSessionContext(db))
     monkeypatch.setattr(scheduler_module.football_service, "sync_match_events", fake_sync_events)
 
@@ -683,24 +688,61 @@ def test_event_refresh_uses_active_match_discovery_and_status_gate(monkeypatch, 
 
     assert metrics == {
         "active_matches": 4,
-        "processed_matches": 2,
-        "synced_matches": 2,
-        "skipped_matches": 2,
+        "processed_matches": 3,
+        "synced_matches": 3,
+        "skipped_matches": 1,
         "failed_matches": 0,
     }
-    assert synced == [502, 504]
-    assert db.commit_calls == 2
+    assert synced == [502, 503, 504]
+    assert removed == []
+    assert db.commit_calls == 3
     assert db.rollback_calls == 0
     assert scheduler.cache_service.delete_calls == [
         "fover:match:502:events",
+        "fover:match:503:events",
         "fover:match:504:events",
     ]
     assert "EVENT_REFRESH_START" in caplog.text
     assert "EVENT_REFRESH_SKIPPED match_id=501 reason=status_blocked status=NS" in caplog.text
-    assert "EVENT_REFRESH_SKIPPED match_id=503 reason=status_blocked status=FT" in caplog.text
     assert "EVENT_REFRESH_SYNCED match_id=502" in caplog.text
+    assert "EVENT_REFRESH_SYNCED match_id=503" in caplog.text
     assert "EVENT_REFRESH_SYNCED match_id=504" in caplog.text
     assert "EVENT_REFRESH_COMPLETE" in caplog.text
+
+
+def test_event_refresh_allows_terminal_recovery_statuses(monkeypatch):
+    scheduler = LiveUpdateScheduler()
+    db = FakeSchedulerDB()
+    scheduler.cache_service = FakeEventRefreshCacheService()
+    synced = []
+
+    async def fake_get_active_matches():
+        return [701]
+
+    async def fake_get_status(_db, _match_id):
+        return "FT"
+
+    async def fake_sync_events(_db, match_id):
+        synced.append(match_id)
+        return {"success": True, "count": 2}
+
+    monkeypatch.setattr(scheduler_module.active_match_service, "get_active_matches", fake_get_active_matches)
+    monkeypatch.setattr(scheduler, "_get_match_status_for_event_refresh", fake_get_status)
+    monkeypatch.setattr(scheduler_module, "async_session", lambda: FakeAsyncSessionContext(db))
+    monkeypatch.setattr(scheduler_module.football_service, "sync_match_events", fake_sync_events)
+
+    metrics = asyncio.run(scheduler._refresh_events_job())
+
+    assert metrics == {
+        "active_matches": 1,
+        "processed_matches": 1,
+        "synced_matches": 1,
+        "skipped_matches": 0,
+        "failed_matches": 0,
+    }
+    assert synced == [701]
+    assert db.commit_calls == 1
+    assert db.rollback_calls == 0
 
 
 def test_event_refresh_skips_before_refresh_interval(monkeypatch, caplog):

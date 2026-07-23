@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 EVENT_REFRESH_ALLOWED_STATUSES = {"1H", "HT", "2H", "LIVE"}
 EVENT_REFRESH_BLOCKED_STATUSES = {"NS", "FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"}
+EVENT_FINALIZATION_RECOVERY_STATUSES = {"FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"}
 EVENT_REFRESH_INTERVAL_SECONDS = 300
 STATISTICS_REFRESH_ALLOWED_STATUSES = {"1H", "HT", "2H", "LIVE"}
 STATISTICS_REFRESH_BLOCKED_STATUSES = {"NS", "FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"}
@@ -598,22 +599,28 @@ class LiveUpdateScheduler:
                 for match_id in active_matches:
                     logger.debug("EVENT_REFRESH_MATCH match_id=%s", match_id)
                     status = await self._get_match_status_for_event_refresh(db, match_id)
+                    status_upper = str(status or "").upper() if status is not None else None
 
-                    if not status or status in EVENT_REFRESH_BLOCKED_STATUSES or status not in EVENT_REFRESH_ALLOWED_STATUSES:
+                    if not status_upper or (
+                        status_upper in EVENT_REFRESH_BLOCKED_STATUSES
+                        and status_upper not in EVENT_FINALIZATION_RECOVERY_STATUSES
+                        and status_upper not in EVENT_REFRESH_ALLOWED_STATUSES
+                    ):
                         metrics["skipped_matches"] += 1
-                        logger.debug(
+                        logger.info(
                             "EVENT_REFRESH_SKIPPED match_id=%s reason=status_blocked status=%s",
                             match_id,
-                            status,
+                            status_upper,
                         )
                         continue
 
                     metrics["processed_matches"] += 1
 
                     try:
-                        if not await self._should_refresh_match_events(db, match_id):
+                        should_refresh = status_upper in EVENT_FINALIZATION_RECOVERY_STATUSES or await self._should_refresh_match_events(db, match_id)
+                        if not should_refresh:
                             metrics["skipped_matches"] += 1
-                            logger.debug(
+                            logger.info(
                                 "EVENT_REFRESH_SKIPPED match_id=%s reason=refresh_window",
                                 match_id,
                             )
@@ -622,9 +629,12 @@ class LiveUpdateScheduler:
                         result = await football_service.sync_match_events(db, match_id)
                         if result.get("success"):
                             await db.commit()
-                            await self.cache_service.delete(make_cache_key("match", match_id, "events"))
+                            try:
+                                await self.cache_service.delete(make_cache_key("match", match_id, "events"))
+                            except Exception:
+                                logger.exception("EVENT_REFRESH_CACHE_INVALIDATION_FAILED match_id=%s", match_id)
                             metrics["synced_matches"] += 1
-                            logger.debug("EVENT_REFRESH_SYNCED match_id=%s", match_id)
+                            logger.info("EVENT_REFRESH_SYNCED match_id=%s", match_id)
                             continue
 
                         await db.rollback()

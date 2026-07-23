@@ -29,6 +29,7 @@ FINISHED_STATUSES = {"FT", "AET", "PEN", "CANC", "ABD", "AWD", "WO"}
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "LIVE", "BT", "P"}
 ACTIVE_MATCH_REGISTER_STATUSES = {"1H", "2H", "HT", "LIVE"}
 ACTIVE_MATCH_TERMINAL_STATUSES = FINISHED_STATUSES | {"PST"}
+FINALIZATION_TERMINAL_STATUSES = ACTIVE_MATCH_TERMINAL_STATUSES
 
 
 class FixtureSyncService:
@@ -96,6 +97,49 @@ class FixtureSyncService:
             await active_match_service.remove_match_active(match_id)
         except Exception as exc:
             logger.warning("ACTIVE_MATCH_SYNC_SIDE_EFFECT_FAILED match_id=%s status=%s error=%s", match_id, status, exc)
+
+    async def _finalize_terminal_match_events(self, db: AsyncSession, match_id: int, status: str | None) -> bool:
+        normalized_status = str(status or "").upper()
+        if normalized_status not in FINALIZATION_TERMINAL_STATUSES:
+            return False
+
+        match_row = await db.execute(select(Match).where(Match.match_id == match_id))
+        if match_row is None or not hasattr(match_row, "scalar_one_or_none"):
+            return True
+
+        current_match = match_row.scalar_one_or_none()
+        if current_match is None:
+            return True
+
+        current_state = str(getattr(current_match, "status", "") or "").upper()
+        if current_state in {"FINALIZED"}:
+            logger.info("FINAL_EVENT_SYNC_SKIPPED match_id=%s reason=already_finalized", match_id)
+            return False
+
+        try:
+            from app.services.football import football_service
+
+            result = await football_service.sync_match_events(db, match_id)
+            if not result.get("success"):
+                logger.warning(
+                    "FINAL_EVENT_SYNC_FAILED match_id=%s status=%s reason=%s",
+                    match_id,
+                    normalized_status,
+                    result.get("message", "event_sync_failed"),
+                )
+                await db.rollback()
+                return False
+
+            await db.commit()
+            try:
+                await self.cache_service.delete(make_cache_key("match", match_id, "events"))
+            except Exception as exc:
+                logger.warning("FINAL_EVENT_SYNC_CACHE_INVALIDATION_FAILED match_id=%s error=%s", match_id, exc)
+            return True
+        except Exception as exc:
+            await db.rollback()
+            logger.warning("FINAL_EVENT_SYNC_FAILED match_id=%s status=%s error=%s", match_id, normalized_status, exc)
+            return False
 
     async def _prewarm_missing_standings(self, db: AsyncSession, candidates: set[tuple[int, int]]) -> dict[str, int]:
         total_pairs = len(candidates)
@@ -322,7 +366,14 @@ class FixtureSyncService:
 
                 await db.flush()
                 await db.commit()
-                await self._sync_active_match_registration(match.match_id, match.status)
+
+                normalized_status = str(match.status or "").upper()
+                finalization_completed = False
+                if normalized_status in FINALIZATION_TERMINAL_STATUSES:
+                    finalization_completed = await self._finalize_terminal_match_events(db, match.match_id, match.status)
+
+                if finalization_completed or normalized_status not in FINALIZATION_TERMINAL_STATUSES:
+                    await self._sync_active_match_registration(match.match_id, match.status)
 
                 result["inserted"] += inserted
                 result["updated"] += updated

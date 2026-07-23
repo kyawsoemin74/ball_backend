@@ -22,7 +22,7 @@ class EventSyncService:
         self.event_repository = event_repository or EventRepository()
 
     async def refresh_match_events(self, db: AsyncSession, match_id: int) -> Dict[str, Any]:
-        logger.info("EVENT_SYNC_START", extra={"match_id": match_id})
+        logger.info("FINAL_EVENT_SYNC_START", extra={"match_id": match_id})
 
         result = await self.event_provider.get_match_events(match_id)
         if not result or "response" not in result:
@@ -33,7 +33,7 @@ class EventSyncService:
         await self.event_repository.replace_match_events(db, match_id, api_events)
         await db.flush()
 
-        logger.info("EVENT_SYNC_COMPLETE", extra={"match_id": match_id, "count": len(api_events)})
+        logger.info("FINAL_EVENT_SYNC_COMPLETE", extra={"match_id": match_id, "count": len(api_events)})
         # Return events for caller to inspect; cache invalidation should occur
         # after the caller commits the transaction.
         return {"success": True, "count": len(api_events), "api_events": api_events}
