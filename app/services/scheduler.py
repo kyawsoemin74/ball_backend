@@ -52,7 +52,7 @@ class LiveUpdateScheduler:
         
         self.scheduler.add_job(
             self._sync_live_matches_job,
-            trigger=IntervalTrigger(seconds=120),
+            trigger=IntervalTrigger(seconds=60),
             id="sync_live_matches",
             name="Sync Live Matches",
             max_instances=1  # Prevent overlapping jobs

@@ -92,7 +92,7 @@ class LineupSyncService:
                 await self.lineup_repository.update_one(db, existing, lineup_data)
                 await db.flush()
                 metrics = {"success": True, "match_id": match_id, "created": False, "updated": True}
-                logger.debug("LINEUP_SYNC_UPDATED", extra=_safe_lineup_log_extra(metrics))
+                logger.info("LINEUP_SYNC_UPDATED", extra=_safe_lineup_log_extra(metrics))
                 logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
                 return metrics
 
@@ -115,7 +115,7 @@ class LineupSyncService:
                 return metrics
 
             metrics = {"success": True, "match_id": match_id, "created": True, "updated": False}
-            logger.debug("LINEUP_SYNC_CREATED", extra=_safe_lineup_log_extra(metrics))
+            logger.info("LINEUP_SYNC_CREATED", extra=_safe_lineup_log_extra(metrics))
             logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
             return metrics
         except Exception as exc:

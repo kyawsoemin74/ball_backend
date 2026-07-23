@@ -52,6 +52,16 @@ class FakeCacheService:
             del self.store[key]
 
 
+class FakeTeamService:
+    def __init__(self, squad_payloads: Dict[int, Dict[str, Any]]):
+        self.squad_payloads = squad_payloads
+        self.calls: List[int] = []
+
+    async def get_cached_team_squad(self, team_id: int) -> Dict[str, Any] | None:
+        self.calls.append(team_id)
+        return self.squad_payloads.get(team_id)
+
+
 class FakeLineupSyncService:
     def __init__(self, result: Dict[str, Any]):
         self.result = result
@@ -304,6 +314,44 @@ def test_sync_lineup_status_gate_canc_is_skipped_without_api_call():
     assert client.calls == 0
     assert 123 not in db.records
     assert cache.delete_calls == []
+
+
+def test_get_cached_match_lineup_enriches_players_with_squad_photos():
+    client = FakeClient([])
+    cache = FakeCacheService()
+    db = FakeSession()
+    db.records[123] = [
+        MatchLineup(
+            match_id=123,
+            data=[
+                {
+                    "team": {"id": 1, "name": "Home FC"},
+                    "startXI": [{"player": {"id": 10, "name": "Starter"}}],
+                    "substitutes": [{"player": {"id": 20, "name": "Sub"}}],
+                    "coach": {"id": 1, "name": "Coach"},
+                },
+                {
+                    "team": {"id": 2, "name": "Away FC"},
+                    "startXI": [{"player": {"id": 30, "name": "AwayStarter"}}],
+                    "substitutes": [{"player": {"id": 40, "name": "AwaySub"}}],
+                    "coach": {"id": 2, "name": "Away Coach"},
+                },
+            ],
+        )
+    ]
+    team_service = FakeTeamService({
+        1: {"team_id": 1, "players": [{"player_id": 10, "photo": "home.png"}]},
+        2: {"team_id": 2, "players": [{"player_id": 30, "photo": "away.png"}]},
+    })
+    service = LineupService(client=client, cache_service=cache, team_service=team_service)
+
+    result = asyncio.run(service.get_cached_match_lineup(db, 123))
+
+    assert result[0]["startXI"][0]["player"]["photo"] == "home.png"
+    assert result[0]["substitutes"][0]["player"]["photo"] is None
+    assert result[1]["startXI"][0]["player"]["photo"] == "away.png"
+    assert result[1]["coach"]["name"] == "Away Coach"
+    assert team_service.calls == [1, 2]
 
 
 def test_get_cached_match_lineup_cache_hit_returns_cached_without_db_or_api():
