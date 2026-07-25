@@ -28,6 +28,30 @@ class H2HService:
         self.h2h_provider = h2h_provider or H2HProvider(client)
         self.h2h_sync_service = h2h_sync_service or H2HSyncService(self, cache_service=self.cache_service, h2h_provider=self.h2h_provider)
 
+    def _prepare_h2h_payload(self, payload: Optional[list[dict]]) -> Optional[list[dict]]:
+        if not isinstance(payload, list):
+            return payload
+
+        def sort_key(item: object) -> float:
+            if not isinstance(item, dict):
+                return float("-inf")
+
+            fixture = item.get("fixture")
+            if not isinstance(fixture, dict):
+                return float("-inf")
+
+            timestamp = fixture.get("timestamp")
+            if isinstance(timestamp, (int, float)):
+                return float(timestamp)
+            if isinstance(timestamp, str):
+                try:
+                    return float(timestamp)
+                except ValueError:
+                    return float("-inf")
+            return float("-inf")
+
+        return sorted(payload, key=sort_key, reverse=True)
+
     async def get_match_h2h(self, match_id: int) -> Optional[dict]:
         return await self.h2h_provider.get_match_h2h(match_id)
 
@@ -38,7 +62,7 @@ class H2HService:
 
         cached = await self.cache_service.get_json(cache_key)
         if cached is not None:
-            return cached
+            return self._prepare_h2h_payload(cached)
 
         match = (await db.execute(select(Match).where(Match.match_id == match_id))).scalar_one_or_none()
         if not match:
@@ -46,13 +70,15 @@ class H2HService:
 
         db_record = (await db.execute(select(MatchH2H).where(MatchH2H.h2h_key == h2h_key))).scalar_one_or_none()
         if db_record:
-            await self.cache_service.set_json(cache_key, db_record.data, 86400)
-            return db_record.data
+            prepared_payload = self._prepare_h2h_payload(db_record.data)
+            await self.cache_service.set_json(cache_key, prepared_payload, 86400)
+            return prepared_payload
 
         refresh_result = await self.h2h_sync_service.refresh_h2h(db, h2h_key)
         if not refresh_result or "data" not in refresh_result:
             return None
 
         h2h_data = refresh_result["data"]
-        await self.cache_service.set_json(cache_key, h2h_data, 86400)
-        return h2h_data
+        prepared_payload = self._prepare_h2h_payload(h2h_data)
+        await self.cache_service.set_json(cache_key, prepared_payload, 86400)
+        return prepared_payload
