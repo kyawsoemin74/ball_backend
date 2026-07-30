@@ -9,5 +9,6 @@ from app.models.match_event import MatchEvent
 from app.models.match_statistics import MatchStatistics
 from app.models.lineup_refresh_state import LineupRefreshState
 from app.models.ad import Ad
+from app.models.ad_config import AdConfig
 from app.models.news import News
 from app.models.user import User
