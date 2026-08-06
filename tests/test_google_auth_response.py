@@ -10,6 +10,7 @@ def test_google_auth_response_includes_user_profile():
         username="google-user",
         email="google-user@example.com",
         role="user",
+        avatar_url=None,
     )
 
     response = auth_service.create_google_auth_response(user)

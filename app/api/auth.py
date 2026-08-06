@@ -69,10 +69,11 @@ async def google_login(
             settings.GOOGLE_CLIENT_ID,
         )
 
-        # 2. Get email, google_id, and name from payload
+        # 2. Get email, google_id, name, and picture from payload
         email = idinfo['email']
         google_id = idinfo['sub']
         name = idinfo.get('name', email.split('@')[0])  # name မရှိရင် email ရှေ့ပိုင်းကို ယူမယ်
+        picture = idinfo.get('picture')
 
     except ValueError:
         # Invalid token
@@ -85,6 +86,7 @@ async def google_login(
         db=db,
         email=email,
         google_id=google_id,
-        username=name
+        username=name,
+        picture=picture,
     )
     return auth_service.create_google_auth_response(user)

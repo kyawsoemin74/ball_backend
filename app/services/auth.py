@@ -7,7 +7,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import or_, select
 
 from app.core.config import settings
-from app.models.user import User
+from app.models.user import AvatarSource, User
 from app.schemas.token import GoogleAuthResponse, GoogleAuthUser
 from app.schemas.user import UserCreate
 from app.services.token import TokenService
@@ -74,7 +74,33 @@ class AuthService:
             )
         return user
 
-    async def authenticate_google_user(self, db: AsyncSession, email: str, google_id: str, username: str) -> User:
+    def _sync_google_profile(self, user: User, username: str | None, picture: str | None) -> None:
+        if user.avatar_source == AvatarSource.UPLOAD:
+            if username:
+                user.display_name = username
+            return
+
+        if user.avatar_source == AvatarSource.GOOGLE:
+            if username:
+                user.display_name = username
+            if picture:
+                user.avatar_url = picture
+            return
+
+        if username:
+            user.display_name = username
+        if picture:
+            user.avatar_url = picture
+        user.avatar_source = AvatarSource.GOOGLE
+
+    async def authenticate_google_user(
+        self,
+        db: AsyncSession,
+        email: str,
+        google_id: str,
+        username: str,
+        picture: str | None = None,
+    ) -> User:
         # 1. Check if user exists by google_id
         result = await db.execute(select(User).where(User.google_id == google_id))
         user = result.scalar_one_or_none()
@@ -110,10 +136,15 @@ class AuthService:
                     google_id=google_id,
                     hashed_password=self.hash_password(random_password),
                     role="user",
-                    is_active=True
+                    is_active=True,
+                    display_name=username,
+                    avatar_url=picture,
+                    avatar_source=AvatarSource.GOOGLE if picture else AvatarSource.DEFAULT,
                 )
                 db.add(user)
 
+        if user:
+            self._sync_google_profile(user, username, picture)
             try:
                 await db.commit()
                 await db.refresh(user)
@@ -145,7 +176,7 @@ class AuthService:
                 id=str(user.id),
                 email=user.email,
                 name=user.username,
-                avatarUrl=None,
+                avatarUrl=user.avatar_url,
                 provider="google",
             ),
         )
