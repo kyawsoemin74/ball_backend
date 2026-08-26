@@ -51,10 +51,17 @@ class RecordingCacheService:
 
 
 class TrackingTeamRepository:
-    def __init__(self, existing_ids=None):
+    def __init__(self, existing_ids=None, provider_ids=None):
         self.existing_ids = set(existing_ids or [])
+        self.provider_ids = dict(provider_ids or {})
         self.upsert_many_rows = []
         self.upsert_one_rows = []
+
+    async def find_by_provider_identity(self, db, provider, provider_id):
+        team_id = self.provider_ids.get((provider, str(provider_id)))
+        if team_id is None:
+            return None
+        return SimpleNamespace(team_id=team_id)
 
     async def get_many_by_ids(self, db, team_ids):
         return [SimpleNamespace(team_id=tid) for tid in team_ids if tid in self.existing_ids]
@@ -103,6 +110,39 @@ class TrackingTeamContextRepository:
                 "current_season": current_season,
             }
         )
+
+
+class DuplicateProviderRepository(TrackingTeamRepository):
+    async def find_by_provider_identity(self, db, provider, provider_id):
+        raise ValueError(f"Multiple teams found for provider={provider} provider_id={provider_id}")
+
+class CoachAssignmentRepository:
+    def __init__(self, provider_id="10", coach_id=None):
+        self.team = SimpleNamespace(team_id=101, provider_id=provider_id, coach_id=coach_id)
+        self.updated = []
+
+    async def get_by_id(self, db, team_id):
+        return self.team if team_id == self.team.team_id else None
+
+    async def update_current_coach(self, db, team_id, coach_id):
+        self.updated.append((team_id, coach_id))
+        self.team.coach_id = coach_id
+
+
+class CoachAssignmentProvider:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def get_team_coach(self, team_id):
+        return self.payload
+
+
+class CoachAssignmentSyncService:
+    def __init__(self, payload):
+        self.provider = CoachAssignmentProvider(payload)
+
+    async def sync_team_coach(self, db, payload):
+        return {"coach_id": payload["id"]}
 
 
 def test_team_repository_upsert_many_uses_real_primary_key_constraint():
@@ -158,8 +198,8 @@ def test_team_repository_upsert_one_uses_real_primary_key_constraint():
     assert "DO UPDATE SET" in sql_text
 
 
-def test_ensure_teams_exist_upserts_only_missing_rows_and_deduplicates_payload():
-    repository = TrackingTeamRepository(existing_ids={10})
+def test_ensure_teams_exist_resolves_existing_masters_and_reports_missing():
+    repository = TrackingTeamRepository(provider_ids={("api-football", "10"): 101})
     cache_service = RecordingCacheService()
     service = TeamSyncService(cache_service=cache_service, team_repository=repository)
     db = ExecuteTrackingDB()
@@ -168,22 +208,53 @@ def test_ensure_teams_exist_upserts_only_missing_rows_and_deduplicates_payload()
         service.ensure_teams_exist(
             db,
             [
-                {"team_id": 10, "name": "Existing"},
-                {"id": 11, "name": "New"},
-                {"team_id": 11, "name": "Duplicate New"},
-                {"team_id": None, "name": "Invalid"},
+                {"provider_id": 10, "name": "Existing"},
+                {"provider_id": 11, "name": "Missing"},
+                {"provider_id": None, "name": "Invalid"},
             ],
         )
     )
 
-    assert result == {"created": 1, "existing": 1, "total": 2}
-    assert len(repository.upsert_many_rows) == 1
-    assert repository.upsert_many_rows[0]["team_id"] == 11
-    assert db.flush_calls == 1
+    assert result == {"created": 0, "existing": 1, "unresolved": 2, "total": 3}
+    assert repository.upsert_many_rows == []
+    assert db.flush_calls == 0
 
 
-def test_upsert_team_routes_persistence_to_repository_and_invalidates_cache(monkeypatch):
-    repository = TrackingTeamRepository()
+def test_provider_identity_resolves_to_different_local_team_id():
+    repository = TrackingTeamRepository(provider_ids={("api-football", "99"): 7001})
+    service = TeamSyncService(cache_service=RecordingCacheService(), team_repository=repository)
+
+    result = asyncio.run(
+        service.resolve_provider_teams(
+            ExecuteTrackingDB(),
+            [{"provider_id": 99, "name": "Provider Team"}],
+        )
+    )
+
+    assert result == {"resolved": {99: 7001}, "unresolved": [], "total": 1}
+
+
+def test_duplicate_provider_identity_fails_closed():
+    service = TeamSyncService(
+        cache_service=RecordingCacheService(),
+        team_repository=DuplicateProviderRepository(),
+    )
+
+    try:
+        asyncio.run(
+            service.resolve_provider_teams(
+                ExecuteTrackingDB(),
+                [{"provider_id": 99, "name": "Ambiguous Team"}],
+            )
+        )
+    except ValueError as exc:
+        assert "Multiple teams found" in str(exc)
+    else:
+        raise AssertionError("Duplicate provider identity did not fail closed")
+
+
+def test_upsert_team_resolves_existing_master_without_persistence(monkeypatch):
+    repository = TrackingTeamRepository(provider_ids={("api-football", "99"): 1001})
     cache_service = RecordingCacheService()
     service = TeamSyncService(cache_service=cache_service, team_repository=repository)
     db = ExecuteTrackingDB()
@@ -204,28 +275,19 @@ def test_upsert_team_routes_persistence_to_repository_and_invalidates_cache(monk
         )
     )
 
-    assert team.team_id == 99
-    assert repository.upsert_one_rows == [
-        {
-            "team_id": 99,
-            "name": "Ninety Nine",
-            "country": "MM",
-            "logo": None,
-            "stadium": "Home Ground",
-            "founded": 1999,
-        }
-    ]
-    assert db.flush_calls == 1
-    assert deleted_keys == [make_cache_key("team", 99)]
+    assert team.team_id == 1001
+    assert repository.upsert_one_rows == []
+    assert db.flush_calls == 0
+    assert deleted_keys == []
 
 
-def test_upsert_team_queues_cache_invalidation_until_commit_when_sync_session_exists():
+def test_upsert_team_does_not_create_missing_master_or_invalidate_cache():
     repository = TrackingTeamRepository()
     cache_service = RecordingCacheService()
     service = TeamSyncService(cache_service=cache_service, team_repository=repository)
     db = SyncSessionBackedDB()
 
-    asyncio.run(
+    result = asyncio.run(
         service.upsert_team(
             db,
             {
@@ -235,8 +297,9 @@ def test_upsert_team_queues_cache_invalidation_until_commit_when_sync_session_ex
         )
     )
 
-    queued_keys = db.sync_session.info.get(_TEAM_POST_COMMIT_CACHE_KEYS)
-    assert queued_keys == {make_cache_key("team", 77)}
+    assert result is None
+    assert repository.upsert_one_rows == []
+    assert db.sync_session.info.get(_TEAM_POST_COMMIT_CACHE_KEYS) is None
     assert cache_service.deleted == []
 
 
@@ -321,3 +384,33 @@ def test_team_cache_invalidation_cleared_on_rollback(monkeypatch):
     _run_team_post_commit_cache_invalidation(session)
 
     assert deleted_keys == []
+
+
+def test_sync_team_coach_assigns_local_coach_id_and_invalidates_team_cache():
+    repository = CoachAssignmentRepository()
+    service = TeamSyncService(
+        cache_service=RecordingCacheService(),
+        team_repository=repository,
+        coach_sync_service=CoachAssignmentSyncService({"id": 129, "name": "Coach A"}),
+    )
+    db = SyncSessionBackedDB()
+
+    result = asyncio.run(service.sync_team_coach(db, 101))
+
+    assert result == {"success": True, "team_id": 101, "coach_id": 129, "updated": True}
+    assert repository.updated == [(101, 129)]
+    assert make_cache_key("team", 101) in db.sync_session.info[_TEAM_POST_COMMIT_CACHE_KEYS]
+
+
+def test_sync_team_coach_does_not_clear_assignment_when_provider_is_unavailable():
+    repository = CoachAssignmentRepository(coach_id=129)
+    service = TeamSyncService(
+        cache_service=RecordingCacheService(),
+        team_repository=repository,
+        coach_sync_service=CoachAssignmentSyncService(None),
+    )
+
+    result = asyncio.run(service.sync_team_coach(ExecuteTrackingDB(), 101))
+
+    assert result["reason"] == "coach_unavailable"
+    assert repository.updated == []

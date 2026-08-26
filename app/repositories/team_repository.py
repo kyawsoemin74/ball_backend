@@ -6,6 +6,27 @@ from app.models.team import Team
 
 
 class TeamRepository:
+    async def find_by_provider_identity(
+        self,
+        db: AsyncSession,
+        provider: str,
+        provider_id: str | int | None,
+    ) -> Team | None:
+        if not provider or provider_id is None:
+            return None
+
+        provider_id_key = str(provider_id)
+        result = await db.execute(
+            select(Team).where(
+                Team.provider == provider,
+                Team.provider_id == provider_id_key,
+            )
+        )
+        rows = list(result.scalars().all())
+        if len(rows) > 1:
+            raise ValueError(f"Multiple teams found for provider={provider} provider_id={provider_id_key}")
+        return rows[0] if rows else None
+
     async def get_by_id(self, db: AsyncSession, team_id: int) -> Team | None:
         result = await db.execute(select(Team).where(Team.team_id == team_id))
         return result.scalar_one_or_none()
@@ -51,6 +72,14 @@ class TeamRepository:
 
         stmt = update(Team).where(Team.team_id == team_id).values(**values)
         await db.execute(stmt)
+
+    async def update_current_coach(self, db: AsyncSession, team_id: int, coach_id: int | None) -> None:
+        await db.execute(
+            update(Team)
+            .where(Team.team_id == team_id)
+            .values(coach_id=coach_id)
+        )
+        await db.flush()
 
     async def upsert_one(self, db: AsyncSession, row: dict) -> Team:
         insert_stmt = pg_insert(Team).values(row)

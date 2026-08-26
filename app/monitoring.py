@@ -44,6 +44,22 @@ CACHE_MISSES = Counter(
     "fover_cache_misses_total",
     "Total number of cache misses",
 )
+CACHE_GET_FAILURES = Counter(
+    "fover_cache_get_failures_total",
+    "Total number of cache GET failures",
+)
+CACHE_SET_FAILURES = Counter(
+    "fover_cache_set_failures_total",
+    "Total number of cache SET failures",
+)
+CACHE_DELETE_FAILURES = Counter(
+    "fover_cache_delete_failures_total",
+    "Total number of cache DELETE failures",
+)
+CACHE_DESERIALIZE_FAILURES = Counter(
+    "fover_cache_deserialize_failures_total",
+    "Total number of malformed cached payload deserialization failures",
+)
 
 # External dependency health metrics
 REDIS_UP = Gauge(

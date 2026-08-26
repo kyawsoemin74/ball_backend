@@ -10,9 +10,11 @@ class MatchEventBase(BaseModel):
     team_name: Optional[str] = None
     
     player_id: Optional[int] = None
+    provider_player_id: Optional[str] = None
     player_name: Optional[str] = None
     
     assist_id: Optional[int] = None
+    provider_assist_id: Optional[str] = None
     assist_name: Optional[str] = None
     
     type: str

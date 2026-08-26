@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     LINEUP_REFRESH_COOLDOWN_SECONDS: int = 900
     ACTIVE_MATCH_TTL_SECONDS: int = 300
     GOOGLE_CLIENT_ID: str
+    SCHEDULER_ENABLED: bool = True
 
     # Upload settings for admin and public image storage
     NEWS_UPLOAD_DIR: str = "/var/www/fover/uploads/news"

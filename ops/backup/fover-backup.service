@@ -1,0 +1,9 @@
+[Unit]
+Description=Fover encrypted PostgreSQL backup
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/fover-backend
+EnvironmentFile=/etc/fover/backup.env
+ExecStart=/usr/bin/python3 /opt/fover-backend/ops/backup/backup.py run

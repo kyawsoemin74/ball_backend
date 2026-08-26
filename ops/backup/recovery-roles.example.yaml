@@ -1,0 +1,29 @@
+environment: disposable-recovery
+roles:
+  - name: fover_user
+    purpose: application access and restored object owner in disposable PostgreSQL
+    login: true
+    owner: true
+    required_privileges: CONNECT; USAGE and CREATE on public; table DML; sequence USAGE, SELECT, UPDATE
+    recovery_method: create with a non-production secret-manager credential and apply reviewed disposable grants
+  - name: fover_migration
+    purpose: Alembic migrations during an approved recovery test
+    login: true
+    owner: false
+    required_privileges: CONNECT; reviewed schema/table/sequence DDL
+    recovery_method: short-lived disposable credential; never copy production passwords
+  - name: fover_backup
+    purpose: pg_dump execution
+    login: true
+    owner: false
+    required_privileges: CONNECT and reviewed read access required by pg_dump
+    recovery_method: short-lived disposable credential
+  - name: fover_scheduler
+    purpose: reserved scheduler identity
+    login: false
+    owner: false
+    required_privileges: none while scheduler is disabled
+    recovery_method: omit during this validation
+notes:
+  superuser: application and migration roles must not be superusers; elevated migration access requires explicit disposable approval
+  owner_handling: restore with pg_restore --no-owner, then assign restored objects to fover_user

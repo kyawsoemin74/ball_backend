@@ -13,5 +13,4 @@ class AdRepository:
         db.add(config)
         await db.flush()
         await db.refresh(config)
-        await db.commit()
         return config

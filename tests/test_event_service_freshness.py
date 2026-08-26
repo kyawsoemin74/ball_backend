@@ -325,3 +325,129 @@ def test_updated_at_refresh_behavior_on_live_refresh():
     assert saved.team_name == "DB Team"
     # updated_at should remain unchanged
     assert saved.updated_at == (now_utc - timedelta(minutes=20))
+
+
+class FakePlayerRepository:
+    def __init__(self, players):
+        self.players = players
+
+    async def get_by_provider_id(self, db, provider_id, provider="api-football"):
+        for player in self.players:
+            if str(player.provider_id) == str(provider_id) and player.provider == provider:
+                return player
+        return None
+
+    async def get_many_by_provider_ids(self, db, provider_ids, provider="api-football"):
+        selected = []
+        for pid in provider_ids:
+            matches = [p for p in self.players if str(p.provider_id) == str(pid) and p.provider == provider]
+            selected.extend(matches)
+        return selected
+
+
+class FakeEventRepository:
+    def __init__(self):
+        self.calls = []
+
+    async def replace_match_events(self, db, match_id, events):
+        self.calls.append({"match_id": match_id, "events": events})
+        db.saved_events = list(events)
+
+
+def test_event_sync_resolves_exact_player_master_for_authoritative_provider_id():
+    from app.services.event_sync_service import EventSyncService
+
+    player = SimpleNamespace(provider="api-football", provider_id="77", player_id=88)
+    repo = FakeEventRepository()
+    service = EventSyncService(
+        event_provider=FakeEventProvider({"response": [{
+            "time": {"elapsed": 10, "extra": 0},
+            "team": {"id": 1, "name": "Home"},
+            "player": {"id": 77, "name": "Player One"},
+            "assist": {"id": 88, "name": "Player Two"},
+            "type": "Goal",
+            "detail": "Normal Goal",
+            "comments": None,
+        }]}),
+        event_repository=repo,
+        player_repository=FakePlayerRepository([player]),
+    )
+
+    result = asyncio.run(service.refresh_match_events(FakeSession(), 123))
+
+    assert result["success"] is True
+    assert result["api_events"][0]["resolved_player_id"] == 88
+    assert repo.calls[0]["events"][0]["resolved_player_id"] == 88
+
+
+def test_event_sync_keeps_unresolved_when_provider_player_id_missing():
+    from app.services.event_sync_service import EventSyncService
+
+    service = EventSyncService(
+        event_provider=FakeEventProvider({"response": [{
+            "time": {"elapsed": 10, "extra": 0},
+            "team": {"id": 1, "name": "Home"},
+            "player": {"name": "Player One"},
+            "assist": {"id": 88, "name": "Player Two"},
+            "type": "Goal",
+            "detail": "Normal Goal",
+            "comments": None,
+        }]}),
+        event_repository=FakeEventRepository(),
+        player_repository=FakePlayerRepository([]),
+    )
+
+    result = asyncio.run(service.refresh_match_events(FakeSession(), 124))
+
+    assert result["success"] is True
+    assert result["api_events"][0]["resolved_player_id"] is None
+
+
+def test_event_sync_keeps_unresolved_when_player_master_missing():
+    from app.services.event_sync_service import EventSyncService
+
+    service = EventSyncService(
+        event_provider=FakeEventProvider({"response": [{
+            "time": {"elapsed": 10, "extra": 0},
+            "team": {"id": 1, "name": "Home"},
+            "player": {"id": 77, "name": "Player One"},
+            "assist": {"id": 88, "name": "Player Two"},
+            "type": "Goal",
+            "detail": "Normal Goal",
+            "comments": None,
+        }]}),
+        event_repository=FakeEventRepository(),
+        player_repository=FakePlayerRepository([]),
+    )
+
+    result = asyncio.run(service.refresh_match_events(FakeSession(), 125))
+
+    assert result["success"] is True
+    assert result["api_events"][0]["resolved_player_id"] is None
+
+
+def test_event_sync_is_idempotent_for_repeated_exact_player_resolution():
+    from app.services.event_sync_service import EventSyncService
+
+    player = SimpleNamespace(provider="api-football", provider_id="77", player_id=88)
+    event_provider = FakeEventProvider({"response": [{
+        "time": {"elapsed": 9, "extra": 0},
+        "team": {"id": 1, "name": "Home"},
+        "player": {"id": 77, "name": "Player One"},
+        "assist": {"id": 88, "name": "Player Two"},
+        "type": "Goal",
+        "detail": "Normal Goal",
+        "comments": None,
+    }]})
+    service = EventSyncService(
+        event_provider=event_provider,
+        event_repository=FakeEventRepository(),
+        player_repository=FakePlayerRepository([player]),
+    )
+
+    first = asyncio.run(service.refresh_match_events(FakeSession(), 126))
+    second = asyncio.run(service.refresh_match_events(FakeSession(), 126))
+
+    assert first["api_events"][0]["resolved_player_id"] == 88
+    assert second["api_events"][0]["resolved_player_id"] == 88
+    assert first["api_events"][0]["resolved_player_id"] == second["api_events"][0]["resolved_player_id"]

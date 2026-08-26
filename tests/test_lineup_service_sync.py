@@ -56,8 +56,12 @@ class FakeTeamService:
     def __init__(self, squad_payloads: Dict[int, Dict[str, Any]]):
         self.squad_payloads = squad_payloads
         self.calls: List[int] = []
+        self.team_repository = self
 
-    async def get_cached_team_squad(self, team_id: int) -> Dict[str, Any] | None:
+    async def find_by_provider_identity(self, db, provider, provider_id):
+        return SimpleNamespace(team_id=provider_id)
+
+    async def get_cached_team_squad(self, db, team_id: int) -> Dict[str, Any] | None:
         self.calls.append(team_id)
         return self.squad_payloads.get(team_id)
 
@@ -174,7 +178,7 @@ def test_sync_lineup_creates_new_row():
     assert result == {"success": True, "match_id": 123, "created": True, "updated": False}
     assert 123 in db.records
     assert len(db.records[123]) == 1
-    assert cache.delete_calls == [make_lineup_cache_key(123)]
+    assert cache.delete_calls == []
 
 
 def test_sync_lineup_updates_existing_row():
@@ -189,7 +193,7 @@ def test_sync_lineup_updates_existing_row():
     assert result == {"success": True, "match_id": 123, "created": False, "updated": True}
     assert len(db.records[123]) == 1
     assert db.records[123][0].data[0]["coach"]["name"] == "New Coach"
-    assert cache.delete_calls == [make_lineup_cache_key(123)]
+    assert cache.delete_calls == []
 
 
 def test_sync_lineup_returns_not_available_on_empty_response():
@@ -231,7 +235,7 @@ def test_sync_lineup_duplicate_protection_on_repeated_syncs():
     assert second == {"success": True, "match_id": 123, "created": False, "updated": True}
     assert len(db.records[123]) == 1
     assert db.records[123][0].data[0]["coach"]["name"] == "Coach B"
-    assert cache.delete_calls == [make_lineup_cache_key(123), make_lineup_cache_key(123)]
+    assert cache.delete_calls == []
 
 
 def test_sync_lineup_status_gate_ns_allows_sync():

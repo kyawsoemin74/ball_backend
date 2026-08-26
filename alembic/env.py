@@ -25,6 +25,10 @@ from app.models import (
     Match, 
     League, 
     Team, 
+    Country,
+    Player,
+    Venue,
+    Coach,
     Standings, 
     Odds, 
     Ad, 
@@ -34,6 +38,7 @@ from app.models import (
     MatchLineup,
     MatchStatistics,
     LineupRefreshState,
+    MatchLineupFinalization,
 )
 
 from sqlalchemy import engine_from_config, pool, MetaData
@@ -56,10 +61,10 @@ if database_url:
         database_url = database_url.replace("postgres://", "postgresql://", 1)
     
     config.set_main_option("sqlalchemy.url", database_url)
-    print(f"✓ Using DATABASE_URL from environment")
+    print("Using DATABASE_URL from environment")
 else:
     database_url = config.get_main_option("sqlalchemy.url")
-    print(f"✓ Using sqlalchemy.url from alembic.ini")
+    print("Using sqlalchemy.url from alembic.ini")
 
 # Set target metadata for autogeneration
 target_metadata = Base.metadata

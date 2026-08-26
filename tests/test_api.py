@@ -251,8 +251,16 @@ def test_team_statistics_normalization_uses_total_and_average_fields():
 
     async def run_test():
         service = TeamService(client=FakeClient(), cache_service=FakeCacheService())
-        result = await service.get_cached_team_statistics(team_id=25, league_id=39, season=2026)
+        class Repository:
+            async def get_by_id(self, db, team_id):
+                return _team_row()
+
+        service.team_repository = Repository()
+        result = await service.get_cached_team_statistics(object(), team_id=25, league_id=39, season=2026)
         captured["result"] = result
+
+    def _team_row():
+        return type("TeamRow", (), {"provider_id": 250})()
 
     asyncio.run(run_test())
 
@@ -289,12 +297,17 @@ def test_team_statistics_service_uses_league_parameter(monkeypatch):
 
     async def run_test():
         service = TeamService(client=FakeClient(), cache_service=FakeCacheService())
-        await service.get_cached_team_statistics(team_id=25, league_id=39, season=2026)
+        class Repository:
+            async def get_by_id(self, db, team_id):
+                return type("TeamRow", (), {"provider_id": 250})()
+
+        service.team_repository = Repository()
+        await service.get_cached_team_statistics(object(), team_id=25, league_id=39, season=2026)
 
     asyncio.run(run_test())
 
     assert captured["path"] == "/teams/statistics"
-    assert captured["params"] == {"team": 25, "league": 39, "season": 2026}
+    assert captured["params"] == {"team": 250, "league": 39, "season": 2026}
     assert captured["cache_key"].endswith("team:25:statistics:39:2026")
 
 
@@ -1279,6 +1292,7 @@ def test_statistics_normalization_uses_team_ids_not_response_order():
         match_id=1492286,
         home_team_id=100,
         away_team_id=200,
+        provider_to_local={100: 100, 200: 200},
     )
 
     assert normalized["statistics"][0]["home_value"] == "62%"

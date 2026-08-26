@@ -92,8 +92,11 @@ class TeamService:
             "result": TeamService._normalize_fixture_result(fixture, team_id),
         }
 
-    async def get_team_details(self, team_id: int) -> Optional[dict]:
-        return await self.team_provider.get_team_details(team_id)
+    async def get_team_details(self, db: AsyncSession, team_id: int) -> Optional[dict]:
+        team = await self.team_repository.get_by_id(db, team_id)
+        if team is None or getattr(team, "provider_id", None) is None:
+            return None
+        return await self.team_provider.get_team_details(int(team.provider_id))
 
     @staticmethod
     def _normalize_db_fixture_item(match: Match, team_id: int) -> dict[str, Any]:
@@ -171,7 +174,7 @@ class TeamService:
         await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_TEAM_FIXTURES)
         return payload
 
-    async def get_cached_team_squad(self, team_id: int) -> Optional[dict]:
+    async def get_cached_team_squad(self, db: AsyncSession, team_id: int) -> Optional[dict]:
         from app.cache import make_cache_key
 
         cache_key = make_cache_key("team", team_id, "squad")
@@ -179,7 +182,12 @@ class TeamService:
         if cached is not None:
             return cached
 
-        result = await self.team_provider.get_team_squad(team_id)
+        team = await self.team_repository.get_by_id(db, team_id)
+        provider_id = getattr(team, "provider_id", None) if team is not None else None
+        if provider_id is None:
+            return None
+
+        result = await self.team_provider.get_team_squad(int(provider_id))
         if not result or "response" not in result or not result["response"]:
             return {"team_id": team_id, "team_name": None, "players": []}
 
@@ -204,7 +212,7 @@ class TeamService:
         await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_TEAM_SQUAD)
         return payload
 
-    async def get_cached_team_statistics(self, team_id: int, league_id: int, season: int) -> Optional[dict]:
+    async def get_cached_team_statistics(self, db: AsyncSession, team_id: int, league_id: int, season: int) -> Optional[dict]:
         from app.cache import make_cache_key
 
         cache_key = make_cache_key("team", team_id, "statistics", league_id, season)
@@ -212,7 +220,12 @@ class TeamService:
         if cached is not None:
             return cached
 
-        result = await self.team_provider.get_team_statistics(team_id, league_id, season)
+        team = await self.team_repository.get_by_id(db, team_id)
+        provider_id = getattr(team, "provider_id", None) if team is not None else None
+        if provider_id is None:
+            return {"error": "Team identity not found"}
+
+        result = await self.team_provider.get_team_statistics(int(provider_id), league_id, season)
         if not result or "response" not in result or not result["response"]:
             return {"error": "Statistics not found"}
 
@@ -245,6 +258,9 @@ class TeamService:
 
     async def ensure_teams_exist(self, db: AsyncSession, teams_data: list[dict]) -> dict:
         return await self._team_sync_ensure_impl(db, teams_data)
+
+    async def resolve_provider_teams(self, db: AsyncSession, teams_data: list[dict]) -> dict:
+        return await self.team_sync_service.resolve_provider_teams(db, teams_data)
 
     async def upsert_team(self, db: AsyncSession, team_data: dict):
         return await self._team_sync_upsert_impl(db, team_data)

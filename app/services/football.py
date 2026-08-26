@@ -169,6 +169,9 @@ class FootballAPIService:
     async def sync_live_matches(self, db: AsyncSession) -> dict:
         return await self.fixture_sync_service.sync_live_matches(db)
 
+    async def finalize_pending_lineups(self, match_ids: list[int] | None = None) -> dict[str, int]:
+        return await self.fixture_sync_service.finalize_pending_lineups(match_ids)
+
     async def get_match_events(self, match_id: int) -> Optional[dict]:
         return await self.event_service.get_match_events(match_id)
 
@@ -178,13 +181,21 @@ class FootballAPIService:
     async def get_cached_match_lineup(self, db: AsyncSession, match_id: int) -> Optional[List[Dict[str, Any]]]:
         return await self.lineup_service.get_cached_match_lineup(db, match_id)
 
-    async def sync_match_lineup(self, db: AsyncSession, match_id: int) -> Dict[str, Any]:
+    async def sync_match_lineup(
+        self,
+        db: AsyncSession,
+        match_id: int,
+        *,
+        allow_terminal_status: bool = False,
+        invalidate_cache: bool = True,
+    ) -> Dict[str, Any]:
         return await self.lineup_sync_service.sync_lineup(
             db=db,
             match_id=match_id,
             validate_lineup=self.lineup_service._is_valid_lineup_response,
             cache_service=self.cache_service,
             cache_key=make_cache_key("lineup", match_id),
+            allow_terminal_status=allow_terminal_status,
         )
 
     async def get_match_h2h(self, match_id: int) -> Optional[dict]:
@@ -201,6 +212,9 @@ class FootballAPIService:
 
     async def get_cached_h2h(self, db: AsyncSession, team1_id: int, team2_id: int, match_id: int) -> Optional[dict]:
         return await self.h2h_service.get_cached_h2h(db, team1_id, team2_id, match_id)
+
+    async def refresh_h2h(self, db: AsyncSession, team1_id: int, team2_id: int) -> dict:
+        return await self.h2h_service.refresh_h2h(db, team1_id, team2_id)
 
     async def get_match_odds(self, match_id: int) -> Optional[dict]:
         return await self.odds_service.get_match_odds(match_id)
@@ -226,17 +240,17 @@ class FootballAPIService:
     async def get_all_leagues(self) -> Optional[dict]:
         return await self.league_service.get_all_leagues()
 
-    async def get_team_details(self, team_id: int) -> Optional[dict]:
-        return await self.team_service.get_team_details(team_id)
+    async def get_team_details(self, db: AsyncSession, team_id: int) -> Optional[dict]:
+        return await self.team_service.get_team_details(db, team_id)
 
     async def get_team_fixtures(self, db: AsyncSession, team_id: int) -> Optional[dict]:
         return await self.team_service.get_cached_team_fixtures(db, team_id)
 
-    async def get_team_squad(self, team_id: int) -> Optional[dict]:
-        return await self.team_service.get_cached_team_squad(team_id)
+    async def get_team_squad(self, db: AsyncSession, team_id: int) -> Optional[dict]:
+        return await self.team_service.get_cached_team_squad(db, team_id)
 
-    async def get_team_statistics(self, team_id: int, league_id: int, season: int) -> Optional[dict]:
-        return await self.team_service.get_cached_team_statistics(team_id, league_id, season)
+    async def get_team_statistics(self, db: AsyncSession, team_id: int, league_id: int, season: int) -> Optional[dict]:
+        return await self.team_service.get_cached_team_statistics(db, team_id, league_id, season)
 
     async def get_league_standings(self, league_id: int, season: int) -> Optional[dict]:
         return await self.standing_service.get_league_standings(league_id, season)

@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.match import Match
 from app.providers.statistics_provider import StatisticsProvider
 from app.repositories.statistics_repository import StatisticsRepository
+from app.repositories.team_repository import TeamRepository
 from app.services.base.football_client import FootballAPIClient
 from app.services.cache_service import CacheService
 from app.services.statistics_sync_service import StatisticsSyncService
@@ -88,12 +89,23 @@ class StatisticsService:
         text = raw_name.strip().lower()
         return cls._STAT_LABEL_OVERRIDES.get(text, raw_name.strip() or "Statistic")
 
+    async def _resolve_provider_team_ids(self, db: AsyncSession, provider_ids: set[int]) -> dict[int, int] | None:
+        repository = TeamRepository()
+        resolved = {}
+        for provider_id in provider_ids:
+            team = await repository.find_by_provider_identity(db, "api-football", provider_id)
+            if team is None:
+                return None
+            resolved[int(provider_id)] = int(team.team_id)
+        return resolved
+
     def _normalize_statistics_payload(
         self,
         raw_payload: dict,
         match_id: int,
         home_team_id: Optional[int] = None,
         away_team_id: Optional[int] = None,
+        provider_to_local: dict[int, int] | None = None,
     ) -> dict:
         response = raw_payload.get("response", []) if isinstance(raw_payload, dict) else []
         if not isinstance(response, list) or not response:
@@ -109,21 +121,21 @@ class StatisticsService:
 
         mapped_entries: dict[str, dict[str, Any]] = {}
 
-        for index, item in enumerate(entries):
+        for item in entries:
             team = item.get("team") if isinstance(item.get("team"), dict) else {}
-            team_id = team.get("id")
+            provider_team_id = team.get("id")
+            team_id = provider_to_local.get(int(provider_team_id)) if provider_to_local and provider_team_id is not None else None
 
             if home_team_id is not None and team_id == home_team_id:
                 mapped_entries["home"] = item
             elif away_team_id is not None and team_id == away_team_id:
                 mapped_entries["away"] = item
-            elif index == 0:
-                mapped_entries.setdefault("home", item)
-            elif index == 1:
-                mapped_entries.setdefault("away", item)
 
-        home_entry = mapped_entries.get("home", entries[0] if isinstance(entries[0], dict) else {})
-        away_entry = mapped_entries.get("away", entries[1] if len(entries) > 1 and isinstance(entries[1], dict) else {})
+        if "home" not in mapped_entries or "away" not in mapped_entries:
+            return {"match_id": match_id, "statistics": []}
+
+        home_entry = mapped_entries["home"]
+        away_entry = mapped_entries["away"]
 
         home_stats = home_entry.get("statistics", []) if isinstance(home_entry.get("statistics"), list) else []
         away_stats = away_entry.get("statistics", []) if isinstance(away_entry.get("statistics"), list) else []
@@ -214,4 +226,13 @@ class StatisticsService:
         home_team_id = getattr(match, "home_team_id", None) if match else None
         away_team_id = getattr(match, "away_team_id", None) if match else None
 
-        return self._normalize_statistics_payload(raw_payload, match_id, home_team_id, away_team_id)
+        provider_ids = {
+            int(item["team"]["id"])
+            for item in raw_payload.get("response", [])
+            if isinstance(item, dict) and isinstance(item.get("team"), dict) and item["team"].get("id") is not None
+        }
+        provider_to_local = await self._resolve_provider_team_ids(db, provider_ids)
+        if provider_to_local is None:
+            return {"error": "Statistics Team identity not found"}
+
+        return self._normalize_statistics_payload(raw_payload, match_id, home_team_id, away_team_id, provider_to_local)

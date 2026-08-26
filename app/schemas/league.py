@@ -18,6 +18,32 @@ class LeagueCreate(LeagueBase):
     pass
 
 
+class LeagueRegistrationRequest(BaseModel):
+    provider: str = Field(..., min_length=1, max_length=50)
+    provider_id: int = Field(..., gt=0)
+
+
+class LeagueRegistrationResponse(BaseModel):
+    league_id: int
+    provider: str
+    provider_id: str
+    name: str
+    country: Optional[str] = None
+    country_code: Optional[str] = None
+    logo: Optional[str] = None
+    type: Optional[str] = None
+    national: Optional[bool] = None
+    country_id: Optional[int] = None
+    season: Optional[str] = None
+    is_featured: bool = False
+    display_order: int = 999
+    registered: bool = True
+    authorized: bool = False
+
+    class Config:
+        from_attributes = True
+
+
 class League(LeagueBase):
     created_at: datetime
     updated_at: Optional[datetime] = None

@@ -15,10 +15,12 @@ class MatchEvent(Base):
     team_id = Column(Integer, nullable=False)
     team_name = Column(String(255), nullable=True)
     
-    player_id = Column(Integer, nullable=True)
+    player_id = Column(Integer, ForeignKey("players.player_id"), nullable=True)
+    provider_player_id = Column(String(100), nullable=True)
     player_name = Column(String(255), nullable=True)
     
-    assist_id = Column(Integer, nullable=True)
+    assist_id = Column(Integer, ForeignKey("players.player_id"), nullable=True)
+    provider_assist_id = Column(String(100), nullable=True)
     assist_name = Column(String(255), nullable=True)
     
     type = Column(String(50), nullable=False)  # e.g., Goal, Card, subst, var

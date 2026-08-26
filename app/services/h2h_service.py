@@ -8,6 +8,7 @@ from app.cache import make_cache_key
 from app.models.match import Match
 from app.models.match_h2h import MatchH2H
 from app.providers.h2h_provider import H2HProvider
+from app.repositories.team_repository import TeamRepository
 from app.services.base.football_client import FootballAPIClient
 from app.services.cache_service import CacheService
 from app.services.h2h_sync_service import H2HSyncService
@@ -68,17 +69,39 @@ class H2HService:
         if not match:
             return None
 
+        team_repository = TeamRepository()
+        home_team = await team_repository.get_by_id(db, team1_id)
+        away_team = await team_repository.get_by_id(db, team2_id)
+        if home_team is None or away_team is None:
+            return None
+        home_provider_id = getattr(home_team, "provider_id", None)
+        away_provider_id = getattr(away_team, "provider_id", None)
+        if home_provider_id is None or away_provider_id is None:
+            return None
+        provider_h2h_key = "-".join(sorted([str(home_provider_id), str(away_provider_id)], key=int))
+
         db_record = (await db.execute(select(MatchH2H).where(MatchH2H.h2h_key == h2h_key))).scalar_one_or_none()
         if db_record:
             prepared_payload = self._prepare_h2h_payload(db_record.data)
-            await self.cache_service.set_json(cache_key, prepared_payload, 86400)
+            # Read path remains read-only for H2H. Cache rebuilds are owned by
+            # the explicit source-sync / post-commit invalidation lifecycle.
             return prepared_payload
 
-        refresh_result = await self.h2h_sync_service.refresh_h2h(db, h2h_key)
-        if not refresh_result or "data" not in refresh_result:
-            return None
+        # Reads never trigger Analytics publication. Call refresh_h2h explicitly from a source owner.
+        return None
 
-        h2h_data = refresh_result["data"]
-        prepared_payload = self._prepare_h2h_payload(h2h_data)
-        await self.cache_service.set_json(cache_key, prepared_payload, 86400)
-        return prepared_payload
+    async def refresh_h2h(self, db: AsyncSession, team1_id: int, team2_id: int) -> dict:
+        teams = await self._resolve_provider_team_ids(db, team1_id, team2_id)
+        provider_h2h_key = "-".join(sorted([str(teams[0]), str(teams[1])], key=int))
+        result = await self.h2h_sync_service.refresh_h2h(db, provider_h2h_key)
+        if "data" in result:
+            result["data"] = self._prepare_h2h_payload(result["data"])
+        return result
+
+    async def _resolve_provider_team_ids(self, db: AsyncSession, team1_id: int, team2_id: int) -> tuple[int, int]:
+        repository = TeamRepository()
+        first = await repository.get_by_id(db, team1_id)
+        second = await repository.get_by_id(db, team2_id)
+        if first is None or second is None or getattr(first, "provider_id", None) is None or getattr(second, "provider_id", None) is None:
+            raise ValueError("unresolved Team identity for H2H refresh")
+        return int(first.provider_id), int(second.provider_id)

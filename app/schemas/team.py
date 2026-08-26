@@ -18,6 +18,7 @@ class TeamCreate(TeamBase):
 
 
 class Team(TeamBase):
+    coach_id: Optional[int] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
 

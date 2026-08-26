@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from types import SimpleNamespace
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
@@ -104,8 +105,9 @@ def test_allowed_league_service_prevents_duplicates():
     service = AllowedLeagueService(repository=FakeAllowedLeagueRepository(existing=[type("AllowedLeague", (), {"league_id": 39})()]))
 
     async def run():
-        with pytest.raises(HTTPException) as exc:
-            await service.add_allowed_league(FakeDB(league=object()), 39)
+        allowed_league, created = await service.add_allowed_league(FakeDB(league=object()), 39)
+        assert allowed_league.league_id == 39
+        assert created is False
 
     asyncio.run(run())
 
@@ -168,7 +170,7 @@ class FakeDeleteFailingDB(FakeFailingDB):
         self.deleted = instance
 
 
-def test_allowed_league_repository_create_commits_and_refreshes():
+def test_allowed_league_repository_create_refreshes_without_commit():
     db = FakeCommitDB()
     repo = AllowedLeagueRepository()
 
@@ -176,7 +178,7 @@ def test_allowed_league_repository_create_commits_and_refreshes():
         result = await repo.create(db, 39)
         assert result.league_id == 39
         assert db.added and db.added[0].league_id == 39
-        assert db.committed is True
+        assert db.committed is False
         assert db.refreshed is True
 
     asyncio.run(run())
@@ -193,7 +195,7 @@ def test_allowed_league_repository_delete_commits():
     asyncio.run(run())
 
     assert db.deleted is item
-    assert db.committed is True
+    assert db.committed is False
 
 
 def test_allowed_league_service_converts_duplicate_integrity_error_to_conflict():
@@ -223,7 +225,7 @@ def test_allowed_league_repository_rolls_back_on_failure():
 
     asyncio.run(run())
 
-    assert db.rolled_back is True
+    assert db.rolled_back is False
     assert db.committed is False
 
 
@@ -301,7 +303,7 @@ class FakeSyncDB:
         self.commit_calls = 0
         self.rollback_calls = 0
 
-    async def execute(self, query):
+    async def execute(self, query, params=None):
         self.execute_calls.append(query)
 
         class FakeScalars:
@@ -314,6 +316,9 @@ class FakeSyncDB:
 
             def scalar_one_or_none(self):
                 return None
+
+            def scalar_one(self):
+                return True
 
             def all(self):
                 return []
@@ -350,6 +355,14 @@ class FakeCacheService:
 class FakeTeamService:
     async def ensure_teams_exist(self, db, teams):
         return None
+
+    async def resolve_provider_teams(self, db, teams):
+        provider_ids = [item.get("provider_id") for item in teams]
+        return {
+            "resolved": {int(provider_id): int(provider_id) for provider_id in provider_ids if provider_id is not None},
+            "unresolved": [item for item in teams if item.get("provider_id") is None],
+            "total": len(teams),
+        }
 
 
 class StaticFixtureClient:
@@ -395,6 +408,15 @@ class AsyncEmptyMatchRepository:
 class InMemoryLeagueRepository:
     def __init__(self, existing=None):
         self.existing = {league.league_id: league for league in (existing or [])}
+
+    async def find_by_provider_identity(self, db, provider, provider_id):
+        matches = [
+            league for league in self.existing.values()
+            if league.provider == provider and league.provider_id == str(provider_id)
+        ]
+        if len(matches) > 1:
+            raise ValueError("Multiple leagues found for provider identity")
+        return matches[0] if matches else None
 
     async def get_many_by_ids(self, db, league_ids, allowed_ids=None):
         return [self.existing[league_id] for league_id in league_ids if league_id in self.existing]
@@ -451,16 +473,52 @@ class CountingAllowedLeagueRepository:
 
 
 class CountingLeagueRepository:
+    def __init__(self, existing=None):
+        self.existing = list(existing or [])
+
+    async def find_by_provider_identity(self, db, provider, provider_id):
+        matches = [league for league in self.existing if league.provider == provider and league.provider_id == str(provider_id)]
+        if len(matches) > 1:
+            raise ValueError("Multiple leagues found for provider identity")
+        return matches[0] if matches else None
+
     async def get_by_id(self, db, league_id):
-        return None
+        return next((league for league in self.existing if league.league_id == league_id), None)
 
     async def get_many_by_ids(self, db, league_ids):
-        return []
+        return [league for league in self.existing if league.league_id in league_ids]
+
+
+def make_master_leagues(*league_ids):
+    return [
+        SimpleNamespace(
+            league_id=league_id,
+            provider="api-football",
+            provider_id=str(league_id),
+            name="Allowed League",
+            country="X",
+            country_code=None,
+            logo=None,
+            season="2026",
+            type=None,
+            national=None,
+            is_featured=False,
+            display_order=999,
+        )
+        for league_id in league_ids
+    ]
 
 
 class CountingDB:
     async def execute(self, query):
-        return type("Result", (), {"scalar_one_or_none": lambda self: None})()
+        class FakeScalars:
+            def all(self):
+                return []
+
+        return type("Result", (), {
+            "scalar_one_or_none": lambda self: None,
+            "scalars": lambda self: FakeScalars(),
+        })()
 
     async def flush(self):
         return None
@@ -476,7 +534,7 @@ def test_league_sync_uses_allowed_ids_only_once_per_run():
     service = LeagueService(client=FakeLeagueSyncClient(), cache_service=FakeCacheService())
     repository = CountingAllowedLeagueRepository([39])
     service.allowed_league_repository = repository
-    service.league_repository = CountingLeagueRepository()
+    service.league_repository = CountingLeagueRepository(make_master_leagues(39))
 
     async def run():
         return await service.sync_all_leagues(CountingDB())
@@ -529,6 +587,7 @@ def test_match_service_daily_sync_prewarm_collapses_duplicate_league_season_pair
         standing_service=standing_service,
     )
     service.allowed_league_repository = FakeAllowedIdsRepository([72])
+    service.league_repository = InMemoryLeagueRepository(existing=make_master_leagues(72))
     service.match_repository = AsyncEmptyMatchRepository()
     db = FakeSyncDB()
 
@@ -560,6 +619,7 @@ def test_match_service_daily_sync_prewarm_all_skipped(caplog):
         standing_service=standing_service,
     )
     service.allowed_league_repository = FakeAllowedIdsRepository([72, 75])
+    service.league_repository = InMemoryLeagueRepository(existing=make_master_leagues(72, 75))
     service.match_repository = AsyncEmptyMatchRepository()
     db = FakeSyncDB()
 
@@ -576,7 +636,7 @@ def test_match_service_daily_sync_prewarm_all_skipped(caplog):
     assert result["standings_prewarm_failed"] == 0
     assert standing_service.standing_repository.calls == [(72, 2026), (75, 2026)]
     assert standing_service.sync_calls == []
-    assert db.commit_calls == 2
+    assert db.commit_calls == 0
     assert "PREWARM_CANDIDATE league_id=72 season=2026" in caplog.text
     assert "PREWARM_CANDIDATE league_id=75 season=2026" in caplog.text
     assert "PREWARM_SKIPPED league_id=72 season=2026" in caplog.text
@@ -596,6 +656,7 @@ def test_match_service_daily_sync_prewarm_all_synced(caplog):
         standing_service=standing_service,
     )
     service.allowed_league_repository = FakeAllowedIdsRepository([72, 75])
+    service.league_repository = InMemoryLeagueRepository(existing=make_master_leagues(72, 75))
     service.match_repository = AsyncEmptyMatchRepository()
     db = FakeSyncDB()
 
@@ -611,7 +672,7 @@ def test_match_service_daily_sync_prewarm_all_synced(caplog):
     assert result["standings_prewarm_skipped"] == 0
     assert result["standings_prewarm_failed"] == 0
     assert standing_service.sync_calls == [(72, 2026), (75, 2026)]
-    assert db.commit_calls == 4
+    assert db.commit_calls == 0
     assert "PREWARM_SYNCED league_id=72 season=2026" in caplog.text
     assert "PREWARM_SYNCED league_id=75 season=2026" in caplog.text
 
@@ -629,6 +690,7 @@ def test_match_service_daily_sync_prewarm_mixed_synced_and_skipped():
         standing_service=standing_service,
     )
     service.allowed_league_repository = FakeAllowedIdsRepository([72, 75])
+    service.league_repository = InMemoryLeagueRepository(existing=make_master_leagues(72, 75))
     service.match_repository = AsyncEmptyMatchRepository()
     db = FakeSyncDB()
 
@@ -644,11 +706,11 @@ def test_match_service_daily_sync_prewarm_mixed_synced_and_skipped():
     assert result["standings_prewarm_failed"] == 0
     assert standing_service.standing_repository.calls == [(72, 2026), (75, 2026)]
     assert standing_service.sync_calls == [(75, 2026)]
-    assert db.commit_calls == 3
+    assert db.commit_calls == 0
     assert db.rollback_calls == 0
 
 
-def test_match_service_sync_inserts_missing_league_once_for_duplicate_fixture_league():
+def test_match_service_sync_does_not_create_missing_league_for_duplicate_fixture_league():
     fixtures = [
         make_fixture(3101, league_id=72, season=2026),
         make_fixture(3102, league_id=72, season=2026),
@@ -671,12 +733,10 @@ def test_match_service_sync_inserts_missing_league_once_for_duplicate_fixture_le
 
     inserted_leagues = [obj for obj in db.added if getattr(obj, "__tablename__", None) == "leagues"]
     assert result["success"] is True
-    assert len(inserted_leagues) == 1
-    assert inserted_leagues[0].league_id == 72
-    assert inserted_leagues[0].name == "Allowed League"
+    assert inserted_leagues == []
 
 
-def test_match_service_sync_updates_existing_league_metadata():
+def test_match_service_sync_does_not_mutate_existing_league_master():
     existing_league = type(
         "LeagueRow",
         (),
@@ -687,6 +747,10 @@ def test_match_service_sync_updates_existing_league_metadata():
             "country_code": "OC",
             "logo": "old-logo",
             "season": "2023",
+            "provider": "api-football",
+            "provider_id": "72",
+            "type": None,
+            "national": None,
         },
     )()
     fixtures = [make_fixture(3201, league_id=72, season=2026)]
@@ -707,13 +771,14 @@ def test_match_service_sync_updates_existing_league_metadata():
     result = asyncio.run(run())
 
     assert result["success"] is True
-    assert existing_league.name == "Allowed League"
-    assert existing_league.country == "X"
+    assert existing_league.name == "Old Name"
+    assert existing_league.country == "Old Country"
+    assert existing_league.country_code == "OC"
     assert existing_league.logo == "old-logo"
-    assert existing_league.season == "2026"
+    assert existing_league.season == "2023"
 
 
-def test_match_service_sync_runs_league_sync_before_team_sync():
+def test_match_service_sync_does_not_run_legacy_league_sync_before_team_sync():
     order_log = []
     fixtures = [make_fixture(3301, league_id=72, season=2026)]
     service = OrderTrackingMatchService(
@@ -724,6 +789,7 @@ def test_match_service_sync_runs_league_sync_before_team_sync():
         order_log=order_log,
     )
     service.allowed_league_repository = FakeAllowedIdsRepository([72])
+    service.league_repository = InMemoryLeagueRepository(existing=make_master_leagues(72))
     service.match_repository = AsyncEmptyMatchRepository()
     service.league_repository = InMemoryLeagueRepository(existing=[])
     db = FakeSyncDB()
@@ -734,7 +800,8 @@ def test_match_service_sync_runs_league_sync_before_team_sync():
     result = asyncio.run(run())
 
     assert result["success"] is True
-    assert order_log.index("league_sync") < order_log.index("team_sync")
+    assert "league_sync" not in order_log
+    assert "team_sync" not in order_log
 
 
 def test_match_service_daily_sync_prewarm_failure_does_not_break_fixture_sync(caplog):
@@ -750,6 +817,7 @@ def test_match_service_daily_sync_prewarm_failure_does_not_break_fixture_sync(ca
         standing_service=standing_service,
     )
     service.allowed_league_repository = FakeAllowedIdsRepository([72, 75])
+    service.league_repository = InMemoryLeagueRepository(existing=make_master_leagues(72, 75))
     service.match_repository = AsyncEmptyMatchRepository()
     db = FakeSyncDB()
 
@@ -766,8 +834,8 @@ def test_match_service_daily_sync_prewarm_failure_does_not_break_fixture_sync(ca
     assert result["standings_prewarm_skipped"] == 0
     assert result["standings_prewarm_failed"] == 1
     assert standing_service.sync_calls == [(72, 2026), (75, 2026)]
-    assert db.commit_calls == 3
-    assert db.rollback_calls == 1
+    assert db.commit_calls == 0
+    assert db.rollback_calls == 0
     assert "PREWARM_FAILED league_id=72 season=2026" in caplog.text
     assert "PREWARM_SYNCED league_id=75 season=2026" in caplog.text
 
@@ -809,6 +877,7 @@ def test_match_service_process_sync_persists_season_on_inserted_match():
 
     service = MatchService(client=FakeMatchClient(), team_service=FakeTeamService(), cache_service=RecordingCacheService())
     service.allowed_league_repository = FakeAllowedIdsRepository([39])
+    service.league_repository = InMemoryLeagueRepository(existing=make_master_leagues(39))
     service.match_repository = FakeMatchRepository()
 
     fixture = {
@@ -852,6 +921,7 @@ def test_match_service_process_sync_persists_season_on_inserted_match():
 
 def test_league_service_sync_all_leagues_skips_unallowed_leagues():
     service = RecordingLeagueService(FakeLeagueSyncClient(), [39])
+    service.league_repository = InMemoryLeagueRepository(existing=make_master_leagues(39))
 
     async def run():
         result = await service.sync_all_leagues(FakeSyncDB())
@@ -860,8 +930,8 @@ def test_league_service_sync_all_leagues_skips_unallowed_leagues():
     result = asyncio.run(run())
 
     assert result["success"] is True
-    assert result["inserted"] == 1
-    assert result["updated"] == 0
+    assert result["inserted"] == 0
+    assert result["updated"] == 1
     assert len(service.upserted) == 1
     assert service.upserted[0]["league"]["id"] == 39
 

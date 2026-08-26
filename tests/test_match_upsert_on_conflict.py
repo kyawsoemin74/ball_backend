@@ -20,6 +20,13 @@ class FakeTeamService:
     async def ensure_teams_exist(self, db, teams):
         return None
 
+    async def resolve_provider_teams(self, db, teams):
+        return {
+            "resolved": {int(item["provider_id"]): int(item["provider_id"]) for item in teams},
+            "unresolved": [],
+            "total": len(teams),
+        }
+
 
 class AsyncEmptyMatchRepository:
     async def get_many_by_ids(self, db, match_ids, allowed_ids=None):
@@ -47,8 +54,19 @@ class FakeStandingServiceForPrewarm:
 
 
 class InMemoryLeagueRepository:
+    def __init__(self, existing_ids=None):
+        self.existing_ids = set(existing_ids or {39})
+
+    async def find_by_provider_identity(self, db, provider, provider_id):
+        if int(provider_id) not in self.existing_ids:
+            return None
+        return type("LeagueRow", (), {"league_id": int(provider_id), "provider": provider, "provider_id": str(provider_id)})()
+
     async def get_many_by_ids(self, db, league_ids, allowed_ids=None):
-        return []
+        return [
+            type("LeagueRow", (), {"league_id": league_id, "provider": "api-football", "provider_id": str(league_id)})()
+            for league_id in league_ids if league_id in self.existing_ids
+        ]
 
 
 class FakeSyncDB:

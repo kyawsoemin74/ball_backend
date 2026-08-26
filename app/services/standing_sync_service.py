@@ -11,6 +11,7 @@ from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.standing_repository import StandingRepository
 from app.services.cache_service import CacheService
 from app.services.team_service import TeamService
+from app.services.analytics_projection_service import AnalyticsProjectionService, log_projection_failure
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +40,14 @@ class StandingSyncService:
         standing_provider: StandingProvider,
         team_service: TeamService,
         cache_service: CacheService,
+        analytics_projection_service: AnalyticsProjectionService | None = None,
     ) -> None:
         self.standing_provider = standing_provider
         self.team_service = team_service
         self.cache_service = cache_service
         self.standing_repository = StandingRepository()
         self.allowed_league_repository = AllowedLeagueRepository()
+        self.analytics_projection_service = analytics_projection_service or AnalyticsProjectionService()
 
     def _flatten_standings_groups(self, api_result: dict) -> list:
         standings_groups = api_result["response"][0].get("league", {}).get("standings", [])
@@ -109,13 +112,19 @@ class StandingSyncService:
 
     async def upsert_standings(self, db: AsyncSession, standings_data: list, league_id: int, season: str):
         prepared_rows = self._prepare_standings_rows(standings_data)
-        team_payload = []
-        for standing in prepared_rows:
-            team = standing.get("team") or {}
-            team_payload.append({"team_id": int(team["id"]), "name": team.get("name"), "logo": team.get("logo"), "country": team.get("country")})
+        provider_team_ids = [
+            int((standing.get("team") or {})["id"])
+            for standing in prepared_rows
+        ]
+        resolution = await self.team_service.resolve_provider_teams(
+            db,
+            [{"provider_id": team_id} for team_id in provider_team_ids],
+        )
+        if resolution["unresolved"]:
+            raise ValueError("Unresolved provider Team identity in standings payload")
 
-        await self.team_service.ensure_teams_exist(db, team_payload)
-        logger.debug("Standings sync ensured %s teams before insert", len(team_payload))
+        resolved_ids = resolution["resolved"]
+        logger.debug("Standings resolved %s provider Team identities", len(resolved_ids))
 
         await db.flush()
 
@@ -127,7 +136,7 @@ class StandingSyncService:
                 {
                     "league_id": league_id,
                     "season": str(season),
-                    "team_id": standing["team"]["id"],
+                    "team_id": resolved_ids[int(standing["team"]["id"])],
                     "position": standing["rank"],
                     "team_name": standing["team"]["name"],
                     "team_logo": standing["team"]["logo"],
@@ -146,6 +155,20 @@ class StandingSyncService:
             )
 
         await self.standing_repository.upsert_for_league_season(db, league_id, season, persistence_rows)
+        if getattr(db, "sync_session", None) is None:
+            projection = None
+        else:
+            try:
+                projection = await self.analytics_projection_service.project_standing(
+                    db, league_id, season, standings_data
+                )
+            except AttributeError as exc:
+                if not self.analytics_projection_service.unavailable_for_fake_db(exc):
+                    raise
+                projection = None
+        if projection is not None and not projection["success"]:
+            raise ValueError(f"Standing analytics projection rejected: {projection.get('reason', 'reconciliation failure')}")
+        self._last_projection = projection
 
         await db.flush()
         if not getattr(self, "_defer_standings_cache_invalidation", False):
@@ -165,6 +188,7 @@ class StandingSyncService:
         logger.debug("ALLOWED LEAGUE: league_id=%s league_name=%s", league_id, "requested league")
         result = await self.standing_provider.get_league_standings(league_id, season)
         if not result or "response" not in result or not result["response"]:
+            log_projection_failure("standing", {"league_id": league_id, "season": str(season)}, "provider_failure")
             return {"success": False, "message": "No standings data found from API"}
 
         try:
@@ -172,7 +196,10 @@ class StandingSyncService:
             updated_count = await self.upsert_standings(db, standings_list, league_id, str(season))
             if updated_count is None:
                 updated_count = len(self._prepare_standings_rows(standings_list))
-            return {"success": True, "league_id": league_id, "season": season, "updated": updated_count}
-        except (KeyError, IndexError, TypeError) as exc:
+            response = {"success": True, "league_id": league_id, "season": season, "updated": updated_count}
+            if getattr(self, "_last_projection", None) is not None:
+                response["analytics"] = self._last_projection
+            return response
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
             logger.error("Error parsing standings response: %s", exc)
             return {"success": False, "message": "Unexpected API response format"}

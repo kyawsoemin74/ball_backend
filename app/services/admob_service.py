@@ -62,10 +62,4 @@ class AdMobService:
 
     async def update_current_config(self, db: AsyncSession, config: AdConfig) -> AdConfig:
         """Persist a provided ad configuration and return the refreshed record."""
-        updated_config = await self.repository.update_current_config(db, config)
-        cache_key = make_cache_key("admob", "config")
-        try:
-            await self.cache_service.delete(cache_key)
-        except Exception:
-            pass
-        return updated_config
+        return await self.repository.update_current_config(db, config)

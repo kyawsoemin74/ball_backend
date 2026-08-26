@@ -20,15 +20,27 @@ class EventRepository:
     async def replace_match_events(self, db: AsyncSession, match_id: int, events: list[dict]) -> None:
         await self.delete_by_match_id(db, match_id)
         for event in events:
+            resolved_player_id = event.get("resolved_player_id")
+
             db.add(MatchEvent(
                 match_id=match_id,
                 time_elapsed=event.get("time", {}).get("elapsed"),
                 time_extra=event.get("time", {}).get("extra"),
                 team_id=event.get("team", {}).get("id"),
                 team_name=event.get("team", {}).get("name"),
-                player_id=event.get("player", {}).get("id"),
+                player_id=resolved_player_id,
+                provider_player_id=event.get("provider_player_id") or (
+                    str(event.get("player", {}).get("id"))
+                    if event.get("player", {}).get("id") is not None
+                    else None
+                ),
                 player_name=event.get("player", {}).get("name"),
-                assist_id=event.get("assist", {}).get("id"),
+                assist_id=event.get("resolved_assist_id"),
+                provider_assist_id=event.get("provider_assist_id") or (
+                    str(event.get("assist", {}).get("id"))
+                    if event.get("assist", {}).get("id") is not None
+                    else None
+                ),
                 assist_name=event.get("assist", {}).get("name"),
                 type=event.get("type"),
                 detail=event.get("detail"),

@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Fover PostgreSQL backup
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 UTC
+Persistent=true
+Unit=fover-backup.service
+
+[Install]
+WantedBy=timers.target

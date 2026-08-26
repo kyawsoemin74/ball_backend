@@ -46,8 +46,12 @@ class Match(Base):
     away_score = Column(Integer, nullable=False, default=0)
     
     # Venue
+    venue_id = Column(Integer, ForeignKey("venues.venue_id", ondelete="RESTRICT"), nullable=True, index=True)
     venue_name = Column(String(255), nullable=True)
     venue_city = Column(String(255), nullable=True)
+
+    # Referee
+    referee_id = Column(Integer, ForeignKey("referees.referee_id", ondelete="RESTRICT"), nullable=True, index=True)
 
     league_obj = relationship("League", foreign_keys=[league_id], back_populates="matches")
     

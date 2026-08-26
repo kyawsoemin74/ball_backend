@@ -16,6 +16,18 @@ logger = logging.getLogger(__name__)
 
 
 class LeagueService:
+    async def find_by_provider_identity(
+        self,
+        db: AsyncSession,
+        provider: str,
+        provider_id: str | int | None,
+    ) -> League | None:
+        return await self._league_repository.find_by_provider_identity(
+            db,
+            provider,
+            provider_id,
+        )
+
     def __init__(
         self,
         client: FootballAPIClient,
@@ -39,8 +51,13 @@ class LeagueService:
         self.league_repository = self._league_repository
         self.allowed_league_repository = self._allowed_league_repository
 
-    async def _upsert_league_bridge(self, db: AsyncSession, league_data: dict, allowed_ids: set[int] | None = None) -> League | None:
-        # Preserve pre-refactor compatibility so overrides on LeagueService.upsert_league still intercept sync writes.
+    async def _upsert_league_bridge(
+        self,
+        db: AsyncSession,
+        league_data: dict,
+        allowed_ids: set[int] | None = None,
+    ) -> League | None:
+        # Preserve compatibility so service overrides still intercept sync writes.
         return await self.upsert_league(db, league_data, allowed_ids=allowed_ids)
 
     @staticmethod
@@ -57,8 +74,12 @@ class LeagueService:
                 existing.country_code = row.get("country_code")
                 existing.logo = row.get("logo")
                 existing.season = row.get("season")
-                existing.is_featured = bool(row.get("is_featured", existing.is_featured))
-                existing.display_order = int(row.get("display_order", existing.display_order))
+                existing.is_featured = bool(
+                    row.get("is_featured", existing.is_featured)
+                )
+                existing.display_order = int(
+                    row.get("display_order", existing.display_order)
+                )
                 if db is not None:
                     await db.flush()
                 return existing
@@ -101,15 +122,28 @@ class LeagueService:
         self._allowed_league_repository = value
         self.league_sync_service.allowed_league_repository = value
 
-    async def get_cached_league_top_scorers(self, league_id: int, season: int) -> Optional[dict]:
+    async def get_cached_league_top_scorers(
+        self,
+        league_id: int,
+        season: int,
+    ) -> Optional[dict]:
         from app.cache import make_cache_key
+        from app.db import async_session
+
+        async with async_session() as db:
+            master = await self._league_repository.get_by_id(db, league_id)
+        if master is None or master.provider_id is None:
+            return {"error": "League not found"}
 
         cache_key = make_cache_key("league", league_id, "topscorers", season)
         cached = await self.cache_service.get_json(cache_key)
         if cached is not None:
             return cached
 
-        result = await self.league_provider.get_league_top_scorers(league_id, season)
+        result = await self.league_provider.get_league_top_scorers(
+            master.provider_id,
+            season,
+        )
         if not result or "response" not in result or not result["response"]:
             return {"error": "Top scorers not found"}
 
@@ -120,18 +154,47 @@ class LeagueService:
                 {
                     "player_id": item.get("player", {}).get("id"),
                     "player_name": item.get("player", {}).get("name"),
-                    "team_id": item.get("statistics", [{}])[0].get("team", {}).get("id") if isinstance(item.get("statistics"), list) and item.get("statistics") else None,
-                    "team_name": item.get("statistics", [{}])[0].get("team", {}).get("name") if isinstance(item.get("statistics"), list) and item.get("statistics") else None,
-                    "goals": item.get("statistics", [{}])[0].get("goals", {}).get("total") if isinstance(item.get("statistics"), list) and item.get("statistics") else None,
-                    "assists": item.get("statistics", [{}])[0].get("goals", {}).get("assists") if isinstance(item.get("statistics"), list) and item.get("statistics") else None,
-                    "appearances": item.get("statistics", [{}])[0].get("games", {}).get("appearences") if isinstance(item.get("statistics"), list) and item.get("statistics") else None,
+                    "team_id": item.get("statistics", [{}])[0]
+                    .get("team", {})
+                    .get("id")
+                    if isinstance(item.get("statistics"), list)
+                    and item.get("statistics")
+                    else None,
+                    "team_name": item.get("statistics", [{}])[0]
+                    .get("team", {})
+                    .get("name")
+                    if isinstance(item.get("statistics"), list)
+                    and item.get("statistics")
+                    else None,
+                    "goals": item.get("statistics", [{}])[0]
+                    .get("goals", {})
+                    .get("total")
+                    if isinstance(item.get("statistics"), list)
+                    and item.get("statistics")
+                    else None,
+                    "assists": item.get("statistics", [{}])[0]
+                    .get("goals", {})
+                    .get("assists")
+                    if isinstance(item.get("statistics"), list)
+                    and item.get("statistics")
+                    else None,
+                    "appearances": item.get("statistics", [{}])[0]
+                    .get("games", {})
+                    .get("appearences")
+                    if isinstance(item.get("statistics"), list)
+                    and item.get("statistics")
+                    else None,
                     "photo": item.get("player", {}).get("photo"),
                 }
                 for item in result["response"]
                 if isinstance(item, dict)
             ],
         }
-        await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_LEAGUE_TOP_SCORERS)
+        await self.cache_service.set_json(
+            cache_key,
+            payload,
+            settings.REDIS_TTL_LEAGUE_TOP_SCORERS,
+        )
         return payload
 
     async def get_league_details(self, league_id: int) -> Optional[dict]:
@@ -140,8 +203,84 @@ class LeagueService:
     async def get_all_leagues(self) -> Optional[dict]:
         return await self.league_provider.get_all_leagues()
 
-    async def upsert_league(self, db: AsyncSession, league_data: dict, allowed_ids: set[int] | None = None) -> League | None:
-        return await self._league_sync_upsert_impl(db, league_data, allowed_ids=allowed_ids)
+    async def register_league(
+        self,
+        db: AsyncSession,
+        provider: str,
+        provider_id: int,
+    ) -> tuple[League, bool]:
+        if provider != "api-football":
+            raise ValueError("Unsupported league provider")
+        if (
+            not isinstance(provider_id, int)
+            or isinstance(provider_id, bool)
+            or provider_id <= 0
+        ):
+            raise ValueError("provider_id must be a positive integer")
+
+        provider_id_text = str(provider_id)
+        existing = await self._league_repository.find_by_provider_identity(
+            db,
+            provider,
+            provider_id_text,
+        )
+        if existing is not None:
+            return existing, False
+
+        local_collision = await self._league_repository.get_by_id(db, provider_id)
+        if local_collision is not None:
+            raise ValueError("Canonical local league_id is already occupied")
+
+        result = await self.league_provider.get_league_details(provider_id)
+        if result is None:
+            raise ConnectionError("League provider is unavailable")
+        if "response" not in result or not result["response"]:
+            raise LookupError("Provider league not found")
+
+        payload = result["response"][0]
+        league_payload = payload.get("league") or payload
+        if str(league_payload.get("id")) != provider_id_text:
+            raise ValueError("Provider response identity does not match provider_id")
+        name = league_payload.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Provider league metadata is missing a name")
+
+        country_payload = payload.get("country")
+        if isinstance(country_payload, dict):
+            country = country_payload.get("name")
+            country_code = country_payload.get("code")
+        else:
+            country = country_payload or league_payload.get("country")
+            country_code = league_payload.get("country_code")
+
+        row = {
+            "league_id": provider_id,
+            "provider": provider,
+            "provider_id": provider_id_text,
+            "name": name.strip(),
+            "country": country,
+            "country_code": country_code,
+            "logo": league_payload.get("logo"),
+            "type": league_payload.get("type"),
+            "national": league_payload.get("national"),
+            "country_id": None,
+            "season": None,
+            "is_featured": False,
+            "display_order": 999,
+        }
+        return await self._league_repository.create_registered(db, row), True
+
+    async def upsert_league(
+        self,
+        db: AsyncSession,
+        league_data: dict,
+        allowed_ids: set[int] | None = None,
+    ) -> League | None:
+        return await self._league_sync_upsert_impl(
+            db,
+            league_data,
+            allowed_ids=allowed_ids,
+        )
 
     async def sync_all_leagues(self, db: AsyncSession) -> dict:
         return await self.league_sync_service.sync_all_leagues(db)

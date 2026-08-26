@@ -1,0 +1,121 @@
+{
+  "audit_timestamp": "2026-08-27T00:00:00Z",
+  "current_db_backup_id": "fover_20260826T181114Z",
+  "current_asset_backup_id": "assets_20260826T184058Z",
+  "test_summary": {
+    "focused_passed": 8,
+    "focused_failed": 0,
+    "focused_skipped": 0,
+    "full_passed": 395,
+    "full_failed": 0,
+    "full_skipped": 0,
+    "warnings": 18,
+    "compilation": "PASS"
+  },
+  "artifact_integrity": {
+    "database": "PASS",
+    "asset": "PASS",
+    "legacy_database_unchanged": "PASS",
+    "legacy_asset_unchanged": "PASS",
+    "metadata_secret_values": "ABSENT"
+  },
+  "key_management_status": {
+    "provider": "Windows Credential Manager",
+    "database_target": "fover/staging/database-backup-encryption",
+    "asset_target": "fover/staging/asset-backup-encryption",
+    "targets_available": "PASS",
+    "keys_distinct": "PASS",
+    "fresh_process_rehydration": "PASS",
+    "source_code_or_git_secret_values": "ABSENT"
+  },
+  "recovery_status": {
+    "database_decrypt": "PASS",
+    "database_restore": "PASS",
+    "pg_restore_list": "PASS",
+    "schema_and_migration": "PASS",
+    "roles_and_grants": "PASS",
+    "asset_decrypt": "PASS",
+    "asset_restore": "PASS",
+    "asset_tree_checksum": "PASS",
+    "redis": "PASS",
+    "backend": "PASS",
+    "readonly_api": "PASS",
+    "failure_drills": "PASS",
+    "synthetic_asset": "YES",
+    "asset_db_reference": "UNPROVEN",
+    "db_asset_pairing": "UNPROVEN"
+  },
+  "RPO": {
+    "classification": "OBSERVED_DISPOSABLE_ONLY",
+    "production_rpo": "UNPROVEN",
+    "status": "WARNING"
+  },
+  "RTO": {
+    "database_restore_seconds": 0.324527,
+    "database_validation_seconds": 0.052265,
+    "application_ready_seconds": 5.0,
+    "total_disposable_e2e_seconds": "NOT_MEASURED_IN_COMPLETE_TIMING_RECORD",
+    "production_rto": "UNPROVEN",
+    "status": "WARNING"
+  },
+  "storage_status": {
+    "path": "D:/FoverBackup",
+    "exists": "PASS",
+    "writable": "PASS",
+    "same_physical_volume": "YES",
+    "offsite": "NO",
+    "gcs": "DEFERRED",
+    "status": "WARNING"
+  },
+  "monitoring_status": {
+    "database_failure_alert": "IMPLEMENTED",
+    "database_checksum_failure": "IMPLEMENTED",
+    "stale_database_backup_check": "IMPLEMENTED",
+    "asset_failure_alert": "MISSING",
+    "storage_exhaustion_alert": "MISSING",
+    "status": "FOLLOW_UP_REQUIRED"
+  },
+  "automation_status": {
+    "database_schedule_definition": "DOCUMENTED",
+    "production_execution": "UNPROVEN",
+    "asset_schedule": "UNPROVEN",
+    "production_backup_automation": "UNPROVEN",
+    "status": "FOLLOW_UP_REQUIRED"
+  },
+  "security_status": {
+    "secret_store": "PASS",
+    "key_separation": "PASS",
+    "least_privilege_recovery_role": "PASS",
+    "metadata_secret_hygiene": "PASS",
+    "production_touch": "NONE",
+    "status": "PASS"
+  },
+  "runbook_status": {
+    "backup_and_restore": "DOCUMENTED",
+    "dedicated_asset_key": "DOCUMENTED",
+    "role_recovery": "DOCUMENTED",
+    "redis_rebuild": "DOCUMENTED",
+    "cleanup": "DOCUMENTED",
+    "known_unproven_items": "DOCUMENTED",
+    "status": "PASS_WITH_FOLLOW_UPS"
+  },
+  "warnings": [
+    {"item": "ASSET_DB_REFERENCE=UNPROVEN", "classification": "ACCEPTABLE_FOR_FREEZE", "reason": "Current representative asset is synthetic."},
+    {"item": "DB_ASSET_PAIRING=UNPROVEN", "classification": "ACCEPTABLE_FOR_FREEZE", "reason": "No populated asset reference exists in the restored staging data."},
+    {"item": "OFFSITE_RECOVERY=DEFERRED", "classification": "REQUIRES_FOLLOW_UP", "reason": "D:/FoverBackup is on the same physical volume and GCS is deferred."},
+    {"item": "PRODUCTION_BACKUP_AUTOMATION=UNPROVEN", "classification": "REQUIRES_FOLLOW_UP", "reason": "Disposable validation does not prove production scheduling."},
+    {"item": "TOTAL_DISPOSABLE_RTO=NOT_MEASURED", "classification": "REQUIRES_FOLLOW_UP", "reason": "Existing evidence has component timings but no complete total timing record."},
+    {"item": "ASSET_OPERATIONAL_ALERTING=MISSING", "classification": "REQUIRES_FOLLOW_UP", "reason": "Asset tooling has deterministic failures but no dedicated alert path."}
+  ],
+  "blockers": [],
+  "unproven": [
+    "production RPO",
+    "production RTO",
+    "production backup automation",
+    "offsite disaster recovery",
+    "database-to-asset reference in synthetic staging data",
+    "complete total disposable RTO"
+  ],
+  "freeze_decision": "PASS_WITH_WARNINGS",
+  "production_readiness": "READY_WITH_WARNINGS"
+}

@@ -14,6 +14,7 @@ from app.schemas.standing import StandingResponse
 from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.league_repository import LeagueRepository
 from app.services.football import football_service
+from app.services.resource_lock import run_with_resource_lock
 from app.services.league_grouping_service import LeagueGroupingService
 
 router = APIRouter()
@@ -109,8 +110,21 @@ async def sync_all_leagues(
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
     """Admin-only sync for all leagues from API-Football."""
-    result = await football_service.sync_all_leagues(db=db)
-    await db.commit()
+    async def sync() -> Dict[str, Any]:
+        try:
+            result = await football_service.sync_all_leagues(db=db)
+            if not result.get("success"):
+                await db.rollback()
+                return result
+            await db.commit()
+            return result
+        except Exception:
+            await db.rollback()
+            raise
+
+    locked, result = await run_with_resource_lock(db, "league", "all", sync)
+    if not locked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="League sync already in progress")
     return result
 
 
@@ -121,6 +135,24 @@ async def sync_league_standings(
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
     """Explicitly sync standings for a league and season from API-Sports"""
-    result = await football_service.sync_standings(db=db, league_id=league_id, season=season)
-    await db.commit()
+    async def sync() -> Dict[str, Any]:
+        try:
+            result = await football_service.sync_standings(db=db, league_id=league_id, season=season)
+            if not result.get("success"):
+                await db.rollback()
+                return result
+            await db.commit()
+            return result
+        except Exception:
+            await db.rollback()
+            raise
+
+    locked, result = await run_with_resource_lock(
+        db,
+        "standing",
+        f"{league_id}:{season}",
+        sync,
+    )
+    if not locked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Standings sync already in progress")
     return result

@@ -1,0 +1,18 @@
+{
+  "recovery_id": "recovery_20260825T192335Z",
+  "backup_id": "fover_20260825T181908Z",
+  "result": "PASS",
+  "t0": "2026-08-25T19:23:35.1005590+00:00",
+  "t1_backup_validated": "2026-08-25T19:23:35.1014210+00:00",
+  "t2_decryption_complete": "2026-08-25T19:23:35.1045090+00:00",
+  "t3_restore_complete": "2026-08-25T19:23:35.7639620+00:00",
+  "t4_database_validation_complete": "2026-08-25T19:23:35.8157370+00:00",
+  "t5_redis_available": "2026-08-25T19:25:13.1925767Z",
+  "t6_backend_startup_complete": "2026-08-25T19:25:13.1971459Z",
+  "t7_first_health_check_success": "2026-08-25T19:25:13.1971875Z",
+  "t8_representative_api_validation_complete": "2026-08-25T19:25:13.1998418Z",
+  "restore_time_seconds": 0.663403,
+  "database_ready_time_seconds": 0.715178,
+  "application_ready_time_seconds": 98.0965869,
+  "total_recovery_time_seconds": 98.0992828
+}

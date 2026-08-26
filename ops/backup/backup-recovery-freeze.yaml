@@ -1,0 +1,127 @@
+freeze_id: DATABASE-HEALTH-3.8-FREEZE-20260827
+timestamp: 2026-08-27T00:00:00Z
+freeze_status: PASS_WITH_WARNINGS
+production_readiness: READY_WITH_WARNINGS
+readiness_score: 8/10
+storage:
+  path: D:/FoverBackup
+  separate_path: true
+  same_physical_volume: true
+  offsite: false
+  gcs: DEFERRED
+baseline_artifacts:
+  database:
+    backup_id: fover_20260826T181114Z
+    artifact: D:/FoverBackup/fover_20260826T181114Z.dump.enc
+    metadata: D:/FoverBackup/fover_20260826T181114Z.json
+    environment: staging
+    database: fover_staging
+    postgresql: 17.9
+    checksum: c0599187457bdca1410c32dfd4ceee23d67ed91577552ae4998c821f063b1cbf
+    status: SUCCESS
+  asset:
+    backup_id: assets_20260826T184058Z
+    artifact: D:/FoverBackup/assets_20260826T184058Z.tar.gz.enc
+    metadata: D:/FoverBackup/assets_20260826T184058Z.json
+    environment: disposable-staging
+    source: D:/fover_backend/.recovery-staging-assets
+    checksum: 121d87ba4110b0c9b9032c2bd11f6622e66bbcd3f249a28b7625f34f83d41ad3
+    status: SUCCESS
+key_references:
+  database:
+    provider: Windows Credential Manager
+    target: fover/staging/database-backup-encryption
+  asset:
+    provider: Windows Credential Manager
+    target: fover/staging/asset-backup-encryption
+  separation: PASS
+  fresh_process_rehydration: PASS
+recovery_capabilities:
+  database_restore: PASS
+  asset_restore: PASS
+  roles_and_grants: PASS
+  configuration: PASS
+  redis: PASS
+  backend: PASS
+  readonly_api: PASS
+  failure_handling: PASS
+  representative_asset: PASS
+  synthetic_asset: true
+  asset_db_reference: UNPROVEN
+rpo:
+  production: UNPROVEN
+  disposable_observation: documented in recovery evidence
+rto:
+  observed_reference_seconds: 98.099
+  final_total_e2e: NOT_MEASURED
+  production: UNPROVEN
+warnings:
+  - id: W-001
+    item: ASSET_DB_REFERENCE=UNPROVEN
+    classification: ACCEPTED_FOR_FREEZE
+    owner: application-data-validation
+    follow_up: populated staging asset reference validation
+  - id: W-002
+    item: DB_ASSET_PAIRING=UNPROVEN
+    classification: ACCEPTED_FOR_FREEZE
+    owner: recovery-validation
+    follow_up: real staging asset/database snapshot pairing
+  - id: W-003
+    item: OFFSITE_RECOVERY=DEFERRED
+    classification: FOLLOW_UP_REQUIRED
+    owner: infrastructure
+    follow_up: approved separate failure-domain storage
+  - id: W-004
+    item: PRODUCTION_BACKUP_AUTOMATION=UNPROVEN
+    classification: FOLLOW_UP_REQUIRED
+    owner: operations
+    follow_up: separately approved production schedule validation
+  - id: W-005
+    item: TOTAL_DISPOSABLE_RTO=NOT_MEASURED
+    classification: FOLLOW_UP_REQUIRED
+    owner: recovery-validation
+    follow_up: complete timed disposable drill
+  - id: W-006
+    item: ASSET_OPERATIONAL_ALERTING=MISSING
+    classification: FOLLOW_UP_REQUIRED
+    owner: operations
+    follow_up: asset failure and storage exhaustion alerting
+change_control:
+  frozen_components:
+    - backup tool
+    - asset backup tool
+    - encryption and key storage
+    - metadata contracts
+    - restore process
+    - recovery roles
+    - recovery configuration
+  required_before_change:
+    - affected tests
+    - new audit
+    - critical recovery validation where applicable
+    - updated freeze baseline
+  production_changes: explicit approval required
+  schema_changes: reopen freeze gate
+  gcs_changes: reopen appropriate gate
+test_baseline:
+  focused_recovery_tests: 8 passed, 0 failed, 0 skipped
+  full_suite: 395 passed, 0 failed, 0 skipped
+  warnings: 18
+  compilation: PASS
+legacy_policy:
+  database: LEGACY_ENCRYPTED_ARTIFACT / KEY_UNAVAILABLE / RECOVERY_UNPROVEN
+  asset: LEGACY_ENCRYPTED_ARTIFACT / KEY_UNAVAILABLE / RECOVERY_UNPROVEN
+operational_statement:
+  local_separate_storage_recovery: VERIFIED
+  offsite_disaster_recovery: NOT_PROVEN
+  production_backup_automation: UNPROVEN
+  backup_recovery: FROZEN_WITH_WARNINGS
+production_safety:
+  database_reads: 0
+  database_writes: 0
+  redis: 0
+  assets: 0
+  scheduler: 0
+  migration: 0
+  gcs: 0
+  production_secrets_modified: 0

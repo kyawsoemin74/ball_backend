@@ -14,19 +14,33 @@ class LeagueGroupingService:
                 0 if getattr(league, "is_featured", False) else 1,
                 int(getattr(league, "display_order", 999) or 999),
                 str(getattr(league, "name", "")).lower(),
+                int(getattr(league, "league_id", 0) or 0),
             ),
         )
 
-        featured = [self._serialize(league) for league in ordered if getattr(league, "is_featured", False)]
-        remaining = [league for league in ordered if not getattr(league, "is_featured", False)]
+        featured = [
+            self._serialize(league)
+            for league in ordered
+            if getattr(league, "is_featured", False)
+        ]
+        remaining = [
+            league for league in ordered if not getattr(league, "is_featured", False)
+        ]
 
         groups = []
         if featured:
-            groups.append({"type": "featured", "title": "Featured Leagues", "leagues": featured})
+            groups.append(
+                {
+                    "type": "featured",
+                    "title": "Featured Leagues",
+                    "leagues": featured,
+                }
+            )
 
         by_country = defaultdict(list)
         for league in remaining:
-            by_country[str(getattr(league, "country") or "Unknown").strip() or "Unknown"].append(league)
+            country = str(getattr(league, "country") or "Unknown").strip() or "Unknown"
+            by_country[country].append(league)
 
         for country in sorted(by_country.keys(), key=lambda value: value.lower()):
             country_leagues = sorted(
@@ -34,9 +48,16 @@ class LeagueGroupingService:
                 key=lambda league: (
                     int(getattr(league, "display_order", 999) or 999),
                     str(getattr(league, "name", "")).lower(),
+                    int(getattr(league, "league_id", 0) or 0),
                 ),
             )
-            groups.append({"type": "country", "country": country, "leagues": [self._serialize(league) for league in country_leagues]})
+            groups.append(
+                {
+                    "type": "country",
+                    "country": country,
+                    "leagues": [self._serialize(league) for league in country_leagues],
+                }
+            )
 
         return groups
 

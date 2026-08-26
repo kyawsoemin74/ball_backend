@@ -35,21 +35,11 @@ class AllowedLeagueRepository:
 
     async def create(self, db: AsyncSession, league_id: int) -> AllowedLeague:
         allowed_league = AllowedLeague(league_id=league_id)
-        try:
-            db.add(allowed_league)
-            await db.flush()
-            await db.refresh(allowed_league)
-            await db.commit()
-            return allowed_league
-        except Exception:
-            await db.rollback()
-            raise
+        db.add(allowed_league)
+        await db.flush()
+        await db.refresh(allowed_league)
+        return allowed_league
 
     async def delete(self, db: AsyncSession, allowed_league: AllowedLeague) -> None:
-        try:
-            await db.delete(allowed_league)
-            await db.flush()
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            raise
+        await db.delete(allowed_league)
+        await db.flush()

@@ -34,8 +34,19 @@ class FakeAllowedLeagueRepository:
 
 
 class FakeLeagueRepository:
+    def __init__(self, existing_ids=None):
+        self.existing_ids = set(existing_ids or {39})
+
+    async def find_by_provider_identity(self, db, provider, provider_id):
+        if int(provider_id) not in self.existing_ids:
+            return None
+        return type("LeagueRow", (), {"league_id": int(provider_id), "provider": provider, "provider_id": str(provider_id)})()
+
     async def get_many_by_ids(self, db, league_ids, allowed_ids=None):
-        return []
+        return [
+            type("LeagueRow", (), {"league_id": league_id, "provider": "api-football", "provider_id": str(league_id)})()
+            for league_id in league_ids if league_id in self.existing_ids
+        ]
 
 
 class FakeMatchRepository:
@@ -51,6 +62,18 @@ class FakeTeamService:
         if any(team.get("team_id") in self.fail_for_team_ids for team in teams):
             raise RuntimeError("team ensure failed")
         return None
+
+    async def resolve_provider_teams(self, db, teams):
+        unresolved = [
+            item for item in teams
+            if item.get("provider_id") in self.fail_for_team_ids
+        ]
+        resolved = {
+            int(item["provider_id"]): int(item["provider_id"])
+            for item in teams
+            if item.get("provider_id") is not None and item not in unresolved
+        }
+        return {"resolved": resolved, "unresolved": unresolved, "total": len(teams)}
 
 
 class FakeStandingService:
@@ -85,6 +108,8 @@ class FakeDB:
         self.rollback_calls = 0
         self.flush_calls = 0
         self.execute_calls = 0
+        self.savepoint_commits = 0
+        self.savepoint_rollbacks = 0
 
     async def execute(self, stmt):
         self.execute_calls += 1
@@ -104,9 +129,22 @@ class FakeDB:
     def add(self, obj):
         return None
 
-    @asynccontextmanager
-    async def begin_nested(self):
-        yield self
+    def begin_nested(self):
+        return FakeSavepoint(self)
+
+
+class FakeSavepoint:
+    def __init__(self, db):
+        self.db = db
+
+    async def start(self):
+        return self
+
+    async def commit(self):
+        self.db.savepoint_commits += 1
+
+    async def rollback(self):
+        self.db.savepoint_rollbacks += 1
 
 
 class StaticFixtureClient:
@@ -173,6 +211,8 @@ def test_sync_daily_fixtures_continues_after_flush_failure():
     assert result["inserted"] == 1
     assert result["failed"] == 1
     assert result["total"] == 2
+    assert db.savepoint_rollbacks == 1
+    assert db.savepoint_commits == 1
 
 
 def test_sync_daily_fixtures_registers_live_matches_for_scheduler(monkeypatch):

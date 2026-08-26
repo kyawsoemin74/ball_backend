@@ -14,8 +14,10 @@ from app.models.odds import Odds
 from app.monitoring import SCHEDULER_JOB_ERRORS, SCHEDULER_JOB_RUNS
 from app.repositories.lineup_refresh_state_repository import LineupRefreshStateRepository
 from app.services.active_match_service import active_match_service
+from app.services.analytics_projection_service import log_projection_transaction
 from app.services.cache_service import CacheService
 from app.services.football import football_service, FINISHED_STATUSES, LIVE_STATUSES
+from app.services.resource_lock import run_with_resource_lock
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +171,7 @@ class LiveUpdateScheduler:
             async with async_session() as db:
                 lock_acquired = await self._acquire_live_match_sync_lock(db)
                 if not lock_acquired:
-                    logger.debug("LIVE_SYNC_SKIPPED reason=lock_not_acquired")
+                    logger.info("LIVE_SYNC_SKIPPED reason=lock_not_acquired")
                     return
 
                 try:
@@ -177,9 +179,32 @@ class LiveUpdateScheduler:
                         logger.debug("No near-start or active non-FT matches found; skipping live sync")
                         return
 
-                    result = await football_service.sync_live_matches(db)
-                    if result.get("success"):
-                        await self.cache_service.delete(make_cache_key("live_matches"))
+                    async def sync_live() -> dict:
+                        try:
+                            result = await football_service.sync_live_matches(db)
+                            if result.get("success"):
+                                await db.commit()
+                                try:
+                                    await self.cache_service.delete(make_cache_key("live_matches"))
+                                except Exception:
+                                    logger.exception("LIVE_SYNC_CACHE_INVALIDATION_FAILED")
+                                if "final_lineup_candidates" in result:
+                                    await football_service.finalize_pending_lineups(
+                                        result.get("final_lineup_candidates", [])
+                                    )
+                            else:
+                                await db.rollback()
+                            return result
+                        except Exception:
+                            await db.rollback()
+                            raise
+
+                    resource_locked, result = await run_with_resource_lock(
+                        db, "fixture_query", "global", sync_live
+                    )
+                    if not resource_locked:
+                        logger.info("LIVE_SYNC_SKIPPED reason=resource_lock_not_acquired")
+                        return
                     SCHEDULER_JOB_RUNS.labels(job="sync_live_matches").inc()
                     if result.get("success"):
                         if result.get("updated", 0) > 0:
@@ -201,12 +226,37 @@ class LiveUpdateScheduler:
             async with async_session() as db:
                 lock_acquired = await self._acquire_daily_fixture_sync_lock(db)
                 if not lock_acquired:
-                    logger.debug("DAILY_FIXTURE_SYNC_SKIPPED reason=lock_not_acquired")
+                    logger.info("DAILY_FIXTURE_SYNC_SKIPPED reason=lock_not_acquired")
                     return
 
                 try:
                     logger.info(f"Starting automatic daily sync for {today}")
-                    result = await football_service.sync_daily_fixtures(db, today)
+                    async def sync_daily() -> dict:
+                        try:
+                            result = await football_service.sync_daily_fixtures(db, today)
+                            if result.get("success"):
+                                await db.commit()
+                                try:
+                                    await self.cache_service.delete(make_cache_key("live_matches"))
+                                except Exception:
+                                    logger.exception("DAILY_FIXTURE_SYNC_CACHE_INVALIDATION_FAILED")
+                                if "final_lineup_candidates" in result:
+                                    await football_service.finalize_pending_lineups(
+                                        result.get("final_lineup_candidates", [])
+                                    )
+                            else:
+                                await db.rollback()
+                            return result
+                        except Exception:
+                            await db.rollback()
+                            raise
+
+                    resource_locked, result = await run_with_resource_lock(
+                        db, "fixture_query", "global", sync_daily
+                    )
+                    if not resource_locked:
+                        logger.info("DAILY_FIXTURE_SYNC_SKIPPED reason=resource_lock_not_acquired")
+                        return
                     SCHEDULER_JOB_RUNS.labels(job="sync_daily_fixtures").inc()
                     logger.info(f"Automatic daily sync completed: {result}")
                 finally:
@@ -226,17 +276,52 @@ class LiveUpdateScheduler:
             async with async_session() as db:
                 lock_acquired = await self._acquire_repair_daily_matches_lock(db)
                 if not lock_acquired:
-                    logger.debug("REPAIR_DAILY_MATCHES_SKIPPED reason=lock_not_acquired")
+                    logger.info("REPAIR_DAILY_MATCHES_SKIPPED reason=lock_not_acquired")
                     return
 
                 try:
                     logger.info(f"Starting daily repair sync for {yesterday_str} and {today_str}")
 
-                    result_yesterday = await football_service.sync_daily_fixtures(db, yesterday_str)
-                    logger.info(f"Daily repair sync for {yesterday_str} completed: {result_yesterday}")
+                    async def sync_repair() -> tuple[dict, dict]:
+                        try:
+                            result_yesterday = await football_service.sync_daily_fixtures(db, yesterday_str)
+                            if result_yesterday.get("success"):
+                                await db.commit()
+                                try:
+                                    await self.cache_service.delete(make_cache_key("live_matches"))
+                                except Exception:
+                                    logger.exception("REPAIR_CACHE_INVALIDATION_FAILED target=%s", yesterday_str)
+                                if "final_lineup_candidates" in result_yesterday:
+                                    await football_service.finalize_pending_lineups(
+                                        result_yesterday.get("final_lineup_candidates", [])
+                                    )
+                            else:
+                                await db.rollback()
+                            logger.info(f"Daily repair sync for {yesterday_str} completed: {result_yesterday}")
 
-                    result_today = await football_service.sync_daily_fixtures(db, today_str)
-                    logger.info(f"Daily repair sync for {today_str} completed: {result_today}")
+                            result_today = await football_service.sync_daily_fixtures(db, today_str)
+                            if result_today.get("success"):
+                                await db.commit()
+                                try:
+                                    await self.cache_service.delete(make_cache_key("live_matches"))
+                                except Exception:
+                                    logger.exception("REPAIR_CACHE_INVALIDATION_FAILED target=%s", today_str)
+                                if "final_lineup_candidates" in result_today:
+                                    await football_service.finalize_pending_lineups(
+                                        result_today.get("final_lineup_candidates", [])
+                                    )
+                            logger.info(f"Daily repair sync for {today_str} completed: {result_today}")
+                            return result_yesterday, result_today
+                        except Exception:
+                            await db.rollback()
+                            raise
+
+                    resource_locked, _ = await run_with_resource_lock(
+                        db, "fixture_query", "global", sync_repair
+                    )
+                    if not resource_locked:
+                        logger.info("REPAIR_DAILY_MATCHES_SKIPPED reason=resource_lock_not_acquired")
+                        return
 
                     SCHEDULER_JOB_RUNS.labels(job="repair_daily_matches").inc()
                 finally:
@@ -258,6 +343,8 @@ class LiveUpdateScheduler:
             now_utc = datetime.now(timezone.utc)
             window_end = now_utc + timedelta(hours=ODDS_REFRESH_WINDOW_HOURS)
             async with async_session() as db:
+                refreshed_cache_keys = []
+                committed_projections = []
                 result = await db.execute(
                     select(Match.match_id, Match.status, Match.match_time)
                     .where(Match.status.in_(ODDS_REFRESH_ELIGIBLE_STATUSES))
@@ -283,7 +370,7 @@ class LiveUpdateScheduler:
 
                     metrics["eligible_matches"] += 1
                     metrics["processed_matches"] += 1
-                    try:
+                    async def refresh_fixture() -> dict:
                         latest_result = await db.execute(
                             select(Odds.last_updated)
                             .where(Odds.fixture_id == match_id)
@@ -292,44 +379,56 @@ class LiveUpdateScheduler:
                         latest_row = latest_result.first()
                         latest_update = latest_row[0] if latest_row else None
 
-                        if latest_update is None:
-                            cache_key = make_cache_key("match", match_id, "odds")
-                            refresh_result = await football_service.odds_sync_service.refresh_odds(
-                                db,
-                                match_id,
-                                cache_key,
-                                1800,
-                            )
-                            if "error" not in refresh_result:
-                                metrics["refreshed_matches"] += 1
-                                logger.debug("ODDS_REFRESH_SYNCED match_id=%s reason=no_snapshot", match_id)
-                            else:
-                                metrics["failed_matches"] += 1
-                                logger.error("ODDS_REFRESH_FAILED match_id=%s reason=%s", match_id, refresh_result.get("reason"))
-                            continue
-
-                        if latest_update and (now_utc - latest_update) < ODDS_REFRESH_MAX_AGE:
-                            metrics["skipped_matches"] += 1
-                            continue
-
                         cache_key = make_cache_key("match", match_id, "odds")
+                        if latest_update and (now_utc - latest_update) < ODDS_REFRESH_MAX_AGE:
+                            return {"state": "skipped"}
+
                         refresh_result = await football_service.odds_sync_service.refresh_odds(
                             db,
                             match_id,
                             cache_key,
                             1800,
                         )
-                        if "error" not in refresh_result:
-                            metrics["refreshed_matches"] += 1
-                            logger.debug("ODDS_REFRESH_SYNCED match_id=%s reason=stale_snapshot", match_id)
-                        else:
+                        if "error" in refresh_result:
+                            await db.rollback()
+                            return {"state": "failed", "reason": refresh_result.get("reason")}
+
+                        await db.commit()
+                        try:
+                            await self.cache_service.delete(cache_key)
+                        except Exception:
+                            logger.exception("ODDS_REFRESH_CACHE_INVALIDATION_FAILED match_id=%s", match_id)
+                        return {"state": "refreshed", "result": refresh_result}
+
+                    try:
+                        resource_locked, refresh_result = await run_with_resource_lock(
+                            db,
+                            "odds",
+                            match_id,
+                            refresh_fixture,
+                        )
+                        if not resource_locked:
+                            metrics["skipped_matches"] += 1
+                            logger.info("ODDS_REFRESH_SKIPPED match_id=%s reason=resource_lock_not_acquired", match_id)
+                            continue
+
+                        state = refresh_result.get("state")
+                        if state == "skipped":
+                            metrics["skipped_matches"] += 1
+                        elif state == "failed":
                             metrics["failed_matches"] += 1
                             logger.error("ODDS_REFRESH_FAILED match_id=%s reason=%s", match_id, refresh_result.get("reason"))
+                        else:
+                            committed_projection = refresh_result["result"].get("analytics")
+                            if committed_projection:
+                                log_projection_transaction(committed_projection, "committed")
+                            metrics["refreshed_matches"] += 1
+                            logger.debug("ODDS_REFRESH_SYNCED match_id=%s", match_id)
                     except Exception:
+                        await db.rollback()
                         metrics["failed_matches"] += 1
                         logger.exception("ODDS_REFRESH_FAILED match_id=%s", match_id)
 
-                await db.commit()
                 SCHEDULER_JOB_RUNS.labels(job="refresh_odds").inc()
                 logger.info("ODDS_REFRESH_COMPLETE metrics=%s", metrics)
                 return metrics
@@ -359,7 +458,7 @@ class LiveUpdateScheduler:
             async with async_session() as db:
                 lock_acquired = await self._acquire_standings_refresh_lock(db)
                 if not lock_acquired:
-                    logger.debug("STANDINGS_REFRESH_SKIPPED reason=lock_not_acquired")
+                    logger.info("STANDINGS_REFRESH_SKIPPED reason=lock_not_acquired")
                     return metrics
 
                 try:
@@ -368,14 +467,35 @@ class LiveUpdateScheduler:
 
                     for league_id, season in pairs:
                         metrics["processed_pairs"] += 1
-                        logger.debug("STANDINGS_REFRESH_LEAGUE league_id=%s season=%s", league_id, season)
+                        logger.info("STANDINGS_REFRESH_LEAGUE league_id=%s season=%s", league_id, season)
 
                         try:
-                            result = await football_service.sync_standings(db, league_id, season)
+                            async def sync_standing() -> dict:
+                                result = await football_service.sync_standings(db, league_id, season)
+                                if result.get("success"):
+                                    await db.commit()
+                                    if result.get("analytics"):
+                                        log_projection_transaction(result["analytics"], "committed")
+                                return result
+
+                            resource_locked, result = await run_with_resource_lock(
+                                db,
+                                "standing",
+                                f"{league_id}:{season}",
+                                sync_standing,
+                            )
+                            if not resource_locked:
+                                metrics["failed_pairs"] += 1
+                                logger.info(
+                                    "STANDINGS_REFRESH_SKIPPED league_id=%s season=%s reason=resource_lock_not_acquired",
+                                    league_id,
+                                    season,
+                                )
+                                continue
+
                             if result.get("success"):
-                                await db.commit()
                                 metrics["success_pairs"] += 1
-                                logger.debug(
+                                logger.info(
                                     "STANDINGS_REFRESH_SUCCESS league_id=%s season=%s updated=%s",
                                     league_id,
                                     season,
@@ -499,29 +619,50 @@ class LiveUpdateScheduler:
                         )
                         if on_cooldown:
                             metrics["skipped_matches"] += 1
-                            logger.debug("LINEUP_REFRESH_SKIPPED match_id=%s reason=cooldown", match_id)
+                            logger.info("LINEUP_REFRESH_SKIPPED match_id=%s reason=cooldown", match_id)
                             continue
 
-                        result = await football_service.sync_match_lineup(db, match_id)
-                        if result.get("success"):
-                            await self.lineup_refresh_state_repository.touch(db, match_id, refreshed_at=now_utc)
-                            await db.commit()
-                            if not result.get("skipped"):
-                                try:
-                                    await self.cache_service.delete(make_cache_key("lineup", match_id))
-                                except Exception:
-                                    logger.exception("LINEUP_REFRESH_CACHE_INVALIDATION_FAILED match_id=%s", match_id)
-                                metrics["synced_matches"] += 1
-                                logger.debug("LINEUP_REFRESH_SYNCED match_id=%s", match_id)
-                            else:
-                                metrics["skipped_matches"] += 1
-                                logger.debug(
-                                    "LINEUP_REFRESH_SKIPPED match_id=%s reason=%s status=%s",
-                                    match_id,
-                                    result.get("reason"),
-                                    result.get("status"),
-                                )
+                        async def sync_lineup() -> dict:
+                            result = await football_service.sync_match_lineup(db, match_id)
+                            if result.get("success"):
+                                await self.lineup_refresh_state_repository.touch(db, match_id, refreshed_at=now_utc)
+                                await db.commit()
+                                if result.get("analytics"):
+                                    log_projection_transaction(result["analytics"], "committed")
+                                if not result.get("skipped"):
+                                    try:
+                                        await self.cache_service.delete(make_cache_key("lineup", match_id))
+                                    except Exception:
+                                        logger.exception("LINEUP_REFRESH_CACHE_INVALIDATION_FAILED match_id=%s", match_id)
+                            return result
+
+                        resource_locked, result = await run_with_resource_lock(
+                            db,
+                            "lineup",
+                            match_id,
+                            sync_lineup,
+                        )
+                        if not resource_locked:
+                            metrics["skipped_matches"] += 1
+                            logger.info("LINEUP_REFRESH_SKIPPED match_id=%s reason=resource_lock_not_acquired", match_id)
                             continue
+
+                        if result.get("success") and not result.get("skipped"):
+                            metrics["synced_matches"] += 1
+                            logger.info("LINEUP_REFRESH_SYNCED match_id=%s", match_id)
+                        elif result.get("success"):
+                            metrics["skipped_matches"] += 1
+                            logger.info(
+                                "LINEUP_REFRESH_SKIPPED match_id=%s reason=%s status=%s",
+                                match_id,
+                                result.get("reason"),
+                                result.get("status"),
+                            )
+                        else:
+                            await db.rollback()
+                            metrics["failed_matches"] += 1
+                            logger.error("LINEUP_REFRESH_FAILED match_id=%s reason=%s", match_id, result.get("reason"))
+                        continue
 
                         await db.rollback()
                         metrics["failed_matches"] += 1
@@ -626,13 +767,30 @@ class LiveUpdateScheduler:
                             )
                             continue
 
-                        result = await football_service.sync_match_events(db, match_id)
+                        async def sync_events() -> dict:
+                            result = await football_service.sync_match_events(db, match_id)
+                            if result.get("success"):
+                                await db.commit()
+                                if result.get("analytics"):
+                                    log_projection_transaction(result["analytics"], "committed")
+                                try:
+                                    await self.cache_service.delete(make_cache_key("match", match_id, "events"))
+                                except Exception:
+                                    logger.exception("EVENT_REFRESH_CACHE_INVALIDATION_FAILED match_id=%s", match_id)
+                            return result
+
+                        resource_locked, result = await run_with_resource_lock(
+                            db,
+                            "events",
+                            match_id,
+                            sync_events,
+                        )
+                        if not resource_locked:
+                            metrics["skipped_matches"] += 1
+                            logger.info("EVENT_REFRESH_SKIPPED match_id=%s reason=resource_lock_not_acquired", match_id)
+                            continue
+
                         if result.get("success"):
-                            await db.commit()
-                            try:
-                                await self.cache_service.delete(make_cache_key("match", match_id, "events"))
-                            except Exception:
-                                logger.exception("EVENT_REFRESH_CACHE_INVALIDATION_FAILED match_id=%s", match_id)
                             metrics["synced_matches"] += 1
                             logger.info("EVENT_REFRESH_SYNCED match_id=%s", match_id)
                             continue
@@ -680,7 +838,7 @@ class LiveUpdateScheduler:
 
                     if not status or status in STATISTICS_REFRESH_BLOCKED_STATUSES or status not in STATISTICS_REFRESH_ALLOWED_STATUSES:
                         metrics["skipped_matches"] += 1
-                        logger.debug(
+                        logger.info(
                             "STATISTICS_REFRESH_SKIPPED match_id=%s reason=status_blocked status=%s",
                             match_id,
                             status,
@@ -690,12 +848,30 @@ class LiveUpdateScheduler:
                     metrics["processed_matches"] += 1
 
                     try:
-                        result = await football_service.sync_match_statistics(db, match_id)
+                        async def sync_statistics() -> dict:
+                            result = await football_service.sync_match_statistics(db, match_id)
+                            if result.get("success"):
+                                await db.commit()
+                                try:
+                                    await self.cache_service.delete(make_cache_key("match", match_id, "statistics"))
+                                except Exception:
+                                    logger.exception("STATISTICS_REFRESH_CACHE_INVALIDATION_FAILED match_id=%s", match_id)
+                            return result
+
+                        resource_locked, result = await run_with_resource_lock(
+                            db,
+                            "statistics",
+                            match_id,
+                            sync_statistics,
+                        )
+                        if not resource_locked:
+                            metrics["skipped_matches"] += 1
+                            logger.info("STATISTICS_REFRESH_SKIPPED match_id=%s reason=resource_lock_not_acquired", match_id)
+                            continue
+
                         if result.get("success"):
-                            await db.commit()
-                            await self.cache_service.delete(make_cache_key("match", match_id, "statistics"))
                             metrics["synced_matches"] += 1
-                            logger.debug("STATISTICS_REFRESH_SYNCED match_id=%s", match_id)
+                            logger.info("STATISTICS_REFRESH_SYNCED match_id=%s", match_id)
                             continue
 
                         await db.rollback()

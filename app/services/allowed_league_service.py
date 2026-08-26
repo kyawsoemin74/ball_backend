@@ -15,13 +15,13 @@ class AllowedLeagueService:
     async def list_allowed_leagues(self, db: AsyncSession) -> list[dict]:
         return await self.repository.get_all(db)
 
-    async def add_allowed_league(self, db: AsyncSession, league_id: int) -> AllowedLeague:
+    async def add_allowed_league(self, db: AsyncSession, league_id: int) -> tuple[AllowedLeague, bool]:
         if not isinstance(league_id, int) or league_id <= 0:
             raise ValueError("league_id must be a positive integer")
 
         existing = await self.repository.get_by_league_id(db, league_id)
         if existing is not None:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="League is already allowed")
+            return existing, False
 
         league_result = await db.execute(select(League).where(League.league_id == league_id))
         league_record = league_result.scalar_one_or_none()
@@ -29,7 +29,7 @@ class AllowedLeagueService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="League not found")
 
         try:
-            return await self.repository.create(db, league_id)
+            return await self.repository.create(db, league_id), True
         except IntegrityError as exc:
             await db.rollback()
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="League is already allowed") from exc

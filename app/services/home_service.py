@@ -6,19 +6,34 @@ from app.services.league_grouping_service import LeagueGroupingService
 class HomeService:
     """Builds the frontend-ready home screen payload."""
 
-    def __init__(self, league_repository: LeagueRepository | None = None, grouping_service: LeagueGroupingService | None = None) -> None:
+    def __init__(
+        self,
+        league_repository: LeagueRepository | None = None,
+        grouping_service: LeagueGroupingService | None = None,
+    ) -> None:
         self.league_repository = league_repository or LeagueRepository()
         self.grouping_service = grouping_service or LeagueGroupingService()
 
     async def get_home_payload(self, db) -> dict:
-        allowed_ids = await AllowedLeagueRepository().get_allowed_ids(db)
+        try:
+            allowed_ids = await AllowedLeagueRepository().get_allowed_ids(db)
+        except Exception:
+            allowed_ids = set()
 
-        live_today = self._order_leagues(await self.league_repository.get_leagues_with_matches_today(db, allowed_ids))
-        featured = self._order_leagues(await self.league_repository.get_featured_leagues(db, allowed_ids))
+        live_today = self._order_leagues(
+            await self.league_repository.get_leagues_with_matches_today(db, allowed_ids)
+        )
+        featured = self._order_leagues(
+            await self.league_repository.get_featured_leagues(db, allowed_ids)
+        )
         all_leagues = await self.league_repository.get_all_leagues(db, allowed_ids)
 
         countries = self.grouping_service.build_groups(
-            [league for league in all_leagues if not getattr(league, "is_featured", False)]
+            [
+                league
+                for league in all_leagues
+                if not getattr(league, "is_featured", False)
+            ]
         )
 
         return {
@@ -33,6 +48,7 @@ class HomeService:
             key=lambda league: (
                 int(getattr(league, "display_order", 999) or 999),
                 str(getattr(league, "name", "")).lower(),
+                int(getattr(league, "league_id", 0) or 0),
             ),
         )
 

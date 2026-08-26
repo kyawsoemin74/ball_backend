@@ -106,7 +106,6 @@ class MatchService:
             sync_result = await self._process_sync(db, fixtures)
             return sync_result
         except Exception:
-            await db.rollback()
             raise
         finally:
             self.fixture_sync_service._defer_live_cache_invalidation = False

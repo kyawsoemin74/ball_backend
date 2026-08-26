@@ -65,7 +65,7 @@ def test_get_current_config_uses_cache_when_available():
     asyncio.run(run_test())
 
 
-def test_update_current_config_invalidates_cache():
+def test_update_current_config_does_not_invalidate_before_commit():
     async def run_test():
         cache_service = FakeCacheService()
         cache_key = make_cache_key("admob", "config")
@@ -78,6 +78,6 @@ def test_update_current_config_invalidates_cache():
 
         assert updated.is_enabled is True
         assert repo.update_calls == 1
-        assert cache_service.store.get(cache_key) is None
+        assert cache_service.store.get(cache_key) == {"id": 1, "is_enabled": False}
 
     asyncio.run(run_test())

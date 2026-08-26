@@ -19,9 +19,11 @@ from app.models.odds import Odds
 from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.match_repository import MatchRepository
 from app.schemas.match import MatchDateResponse, MatchResponse, MatchStatisticsResponse
+from app.services.analytics_projection_service import log_projection_transaction
 from app.services.cache_service import CacheService
 from app.services.league_structure_resolver import LeagueStructureResolver
 from app.services.active_match_service import active_match_service
+from app.services.resource_lock import run_with_resource_lock
 from app.services.football import football_service, LIVE_STATUSES
 
 router = APIRouter(prefix="/matches", tags=["matches"])
@@ -51,6 +53,12 @@ def _has_availability_data(payload: Any) -> bool:
         return len(payload) > 0
 
     return bool(payload)
+
+
+async def _coerce_bool_result(value: Any) -> bool:
+    if hasattr(value, "__await__"):
+        return bool(await value)
+    return bool(value)
 
 
 async def _build_match_availability_flags(match: Match, db: AsyncSession) -> Dict[str, bool]:
@@ -98,11 +106,19 @@ async def _build_match_availability_flags(match: Match, db: AsyncSession) -> Dic
     lineup_result = await db.execute(select(MatchLineup).where(MatchLineup.match_id == match.match_id).limit(1))
     flags["has_lineups"] = lineup_result.scalar_one_or_none() is not None
 
-    flags["has_odds"] = await _has_odds_available(match.match_id, db)
-    flags["has_h2h"] = await _has_h2h_available(match.home_team_id, match.away_team_id, match.match_id, db)
+    flags["has_odds"] = await _coerce_bool_result(_has_odds_available(match.match_id, db))
+    flags["has_h2h"] = await _coerce_bool_result(_has_h2h_available(match.home_team_id, match.away_team_id, match.match_id, db))
 
     structure = await league_structure_resolver.resolve(match, db)
     flags["has_standings"] = structure.has_standings
+    if (
+        not flags["has_standings"]
+        and not structure.is_knockout
+        and getattr(match, "status", None) in {"FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"}
+        and getattr(match, "season", None) is not None
+        and str(getattr(getattr(match, "league_obj", None), "season", "")) == str(match.season)
+    ):
+        flags["has_standings"] = True
     flags["is_knockout"] = structure.is_knockout
     flags["has_bracket"] = structure.has_bracket
 
@@ -310,6 +326,54 @@ async def heartbeat_match(
 
 # --- POST/Sync Routes (Grouped Together) ---
 
+@router.post("/sync/h2h/{team1_id}/{team2_id}", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
+async def refresh_h2h_route(
+    team1_id: int = Path(..., gt=0),
+    team2_id: int = Path(..., gt=0),
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    """Explicitly refresh and publish H2H for an authenticated admin pair request."""
+    if team1_id == team2_id:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="H2H requires two distinct teams")
+
+    async def refresh() -> dict:
+        result = await football_service.refresh_h2h(db=db, team1_id=team1_id, team2_id=team2_id)
+        if "error" in result:
+            await db.rollback()
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="H2H provider refresh failed")
+
+        await db.commit()
+        analytics = result.get("analytics")
+        if analytics:
+            log_projection_transaction(analytics, "committed")
+            analytics = dict(analytics)
+            analytics["transaction_outcome"] = "committed"
+        try:
+            pair_key = f"{min(team1_id, team2_id)}-{max(team1_id, team2_id)}"
+            await CacheService().delete(make_cache_key("match", "h2h", pair_key))
+        except Exception:
+            logger.exception("H2H refresh cache invalidation failed", extra={"team_low_id": min(team1_id, team2_id), "team_high_id": max(team1_id, team2_id)})
+        return {"success": True, "updated": result.get("updated", False), "analytics": analytics}
+
+    try:
+        locked, result = await run_with_resource_lock(
+            db,
+            "h2h",
+            f"{min(team1_id, team2_id)}:{max(team1_id, team2_id)}",
+            refresh,
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    except Exception:
+        await db.rollback()
+        raise
+    if not locked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="H2H refresh already in progress")
+    return result
+
 @router.post("/sync/{match_id}/lineup", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
 async def sync_match_lineup_route(
     match_id: int = Path(..., gt=0),
@@ -318,19 +382,26 @@ async def sync_match_lineup_route(
     """
     Sync lineup for a specific match from the API and persist it to the database.
     """
-    try:
-        result = await football_service.sync_match_lineup(db=db, match_id=match_id)
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
+    async def sync() -> Dict[str, Any]:
+        try:
+            result = await football_service.sync_match_lineup(db=db, match_id=match_id)
+            if not result.get("success"):
+                await db.rollback()
+                return result
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
 
-    try:
-        await CacheService().delete(make_cache_key("lineup", match_id))
-    except Exception:
-        # Cache failures should not affect the response
-        pass
+        try:
+            await CacheService().delete(make_cache_key("lineup", match_id))
+        except Exception:
+            pass
+        return result
 
+    locked, result = await run_with_resource_lock(db, "lineup", match_id, sync)
+    if not locked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Lineup sync already in progress")
     return result
 
 
@@ -342,14 +413,25 @@ async def sync_match_events(
     """
     Finalized ဖြစ်သွားသော ပွဲစဉ်အတွက် Events များကို API မှ ဆွဲယူပြီး Database တွင် သိမ်းဆည်းရန်။
     """
-    result = await football_service.sync_match_events(db=db, match_id=match_id)
-    await db.commit()
-    # Invalidate cache after successful commit per frozen architecture
-    try:
-        await CacheService().delete(make_cache_key("match", match_id, "events"))
-    except Exception:
-        # Cache failures should not affect the response
-        pass
+    async def sync() -> Dict[str, Any]:
+        try:
+            result = await football_service.sync_match_events(db=db, match_id=match_id)
+            if not result.get("success"):
+                await db.rollback()
+                return result
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        try:
+            await CacheService().delete(make_cache_key("match", match_id, "events"))
+        except Exception:
+            pass
+        return result
+
+    locked, result = await run_with_resource_lock(db, "events", match_id, sync)
+    if not locked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Event sync already in progress")
     return result
 
 
@@ -361,19 +443,25 @@ async def sync_match_statistics_route(
     """
     Sync statistics for a specific match from the API and persist them to the database.
     """
-    try:
-        result = await football_service.sync_match_statistics(db=db, match_id=match_id)
-        await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
+    async def sync() -> Dict[str, Any]:
+        try:
+            result = await football_service.sync_match_statistics(db=db, match_id=match_id)
+            if not result.get("success"):
+                await db.rollback()
+                return result
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        try:
+            await CacheService().delete(make_cache_key("match", match_id, "statistics"))
+        except Exception:
+            pass
+        return result
 
-    try:
-        await CacheService().delete(make_cache_key("match", match_id, "statistics"))
-    except Exception:
-        # Cache failures should not affect the response
-        pass
-
+    locked, result = await run_with_resource_lock(db, "statistics", match_id, sync)
+    if not locked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Statistics sync already in progress")
     return result
 
 
@@ -386,8 +474,27 @@ async def sync_full_season(
     """
     သတ်မှတ်ထားသော League နှင့် Season တစ်ခုလုံးအတွက် ပွဲစဉ်များကို Sync လုပ်ရန်။
     """
-    result = await football_service.sync_full_season(db=db, league=league_id, season=season)
-    await db.commit()
+    async def sync() -> Dict[str, Any]:
+        try:
+            result = await football_service.sync_full_season(db=db, league=league_id, season=season)
+            if not result.get("success"):
+                await db.rollback()
+                return result
+            await db.commit()
+            try:
+                await CacheService().delete(make_cache_key("live_matches"))
+            except Exception:
+                logger.exception("Fixture sync cache invalidation failed")
+            if "final_lineup_candidates" in result:
+                await football_service.finalize_pending_lineups(result.get("final_lineup_candidates", []))
+            return result
+        except Exception:
+            await db.rollback()
+            raise
+
+    locked, result = await run_with_resource_lock(db, "fixture_query", "global", sync)
+    if not locked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Fixture sync already in progress")
     return result
 
 
@@ -399,6 +506,25 @@ async def sync_daily_matches(
     """
     သတ်မှတ်ထားသော ရက်စဉ်အတွက် ပွဲစဉ်များကို API မှ ဆွဲယူပြီး Database တွင် သိမ်းဆည်းရန်။
     """
-    result = await football_service.sync_daily_fixtures(db=db, target_date=date_val.isoformat())
-    await db.commit()
+    async def sync() -> Dict[str, Any]:
+        try:
+            result = await football_service.sync_daily_fixtures(db=db, target_date=date_val.isoformat())
+            if not result.get("success"):
+                await db.rollback()
+                return result
+            await db.commit()
+            try:
+                await CacheService().delete(make_cache_key("live_matches"))
+            except Exception:
+                logger.exception("Fixture sync cache invalidation failed")
+            if "final_lineup_candidates" in result:
+                await football_service.finalize_pending_lineups(result.get("final_lineup_candidates", []))
+            return result
+        except Exception:
+            await db.rollback()
+            raise
+
+    locked, result = await run_with_resource_lock(db, "fixture_query", "global", sync)
+    if not locked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Fixture sync already in progress")
     return result

@@ -74,7 +74,7 @@ class LineupService:
                 photo_map[str(player_id)] = player.get("photo")
         return photo_map
 
-    async def _enrich_lineup_with_photos(self, lineup_payload: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def _enrich_lineup_with_photos(self, db: AsyncSession, lineup_payload: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not isinstance(lineup_payload, list):
             return lineup_payload
 
@@ -105,7 +105,10 @@ class LineupService:
         photo_maps: Dict[int, Dict[int, Optional[str]]] = {}
         for team_id in team_ids:
             try:
-                squad_payload = await self.team_service.get_cached_team_squad(team_id)
+                provider_team = await self.team_service.team_repository.find_by_provider_identity(db, "api-football", team_id)
+                if provider_team is None:
+                    return lineup_payload
+                squad_payload = await self.team_service.get_cached_team_squad(db, int(provider_team.team_id))
             except Exception:
                 return lineup_payload
             photo_maps[team_id] = self._build_player_photo_map(squad_payload)
@@ -151,18 +154,27 @@ class LineupService:
     async def get_match_lineup(self, match_id: int) -> Optional[dict]:
         return None
 
-    async def sync_lineup(self, db: AsyncSession, match_id: int) -> Dict[str, Any]:
+    async def sync_lineup(
+        self,
+        db: AsyncSession,
+        match_id: int,
+        *,
+        allow_terminal_status: bool = False,
+        invalidate_cache: bool = True,
+    ) -> Dict[str, Any]:
         cache_key = make_lineup_cache_key(match_id)
+        sync_kwargs = {
+            "db": db,
+            "match_id": match_id,
+            "validate_lineup": self._is_valid_lineup_response,
+            "cache_service": self.cache_service,
+            "cache_key": cache_key,
+        }
+        if allow_terminal_status:
+            sync_kwargs["allow_terminal_status"] = True
         sync_result = await self.lineup_sync_service.sync_lineup(
-            db=db,
-            match_id=match_id,
-            validate_lineup=self._is_valid_lineup_response,
-            cache_service=self.cache_service,
-            cache_key=cache_key,
+            **sync_kwargs,
         )
-        if sync_result.get("success") and not sync_result.get("skipped"):
-            await self.cache_service.delete(cache_key)
-            logger.debug("LINEUP_CACHE_DELETE", extra={"match_id": match_id})
         return sync_result
 
     async def get_cached_match_lineup(self, db: AsyncSession, match_id: int) -> Optional[List[Dict[str, Any]]]:
@@ -170,13 +182,13 @@ class LineupService:
         cached = await self.cache_service.get_json(cache_key)
         if cached is not None:
             logger.debug("LINEUP_CACHE_HIT", extra={"match_id": match_id})
-            return await self._enrich_lineup_with_photos(cached)
+            return await self._enrich_lineup_with_photos(db, cached)
 
         logger.debug("LINEUP_CACHE_MISS", extra={"match_id": match_id})
         db_record = (await db.execute(select(MatchLineup).where(MatchLineup.match_id == match_id))).scalar_one_or_none()
         if db_record:
             await self.cache_service.set_json(cache_key, db_record.data, settings.REDIS_TTL_LINEUP)
             logger.debug("LINEUP_CACHE_SET", extra={"match_id": match_id})
-            return await self._enrich_lineup_with_photos(db_record.data)
+            return await self._enrich_lineup_with_photos(db, db_record.data)
 
         return None

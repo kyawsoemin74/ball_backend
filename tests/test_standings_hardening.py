@@ -34,6 +34,13 @@ class FakeTeamService:
         self.calls.append(list(teams))
         return None
 
+    async def resolve_provider_teams(self, db, teams):
+        return {
+            "resolved": {int(item["provider_id"]): int(item["provider_id"]) for item in teams},
+            "unresolved": [],
+            "total": len(teams),
+        }
+
 
 class RecordingCacheService:
     def __init__(self, cached=None):

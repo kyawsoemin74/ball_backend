@@ -28,7 +28,7 @@ async def get_team_fixtures(team_id: int = Path(..., gt=0), db: AsyncSession = D
 @router.get("/{team_id}/squad", response_model=TeamSquadResponse)
 async def get_team_squad(team_id: int = Path(..., gt=0), db: AsyncSession = Depends(get_db)):
     """Get the current squad for a team."""
-    result = await football_service.get_team_squad(team_id)
+    result = await football_service.get_team_squad(db, team_id)
     if not result or "error" in result:
         raise HTTPException(status_code=404, detail="Squad not found")
     return result
@@ -70,7 +70,7 @@ async def get_team_statistics(
     db: AsyncSession = Depends(get_db),
 ):
     """Get normalized team statistics for a team, league, and season."""
-    result = await football_service.get_team_statistics(team_id, league_id, season)
+    result = await football_service.get_team_statistics(db, team_id, league_id, season)
     if not result or "error" in result:
         raise HTTPException(status_code=404, detail="Statistics not found")
     return result
@@ -102,15 +102,4 @@ async def get_team_details(team_id: int, db: AsyncSession = Depends(get_db)):
         await cache_set_json(cache_key, payload, settings.REDIS_TTL_LEAGUE_TEAM)
         return payload
 
-    # Fetch from API
-    result = await football_service.get_team_details(team_id)
-    if not result or "response" not in result or not result["response"]:
-        raise HTTPException(status_code=404, detail="Team not found")
-
-    team_data = result["response"][0]
-    upserted_team = await football_service.upsert_team(db, team_data)
-    await db.commit()
-    logger.info(f"Team {team_id} fetched from API and cached")
-    payload = TeamSchema.from_orm(upserted_team).dict()
-    await cache_set_json(cache_key, payload, settings.REDIS_TTL_LEAGUE_TEAM)
-    return payload
+    raise HTTPException(status_code=404, detail="Team not found")

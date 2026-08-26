@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from app.providers.odds_provider import OddsProvider
 from app.repositories.odds_repository import OddsRepository
 from app.services.cache_service import CacheService
+from app.services.analytics_projection_service import AnalyticsProjectionService, log_projection_failure
 
 if TYPE_CHECKING:
     from app.services.odds_service import OddsService
@@ -21,15 +22,18 @@ class OddsSyncService:
         cache_service: CacheService | None = None,
         odds_provider: OddsProvider | None = None,
         odds_repository: OddsRepository | None = None,
+        analytics_projection_service: AnalyticsProjectionService | None = None,
     ) -> None:
         self.odds_service = odds_service
         self.cache_service = cache_service or CacheService()
         self.odds_provider = odds_provider or OddsProvider(self.odds_service.client)
         self.odds_repository = odds_repository or OddsRepository()
+        self.analytics_projection_service = analytics_projection_service or AnalyticsProjectionService()
 
     async def refresh_odds(self, db, fixture_id: int, cache_key: str, pre_match_ttl: int) -> dict:
         result = await self.odds_provider.get_match_odds(fixture_id)
         if not result or "response" not in result:
+            log_projection_failure("odds", {"match_id": fixture_id}, "provider_failure")
             return {"error": "API error"}
 
         responses = result.get("response", [])
@@ -50,6 +54,7 @@ class OddsSyncService:
                 odds_to_upsert.append(record)
 
         now_utc = datetime.now(timezone.utc)
+        projection = None
         if odds_to_upsert:
             persistence_rows = []
             for record in odds_to_upsert:
@@ -67,8 +72,12 @@ class OddsSyncService:
                 )
             await self.odds_repository.replace_fixture_odds(db, fixture_id, persistence_rows)
             await db.flush()
+            projection = await self.analytics_projection_service.project_odds(db, fixture_id, persistence_rows)
+            if not projection["success"]:
+                raise ValueError(f"Odds analytics projection rejected: {projection.get('reason', 'reconciliation failure')}")
         else:
             await db.flush()
+            projection = await self.analytics_projection_service.project_odds(db, fixture_id, [])
 
         if not odds_to_upsert:
             reason = "1xbet_data_not_found" if one_xbet_missing else "filtered_no_odds"
@@ -85,6 +94,6 @@ class OddsSyncService:
             }
             for r in odds_to_upsert
         ]
-        refresh_result = {"source": "api", "odds": odds_data, "cached": False, "match_started": False, "updated": len(odds_to_upsert)}
-        await self.cache_service.set_json(cache_key, refresh_result, pre_match_ttl)
+        refresh_result = {"source": "api", "odds": odds_data, "cached": False, "match_started": False, "updated": len(odds_to_upsert), "analytics": projection}
+        # The scheduler invalidates this key after its outer transaction commits.
         return refresh_result

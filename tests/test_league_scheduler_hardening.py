@@ -68,12 +68,15 @@ def test_refresh_odds_continues_after_match_exception(monkeypatch):
         def first(self):
             return self._rows[0] if self._rows else None
 
+        def scalar_one(self):
+            return True
+
     class FakeSchedulerDBWithQuery(FakeSchedulerDB):
         def __init__(self):
             super().__init__()
             self._execute_count = 0
 
-        async def execute(self, _query):
+        async def execute(self, _query, _params=None):
             self._execute_count += 1
             if self._execute_count == 1:
                 return FakeQueryResult([(1, "NS", datetime.now(timezone.utc) + timedelta(hours=1)), (2, "NS", datetime.now(timezone.utc) + timedelta(hours=2)), (3, "NS", datetime.now(timezone.utc) + timedelta(hours=3))])

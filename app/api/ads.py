@@ -2,12 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import current_active_admin
+from app.cache import make_cache_key
 from app.db import get_db
 from app.models.ad_config import AdConfig
 from app.schemas.ad import AdsResponse
 from app.schemas.ad_config import AdConfigResponse, AdConfigUpdateRequest
 from app.crud import ads
 from app.services.admob_service import AdMobService
+from app.services.cache_service import CacheService
 
 router = APIRouter()
 
@@ -49,5 +51,15 @@ async def update_ad_config(payload: AdConfigUpdateRequest, db: AsyncSession = De
         app_open_android=payload.app_open_android,
         app_open_ios=payload.app_open_ios,
     )
-    updated_config = await service.update_current_config(db, config)
+    try:
+        updated_config = await service.update_current_config(db, config)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    try:
+        await CacheService().delete(make_cache_key("admob", "config"))
+    except Exception:
+        pass
     return updated_config

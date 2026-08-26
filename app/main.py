@@ -16,6 +16,7 @@ from app.api.home import router as home_router
 from app.api.teams import router as teams_router
 from app.api.ads import router as ads_router
 from app.api.news import router as news_router
+from app.api.v2.player_contracts import router as player_v2_router
 from app.api.auth import router as auth_router
 from app.api.socket import router as socket_router
 from app.api.uploads import router as uploads_router
@@ -40,7 +41,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 async def lifespan(app: FastAPI):
     # Start auxiliary background services with the FastAPI application lifecycle.
     start_worker_metrics_server(8001)
-    start_scheduler()
+    if settings.SCHEDULER_ENABLED:
+        start_scheduler()
     app.state.notification_worker_task = asyncio.create_task(notification_worker.start())
 
     try:
@@ -53,7 +55,8 @@ async def lifespan(app: FastAPI):
                 await app.state.notification_worker_task
             except asyncio.CancelledError:
                 pass
-        stop_scheduler()
+        if settings.SCHEDULER_ENABLED:
+            stop_scheduler()
 
 
 app = FastAPI(
@@ -98,6 +101,7 @@ app.include_router(teams_router, prefix="/api/teams", tags=["teams"])
 app.include_router(ads_router, prefix="/api/ads", tags=["ads"])
 app.include_router(news_router, prefix="/api/news", tags=["news"])
 app.include_router(uploads_router, prefix="/api", tags=["uploads"])
+app.include_router(player_v2_router, prefix="/api/v2")
 
 
 @app.on_event("startup")

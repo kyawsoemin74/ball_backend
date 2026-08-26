@@ -1,0 +1,26 @@
+recovery_id: <generated-at-drill-start>
+timestamp: <UTC timestamp>
+environment: disposable-recovery
+database:
+  source_of_truth: PostgreSQL
+  backup_artifact: encrypted custom-format dump and JSON metadata
+  restore: pg_restore --no-owner into disposable PostgreSQL of matching major version
+redis:
+  role: rebuildable cache
+  restore: start empty disposable Redis
+application_configuration: recovery.env.example
+secrets:
+  source: approved secret manager
+  values_in_repository: false
+roles: recovery-roles.example.yaml
+grants: apply reviewed disposable grants; validate owners, schemas, tables, and sequences
+assets:
+  source: NEWS_UPLOAD_DIR local filesystem
+  artifact: encrypted tar.gz plus JSON metadata
+  storage: D:/FoverBackup
+  validation: encrypted checksum, archive checksum, restored tree checksum, representative file, and DB URL reference
+backup_artifact:
+  database: encrypted PostgreSQL dump
+  assets: encrypted asset archive
+gcs: deferred
+recovery_steps: ops/backup/README.md

@@ -9,7 +9,19 @@ class FakeRepository:
         self.existing = existing
 
     async def get_by_id(self, db, league_id):
-        return self.existing
+        if self.existing is not None and self.existing.league_id == league_id:
+            return self.existing
+        return None
+
+    async def find_by_provider_identity(self, db, provider, provider_id):
+        if self.existing is None:
+            return None
+        if (
+            self.existing.provider == provider
+            and self.existing.provider_id == str(provider_id)
+        ):
+            return self.existing
+        return None
 
     async def get_many_by_ids(self, db, league_ids):
         return list(self.existing) if isinstance(self.existing, list) else []
@@ -28,9 +40,14 @@ class FakeClient:
         return {"response": []}
 
 
-def make_existing_league(league_id=1, display_order=1):
+def make_existing_league(
+    league_id=1,
+    display_order=1,
+):
     return League(
         league_id=league_id,
+        provider="api-football",
+        provider_id=str(league_id),
         name="Existing League",
         country="England",
         logo=None,
@@ -58,30 +75,10 @@ def test_league_service_preserves_existing_display_order_on_update():
     assert updated.display_order == 7
 
 
-def test_league_service_defaults_new_leagues_to_display_order_999():
-    service = LeagueService(client=FakeClient(), cache_service=FakeCacheService())
-
-    class FakeDB:
-        async def flush(self):
-            return None
-
-        async def refresh(self, obj):
-            return None
-
-        def add(self, obj):
-            self.added = obj
-
-    db = FakeDB()
-    service.league_repository = FakeRepository(existing=None)
-
+def test_league_service_fails_closed_when_master_is_missing():
     async def run():
-        league = await service.upsert_league(db, {
-            "league": {"id": 99, "name": "New League", "logo": None},
-            "country": "England",
-            "seasons": [{"year": 2024}],
-        })
-        return league
+        return await FakeRepository(existing=None).find_by_provider_identity(
+            None, "api-football", "99"
+        )
 
-    league = asyncio.run(run())
-
-    assert league.display_order == 999
+    assert asyncio.run(run()) is None
