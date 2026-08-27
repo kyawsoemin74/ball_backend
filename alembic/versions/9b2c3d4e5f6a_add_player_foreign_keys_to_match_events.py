@@ -1,14 +1,14 @@
 """add Player Master foreign keys to match events
 
 Revision ID: 9b2c3d4e5f6a
-Revises: 9a1b2c3d4e5f
+Revises: 9aa1b2c3d4e5
 """
 
 from alembic import op
 
 
 revision = "9b2c3d4e5f6a"
-down_revision = "9a1b2c3d4e5f"
+down_revision = "9aa1b2c3d4e5"
 branch_labels = None
 depends_on = None
 
