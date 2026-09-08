@@ -11,7 +11,7 @@ class Team(Base):
         UniqueConstraint("coach_id", name="uq_teams_coach_id"),
     )
 
-    team_id = Column(Integer, primary_key=True, index=True)
+    team_id = Column(Integer, primary_key=True)
     provider = Column(String(50), nullable=False, server_default="api-football")
     provider_id = Column(String(100), nullable=True, index=True)
     coach_id = Column(Integer, ForeignKey("coaches.coach_id", name="fk_teams_coach_id", ondelete="RESTRICT"), nullable=True)
@@ -23,6 +23,6 @@ class Team(Base):
     founded = Column(Integer, nullable=True)  # year
     current_league_id = Column(Integer, nullable=True)
     current_season = Column(String(10), nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

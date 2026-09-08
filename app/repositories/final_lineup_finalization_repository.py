@@ -9,6 +9,7 @@ from app.models.match_lineup_finalization import MatchLineupFinalization
 
 FINAL_LINEUP_REQUIRED_STATES = ("REQUIRED", "RETRYABLE")
 FINAL_LINEUP_TERMINAL_STATUSES = ("FT", "AET", "PEN")
+FINAL_LINEUP_MAX_ATTEMPTS = 5
 
 
 class FinalLineupFinalizationRepository:
@@ -44,9 +45,10 @@ class FinalLineupFinalizationRepository:
         record: MatchLineupFinalization,
         attempted_at: datetime,
     ) -> MatchLineupFinalization:
-        if record.status == "SUCCESS":
+        if record.status in {"SUCCESS", "TERMINAL"}:
             return record
         record.attempt_count += 1
+        record.status = "RUNNING"
         record.last_attempted_at = attempted_at
         record.updated_at = attempted_at
         await db.flush()
@@ -59,6 +61,7 @@ class FinalLineupFinalizationRepository:
         failure_category: str,
         failure_reason: str | None,
         attempted_at: datetime,
+        failure_diagnostics: list[dict] | None = None,
     ) -> MatchLineupFinalization:
         if record.status == "SUCCESS":
             return record
@@ -66,6 +69,7 @@ class FinalLineupFinalizationRepository:
         record.completed_at = None
         record.failure_category = failure_category
         record.failure_reason = self._truncate_reason(failure_reason)
+        record.failure_diagnostics = failure_diagnostics
         record.last_attempted_at = attempted_at
         record.updated_at = datetime.now(timezone.utc)
         await db.flush()
@@ -84,6 +88,27 @@ class FinalLineupFinalizationRepository:
         record.failure_category = None
         record.failure_reason = None
         record.updated_at = completed_at
+        await db.flush()
+        return record
+
+    async def mark_terminal(
+        self,
+        db: AsyncSession,
+        record: MatchLineupFinalization,
+        failure_category: str,
+        failure_reason: str | None,
+        attempted_at: datetime,
+        failure_diagnostics: list[dict] | None = None,
+    ) -> MatchLineupFinalization:
+        if record.status == "SUCCESS":
+            return record
+        record.status = "TERMINAL"
+        record.completed_at = None
+        record.failure_category = failure_category
+        record.failure_reason = self._truncate_reason(failure_reason)
+        record.failure_diagnostics = failure_diagnostics
+        record.last_attempted_at = attempted_at
+        record.updated_at = datetime.now(timezone.utc)
         await db.flush()
         return record
 

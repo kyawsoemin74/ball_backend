@@ -24,11 +24,9 @@ from app.api.admin_leagues import router as admin_leagues_router
 from sqlalchemy import text
 from app.db import async_session, engine
 from app.admin import setup_admin
-from app.monitoring import MonitoringMiddleware, metrics_router, POSTGRES_UP, REDIS_UP, start_worker_metrics_server
-from app.redis import sync_redis
+from app.monitoring import MonitoringMiddleware, metrics_router, refresh_dependency_health
 from app.services.notification import notification_worker
 from app.services.socket_service import broker as redis_broker
-from scheduler_service import start_scheduler, stop_scheduler
 
 log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
 log_level = getattr(logging, log_level_name, logging.INFO)
@@ -39,10 +37,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start auxiliary background services with the FastAPI application lifecycle.
-    start_worker_metrics_server(8001)
-    if settings.SCHEDULER_ENABLED:
-        start_scheduler()
     app.state.notification_worker_task = asyncio.create_task(notification_worker.start())
 
     try:
@@ -55,8 +49,6 @@ async def lifespan(app: FastAPI):
                 await app.state.notification_worker_task
             except asyncio.CancelledError:
                 pass
-        if settings.SCHEDULER_ENABLED:
-            stop_scheduler()
 
 
 app = FastAPI(
@@ -64,15 +56,15 @@ app = FastAPI(
     description="Football data management API",
     version="1.0.0",
     lifespan=lifespan,
-    docs_url="/docs",
+    docs_url="/docs" if settings.ENABLE_API_DOCS else None,
     redoc_url=None,
-    openapi_url="/api/openapi.json"
+    openapi_url="/api/openapi.json" if settings.ENABLE_API_DOCS else None
 )
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Production မှာ တကယ်သုံးမည့် Domain ကိုသာ ပြောင်းလဲရန်
+    allow_origins=[origin.strip() for origin in settings.CORS_ORIGINS.split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -86,7 +78,8 @@ setup_admin(app, engine)
 
 # Monitoring middleware and metrics
 app.add_middleware(MonitoringMiddleware)
-app.include_router(metrics_router)
+if settings.ENABLE_API_METRICS:
+    app.include_router(metrics_router)
 
 # WebSocket router
 app.include_router(socket_router)
@@ -125,27 +118,6 @@ def health_check():
     return {"status": "alive"}
 
 
-async def _check_postgres() -> bool:
-    async with async_session() as db:
-        try:
-            await db.execute(text("SELECT 1"))
-            POSTGRES_UP.set(1)
-            return True
-        except Exception:
-            POSTGRES_UP.set(0)
-            return False
-
-
-def _check_redis() -> bool:
-    try:
-        healthy = sync_redis.ping()
-        REDIS_UP.set(1 if healthy else 0)
-        return bool(healthy)
-    except Exception:
-        REDIS_UP.set(0)
-        return False
-
-
 @app.get("/health/live")
 def health_live():
     return {"status": "alive"}
@@ -153,8 +125,7 @@ def health_live():
 
 @app.get("/health/ready")
 async def health_ready():
-    postgres_ok = await _check_postgres()
-    redis_ok = _check_redis()
+    postgres_ok, redis_ok = await refresh_dependency_health()
     status = "ready" if postgres_ok and redis_ok else "unhealthy"
     return JSONResponse(
         status_code=200 if status == "ready" else 503,

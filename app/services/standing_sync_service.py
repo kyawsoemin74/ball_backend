@@ -12,6 +12,7 @@ from app.repositories.standing_repository import StandingRepository
 from app.services.cache_service import CacheService
 from app.services.team_service import TeamService
 from app.services.analytics_projection_service import AnalyticsProjectionService, log_projection_failure
+from app.monitoring import observe_sync
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +176,7 @@ class StandingSyncService:
             self._queue_standings_cache_invalidation(db, league_id, str(season))
         return len(prepared_rows)
 
+    @observe_sync("standing")
     async def sync_standings(self, db: AsyncSession, league_id: int, season: int) -> dict:
         allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
         if not allowed_ids:

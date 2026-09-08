@@ -1,6 +1,6 @@
 import enum
 
-from sqlalchemy import Boolean, Column, DateTime, Enum, Integer, String, func, text
+from sqlalchemy import Boolean, Column, DateTime, Enum, Integer, String, UniqueConstraint, func, text
 
 from app.db import Base
 
@@ -13,11 +13,15 @@ class AvatarSource(str, enum.Enum):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("username", name="uq_users_username"),
+        UniqueConstraint("email", name="uq_users_email"),
+    )
 
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(50), unique=True, nullable=False, index=True)
-    email = Column(String(255), unique=True, nullable=False, index=True)
-    hashed_password = Column(String(255), nullable=True)
+    id = Column(Integer, primary_key=True)
+    username = Column(String(50), nullable=False, index=True)
+    email = Column(String(255), nullable=False, index=True)
+    hashed_password = Column(String(255), nullable=False)
     google_id = Column(String(255), unique=True, nullable=True)
     role = Column(String(20), nullable=False, server_default="user")
     is_active = Column(Boolean(), nullable=False, server_default=text("true"))
@@ -26,7 +30,6 @@ class User(Base):
     avatar_source = Column(
         Enum(
             AvatarSource,
-            native_enum=False,
             values_callable=lambda enum_cls: [member.value for member in enum_cls],
         ),
         nullable=False,

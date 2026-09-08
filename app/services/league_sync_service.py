@@ -131,6 +131,21 @@ class LeagueSyncService:
                 provider_id,
             )
             return None
+
+        country_result = await self.country_sync_service.sync_from_league_payload(db, league_data)
+        country = country_result.get("country") if isinstance(country_result, dict) else None
+        if isinstance(country, dict) and country.get("country_id") is not None:
+            normalized_country_id = int(country["country_id"])
+            if getattr(master, "country_id", None) != normalized_country_id:
+                update_country_id = getattr(self.league_repository, "update_country_id", None)
+                if update_country_id is not None:
+                    await update_country_id(
+                        db,
+                        master.league_id,
+                        normalized_country_id,
+                    )
+                master.country_id = normalized_country_id
+
         self._queue_league_cache_invalidation(db, master.league_id)
         return master
 

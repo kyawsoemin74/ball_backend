@@ -15,11 +15,16 @@ spec:
       labels:
         app: fover-backend-worker
     spec:
+      restartPolicy: Always
       containers:
         - name: worker
           image: ghcr.io/your-org/fover-backend:latest
           imagePullPolicy: IfNotPresent
           command: ["python", "worker.py"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
           ports:
             - containerPort: 8001
               name: metrics
@@ -49,6 +54,10 @@ spec:
                 secretKeyRef:
                   name: fover-backend-secrets
                   key: API_KEY
+            - name: SCHEDULER_ENABLED
+              value: "true"
+            - name: APP_ENV
+              value: "production"
           readinessProbe:
             httpGet:
               path: /metrics

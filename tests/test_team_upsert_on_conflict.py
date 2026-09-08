@@ -132,9 +132,17 @@ class CoachAssignmentRepository:
 class CoachAssignmentProvider:
     def __init__(self, payload):
         self.payload = payload
+        self.selection = None
 
     async def get_team_coach(self, team_id):
         return self.payload
+
+    async def get_team_coach_selection(self, team_id):
+        if self.selection is not None:
+            return self.selection
+        if self.payload is None:
+            return {"status": "NO_DATA", "coach": None}
+        return {"status": "VERIFIED", "coach": self.payload}
 
 
 class CoachAssignmentSyncService:
@@ -414,3 +422,68 @@ def test_sync_team_coach_does_not_clear_assignment_when_provider_is_unavailable(
 
     assert result["reason"] == "coach_unavailable"
     assert repository.updated == []
+
+
+def test_sync_team_coach_blocks_ambiguous_replacement_and_preserves_existing_assignment():
+    repository = CoachAssignmentRepository(coach_id=7)
+    service = TeamSyncService(
+        cache_service=RecordingCacheService(),
+        team_repository=repository,
+        coach_sync_service=CoachAssignmentSyncService({"id": 129, "name": "Coach B"}),
+    )
+    service.coach_sync_service.provider.get_team_coach_selection = lambda team_id: _async_selection("AMBIGUOUS", {"id": 129, "name": "Coach B"})
+
+    result = asyncio.run(service.sync_team_coach(ExecuteTrackingDB(), 101))
+
+    assert result["reason"] == "ambiguous"
+    assert result["coach_id"] == 7
+    assert repository.updated == []
+
+
+def test_sync_team_coach_blocks_ambiguous_assignment_when_team_has_no_coach():
+    repository = CoachAssignmentRepository(coach_id=None)
+    service = TeamSyncService(
+        cache_service=RecordingCacheService(),
+        team_repository=repository,
+        coach_sync_service=CoachAssignmentSyncService({"id": 129, "name": "Coach B"}),
+    )
+    service.coach_sync_service.provider.get_team_coach_selection = lambda team_id: _async_selection("AMBIGUOUS", {"id": 129, "name": "Coach B"})
+
+    result = asyncio.run(service.sync_team_coach(ExecuteTrackingDB(), 101))
+
+    assert result["reason"] == "ambiguous"
+    assert result["coach_id"] is None
+    assert repository.updated == []
+
+
+async def _async_selection(status, coach):
+    return {"status": status, "coach": coach}
+
+
+def test_sync_team_coach_blocks_no_data_and_invalid_replacement():
+    for selection_status in ("NO_DATA", "INVALID"):
+        repository = CoachAssignmentRepository(coach_id=7)
+        coach_sync = CoachAssignmentSyncService({"id": 129, "name": "Coach B"})
+        coach_sync.provider.selection = {"status": selection_status, "coach": None}
+        service = TeamSyncService(
+            cache_service=RecordingCacheService(),
+            team_repository=repository,
+            coach_sync_service=coach_sync,
+        )
+
+        result = asyncio.run(service.sync_team_coach(ExecuteTrackingDB(), 101))
+
+        expected_reason = "coach_unavailable" if selection_status == "NO_DATA" else "invalid"
+        assert result["reason"] == expected_reason
+        assert result["coach_id"] == 7
+        assert repository.updated == []
+
+
+def test_team_repository_ignores_none_current_coach_update():
+    repository = TeamRepository()
+    db = ExecuteTrackingDB()
+
+    asyncio.run(repository.update_current_coach(db, 101, None))
+
+    assert db.execute_calls == []
+    assert db.flush_calls == 0

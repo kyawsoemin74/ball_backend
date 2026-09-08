@@ -5,7 +5,7 @@ from app.db import Base
 class MatchLineup(Base):
     __tablename__ = "match_lineups"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     # fixture_id from API-Sports
     match_id = Column(Integer, ForeignKey("matches.fixture_id"), unique=True, index=True, nullable=False)
     data = Column(JSON, nullable=False)  # Stores the full response from the API

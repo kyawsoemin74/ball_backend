@@ -1,5 +1,6 @@
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
+from app.api.deps import current_active_admin
 from app.schemas.upload import NewsUploadResponse
 from app.services.upload import upload_news_image
 
@@ -7,7 +8,10 @@ router = APIRouter(prefix="/uploads", tags=["uploads"])
 
 
 @router.post("/news", response_model=NewsUploadResponse)
-async def upload_news_image_endpoint(file: UploadFile = File(...)):
+async def upload_news_image_endpoint(
+    file: UploadFile = File(...),
+    _admin=Depends(current_active_admin),
+):
     """Upload a news image to the shared uploads directory and return a public URL."""
     try:
         image_url = await upload_news_image(file)

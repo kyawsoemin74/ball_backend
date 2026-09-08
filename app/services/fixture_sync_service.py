@@ -16,16 +16,19 @@ from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.league_repository import LeagueRepository
 from app.repositories.match_repository import MatchRepository
 from app.repositories.final_lineup_finalization_repository import FinalLineupFinalizationRepository
+from app.repositories.final_lineup_finalization_repository import FINAL_LINEUP_MAX_ATTEMPTS
 from app.schemas.match import MatchCreate
 from app.services.active_match_service import active_match_service
 from app.services.base.football_client import FootballAPIClient
 from app.services.cache_service import CacheService
+from app.services.league_season_sync_service import LeagueSeasonSyncService
 from app.services.standing_service import StandingService
 from app.services.team_service import TeamService
 from app.services.team_sync_service import TeamSyncService
 from app.services.venue_sync_service import VenueSyncService
 from app.services.referee_sync_service import RefereeSyncService
 from app.services.resource_lock import run_with_resource_lock
+from app.monitoring import FINALIZATION_TOTAL, observe_sync
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +63,7 @@ class FixtureSyncService:
         self.team_sync_service = getattr(team_service, "team_sync_service", None) or TeamSyncService(self.cache_service)
         self.venue_sync_service = VenueSyncService()
         self.referee_sync_service = referee_sync_service or RefereeSyncService()
+        self.league_season_sync_service = LeagueSeasonSyncService()
 
     @staticmethod
     async def _begin_fixture_savepoint(db):
@@ -136,6 +140,10 @@ class FixtureSyncService:
             await active_match_service.remove_match_active(match_id)
         except Exception as exc:
             logger.warning("ACTIVE_MATCH_SYNC_SIDE_EFFECT_FAILED match_id=%s status=%s error=%s", match_id, status, exc)
+
+    async def apply_active_match_updates(self, updates: dict[int, str | None] | None) -> None:
+        for match_id, status in (updates or {}).items():
+            await self._sync_active_match_registration(int(match_id), status)
 
     async def _finalize_terminal_match_events(self, db: AsyncSession, match_id: int, status: str | None) -> bool:
         normalized_status = str(status or "").upper()
@@ -347,6 +355,7 @@ class FixtureSyncService:
             "failed": 0,
             "standings_prewarm_candidates": 0,
             "final_lineup_candidates": [],
+            "active_match_updates": {},
         }
         prewarm_candidates: set[tuple[int, int]] = set()
         for fixture_raw, master_league_id in filtered_fixtures:
@@ -359,6 +368,14 @@ class FixtureSyncService:
                     logger.warning("Fixture ID %s failed parsing.", fixture_id)
                     await self._release_fixture_savepoint(fixture_savepoint)
                     continue
+
+                if match.season is not None and getattr(db, "sync_session", None) is not None:
+                    await self.league_season_sync_service.upsert_season(
+                        db,
+                        league_id=int(match.league_id),
+                        season=int(match.season),
+                        provider="api-football",
+                    )
 
                 referee_id = None
                 referee_source = (fixture_raw.get("fixture") or {}).get("referee")
@@ -501,7 +518,10 @@ class FixtureSyncService:
                         result["final_lineup_candidates"].append(match.match_id)
 
                 if finalization_completed or normalized_status not in FINALIZATION_TERMINAL_STATUSES:
-                    await self._sync_active_match_registration(match.match_id, match.status)
+                    if getattr(self, "_defer_live_cache_invalidation", False):
+                        result["active_match_updates"][match.match_id] = match.status
+                    else:
+                        await self._sync_active_match_registration(match.match_id, match.status)
 
                 result["inserted"] += inserted
                 result["updated"] += updated
@@ -545,6 +565,7 @@ class FixtureSyncService:
 
             if not locked:
                 metrics["skipped"] += 1
+                FINALIZATION_TOTAL.labels("skipped", "lock_conflict").inc()
                 logger.info("FINAL_LINEUP_SKIPPED match_id=%s reason=lock_not_acquired", match_id)
                 continue
 
@@ -552,11 +573,17 @@ class FixtureSyncService:
             if state == "success":
                 metrics["attempted"] += 1
                 metrics["succeeded"] += 1
+                FINALIZATION_TOTAL.labels("success", "none").inc()
             elif state == "skipped":
                 metrics["skipped"] += 1
+                FINALIZATION_TOTAL.labels("skipped", "already_complete").inc()
             else:
                 metrics["attempted"] += 1
                 metrics["failed"] += 1
+                FINALIZATION_TOTAL.labels(
+                    "failure",
+                    str(outcome.get("failure_category", "DB_FAILURE"))[:64] if isinstance(outcome, dict) else "DB_FAILURE",
+                ).inc()
                 try:
                     commit_confirmed = await self._persist_final_lineup_failure(
                         match_id,
@@ -564,6 +591,7 @@ class FixtureSyncService:
                         outcome.get("failure_reason", "final lineup sync failed"),
                         outcome.get("attempted_at"),
                         outcome.get("provider_attempted", False),
+                        outcome.get("diagnostics"),
                         verify_commit=state == "commit_unknown",
                     )
                     if commit_confirmed:
@@ -604,6 +632,7 @@ class FixtureSyncService:
                     "state": "failure",
                     "failure_category": self._final_lineup_failure_category(result),
                     "failure_reason": result.get("reason", "final lineup sync failed"),
+                    "diagnostics": result.get("diagnostics", []),
                     "attempted_at": attempted_at,
                     "provider_attempted": provider_attempted,
                 }
@@ -647,6 +676,7 @@ class FixtureSyncService:
         failure_reason: str,
         attempted_at: datetime | None,
         provider_attempted: bool,
+        diagnostics: list[dict] | None = None,
         verify_commit: bool = False,
     ) -> bool:
         async with async_session() as db:
@@ -661,6 +691,7 @@ class FixtureSyncService:
                     failure_reason,
                     attempted_at or datetime.now(timezone.utc),
                     provider_attempted,
+                    diagnostics or [],
                     verify_commit,
                 ),
             )
@@ -684,24 +715,38 @@ class FixtureSyncService:
         failure_reason: str,
         attempted_at: datetime,
         provider_attempted: bool,
+        diagnostics: list[dict],
         verify_commit: bool,
     ) -> str | None:
         record = await self.final_lineup_finalization_repository.get_by_match_id(db, match_id)
         if record is None:
             return None
-        if record.status == "SUCCESS":
+        if record.status in {"SUCCESS", "TERMINAL"}:
             return "success" if verify_commit else None
+        record.attempt_count += 1
         if verify_commit:
             logger.warning("FINAL_LINEUP_COMMIT_NOT_CONFIRMED match_id=%s", match_id)
-        if provider_attempted:
-            await self.final_lineup_finalization_repository.mark_attempt_started(db, record, attempted_at)
-        await self.final_lineup_finalization_repository.mark_retryable(
-            db,
-            record,
-            failure_category,
-            failure_reason,
-            attempted_at,
-        )
+        terminal_categories = {
+            "MASTER_RESOLUTION_FAILURE",
+            "IDENTITY_BOUNDARY_VIOLATION",
+        }
+        if failure_category in terminal_categories or record.attempt_count >= FINAL_LINEUP_MAX_ATTEMPTS:
+            if record.attempt_count >= FINAL_LINEUP_MAX_ATTEMPTS and failure_category not in terminal_categories:
+                failure_category = "MAX_RETRY_ATTEMPTS_EXCEEDED"
+                failure_reason = "maximum automatic lineup attempts exceeded"
+            await self.final_lineup_finalization_repository.mark_terminal(
+                db, record, failure_category, failure_reason, attempted_at, diagnostics
+            )
+        else:
+            if diagnostics:
+                await self.final_lineup_finalization_repository.mark_retryable(
+                    db, record, failure_category, failure_reason, attempted_at,
+                    failure_diagnostics=diagnostics,
+                )
+            else:
+                await self.final_lineup_finalization_repository.mark_retryable(
+                    db, record, failure_category, failure_reason, attempted_at,
+                )
         await db.commit()
         logger.warning(
             "FINAL_LINEUP_FAILURE match_id=%s category=%s reason=%s",
@@ -712,6 +757,14 @@ class FixtureSyncService:
 
     @staticmethod
     def _final_lineup_failure_category(result: dict) -> str:
+        if result.get("failure_classification") in {
+            "MISSING",
+            "INVALID",
+            "AMBIGUOUS",
+            "TEAM_CONFLICT",
+            "PERMANENT_IDENTITY_FAILURE",
+        }:
+            return "MASTER_RESOLUTION_FAILURE"
         reason = str(result.get("reason", ""))
         if reason == "lineup_not_available":
             return "INVALID_RESPONSE"
@@ -740,6 +793,7 @@ class FixtureSyncService:
         result, _ = await self._process_sync_with_candidates(db, fixtures)
         return result
 
+    @observe_sync("fixture")
     async def sync_full_season(self, db: AsyncSession, league: int, season: int) -> dict:
         allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
         if league not in allowed_ids:
@@ -760,6 +814,7 @@ class FixtureSyncService:
         finally:
             self._defer_live_cache_invalidation = False
 
+    @observe_sync("fixture")
     async def sync_daily_fixtures(self, db: AsyncSession, target_date: str) -> dict:
         result = await self.fixture_provider.get_fixtures_by_date(target_date=target_date)
         if not result or "response" not in result:
@@ -804,6 +859,7 @@ class FixtureSyncService:
 
         return sync_result
 
+    @observe_sync("fixture")
     async def sync_live_matches(self, db: AsyncSession) -> dict:
         result = await self.fixture_provider.get_live_fixtures()
         if not result or "response" not in result:

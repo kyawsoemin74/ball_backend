@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -167,3 +167,26 @@ class LeagueRepository:
         if league is None:
             raise RuntimeError(f"League upsert failed for league_id={row['league_id']}")
         return league
+
+    async def update_country_id(
+        self,
+        db: AsyncSession,
+        league_id: int,
+        country_id: int | None,
+    ) -> None:
+        stmt = update(League).where(League.league_id == league_id).values(country_id=country_id)
+        await db.execute(stmt)
+
+    async def update_provider_identity(
+        self,
+        db: AsyncSession,
+        league_id: int,
+        provider: str,
+        provider_id: str | int,
+    ) -> None:
+        stmt = (
+            update(League)
+            .where(League.league_id == league_id)
+            .values(provider=provider, provider_id=str(provider_id))
+        )
+        await db.execute(stmt)

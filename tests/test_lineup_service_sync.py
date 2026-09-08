@@ -6,7 +6,31 @@ import pytest
 
 from app.core.config import settings
 from app.models.match_lineup import MatchLineup
-from app.services.lineup_service import LineupService, make_lineup_cache_key
+from app.services.lineup_service import LineupService as RealLineupService, make_lineup_cache_key
+from app.services.player_identity_resolution_service import PlayerReadiness
+
+
+class FakeIdentityResolver:
+    async def resolve_lineup(self, db, payload):
+        canonical = []
+        results = []
+        for lineup in payload:
+            canonical_lineup = dict(lineup)
+            for section in ("startXI", "substitutes"):
+                entries = []
+                for position, entry in enumerate(lineup.get(section, []), start=1):
+                    player = dict(entry["player"])
+                    player["player_id"] = int(player["id"]) + 1000
+                    entries.append({**entry, "player": player})
+                    results.append(PlayerReadiness("READY", player["player_id"], "api-football", str(player["id"]), lineup["team"]["id"], player.get("name")))
+                canonical_lineup[section] = entries
+            canonical.append(canonical_lineup)
+        return results, canonical
+
+
+def LineupService(*args, **kwargs):
+    kwargs.setdefault("player_identity_resolution_service", FakeIdentityResolver())
+    return RealLineupService(*args, **kwargs)
 
 
 class FakeClient:

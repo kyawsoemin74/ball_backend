@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.providers.statistics_provider import StatisticsProvider
 from app.repositories.statistics_repository import StatisticsRepository
 from app.services.analytics_projection_service import AnalyticsProjectionService, log_projection_failure
+from app.monitoring import observe_sync
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ class StatisticsSyncService:
         self.statistics_repository = statistics_repository or StatisticsRepository()
         self.analytics_projection_service = analytics_projection_service or AnalyticsProjectionService()
 
+    @observe_sync("statistics")
     async def sync_match_statistics(self, db: AsyncSession, match_id: int) -> Dict[str, Any]:
         logger.info("STATISTICS_SYNC_START", extra={"match_id": match_id})
 

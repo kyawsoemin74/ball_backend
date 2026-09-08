@@ -1,7 +1,9 @@
 import asyncio
+from types import SimpleNamespace
 
 from app.models.country import Country
 from app.repositories.country_repository import CountryRepository
+from app.services.league_sync_service import LeagueSyncService
 
 
 class FakeCountryResult:
@@ -49,5 +51,49 @@ def test_country_repository_upserts_country_record():
         assert isinstance(country, Country)
         assert country.name == "Myanmar"
         assert country.code == "MM"
+
+    asyncio.run(run())
+
+
+def test_country_sync_updates_league_country_id():
+    class FakeCountrySyncService:
+        async def sync_from_league_payload(self, db, league_data):
+            return {"status": "created", "country": {"country_id": 42, "name": "England"}}
+
+    class FakeLeagueRepository:
+        def __init__(self):
+            self.calls = []
+
+        async def find_by_provider_identity(self, db, provider, provider_id):
+            return SimpleNamespace(league_id=1, provider=provider, provider_id=str(provider_id), name="Premier League")
+
+        async def update_country_id(self, db, league_id, country_id):
+            self.calls.append((league_id, country_id))
+
+    class FakeAllowedLeagueRepository:
+        async def get_allowed_ids(self, db):
+            return {1}
+
+    class FakeCacheService:
+        def delete_sync(self, *args, **kwargs):
+            return None
+
+    async def run():
+        fake_repository = FakeLeagueRepository()
+        service = LeagueSyncService(
+            cache_service=FakeCacheService(),
+            league_repository=fake_repository,
+            allowed_league_repository=FakeAllowedLeagueRepository(),
+            fetch_all_leagues=None,
+        )
+        service.country_sync_service = FakeCountrySyncService()
+
+        await service._upsert_league(
+            db=SimpleNamespace(),
+            league_data={"league": {"id": 100, "name": "Premier League", "country": "England"}},
+            master=SimpleNamespace(league_id=1, provider="api-football", provider_id="100", name="Premier League"),
+        )
+
+        assert fake_repository.calls == [(1, 42)]
 
     asyncio.run(run())

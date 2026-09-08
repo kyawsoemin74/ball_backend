@@ -15,10 +15,15 @@ spec:
       labels:
         app: fover-backend
     spec:
+      restartPolicy: Always
       containers:
         - name: api
           image: ghcr.io/your-org/fover-backend:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
           ports:
             - containerPort: 8000
               name: http
@@ -48,6 +53,14 @@ spec:
                 secretKeyRef:
                   name: fover-backend-secrets
                   key: API_KEY
+            - name: SCHEDULER_ENABLED
+              value: "false"
+            - name: APP_ENV
+              value: "production"
+            - name: ENABLE_API_DOCS
+              value: "false"
+            - name: ENABLE_API_METRICS
+              value: "false"
           readinessProbe:
             httpGet:
               path: /health/ready

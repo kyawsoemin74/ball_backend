@@ -208,6 +208,78 @@
       ],
       "title": "Scheduler Status & Job Health",
       "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "id": 7,
+      "targets": [
+        {
+          "expr": "sum(rate(fover_sync_total{status=\"failure\"}[5m])) by (operation, failure_category)",
+          "legendFormat": "{{operation}} {{failure_category}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(fover_sync_retries_total[5m])) by (operation)",
+          "legendFormat": "Retries {{operation}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(fover_finalization_total{status=\"failure\"}[5m])) by (failure_category)",
+          "legendFormat": "Finalization {{failure_category}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Sync Failures & Retries",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "id": 8,
+      "targets": [
+        {
+          "expr": "fover_postgres_up",
+          "legendFormat": "PostgreSQL",
+          "refId": "A"
+        },
+        {
+          "expr": "fover_redis_up",
+          "legendFormat": "Redis",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(fover_provider_requests_total{status!=\"success\"}[5m])) by (path, status)",
+          "legendFormat": "Provider {{path}} {{status}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Dependencies & Provider Health",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",

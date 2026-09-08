@@ -44,7 +44,7 @@ async def refresh_token(refresh_token: str, db: AsyncSession = Depends(get_db)):
     username = payload["sub"]
     result = await db.execute(select(User).where(User.username == username))
     user = result.scalar_one_or_none()
-    if not user:
+    if not user or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate refresh token",

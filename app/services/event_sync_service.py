@@ -7,6 +7,7 @@ from app.providers.event_provider import EventProvider
 from app.repositories.event_repository import EventRepository
 from app.repositories.player_repository import PlayerRepository
 from app.services.player_sync_service import PlayerSyncService
+from app.monitoring import observe_sync
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ class EventSyncService:
         assist_id, provider_assist_id = await self._resolve_provider_player(db, assist_payload)
         return player_id, provider_player_id, assist_id, provider_assist_id
 
+    @observe_sync("events")
     async def refresh_match_events(self, db: AsyncSession, match_id: int) -> Dict[str, Any]:
         logger.info("FINAL_EVENT_SYNC_START", extra={"match_id": match_id})
 

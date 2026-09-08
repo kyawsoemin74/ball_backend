@@ -184,6 +184,7 @@ class LiveUpdateScheduler:
                             result = await football_service.sync_live_matches(db)
                             if result.get("success"):
                                 await db.commit()
+                                await football_service.apply_active_match_updates(result.get("active_match_updates"))
                                 try:
                                     await self.cache_service.delete(make_cache_key("live_matches"))
                                 except Exception:
@@ -236,6 +237,7 @@ class LiveUpdateScheduler:
                             result = await football_service.sync_daily_fixtures(db, today)
                             if result.get("success"):
                                 await db.commit()
+                                await football_service.apply_active_match_updates(result.get("active_match_updates"))
                                 try:
                                     await self.cache_service.delete(make_cache_key("live_matches"))
                                 except Exception:
@@ -287,6 +289,7 @@ class LiveUpdateScheduler:
                             result_yesterday = await football_service.sync_daily_fixtures(db, yesterday_str)
                             if result_yesterday.get("success"):
                                 await db.commit()
+                                await football_service.apply_active_match_updates(result_yesterday.get("active_match_updates"))
                                 try:
                                     await self.cache_service.delete(make_cache_key("live_matches"))
                                 except Exception:
@@ -302,6 +305,7 @@ class LiveUpdateScheduler:
                             result_today = await football_service.sync_daily_fixtures(db, today_str)
                             if result_today.get("success"):
                                 await db.commit()
+                                await football_service.apply_active_match_updates(result_today.get("active_match_updates"))
                                 try:
                                     await self.cache_service.delete(make_cache_key("live_matches"))
                                 except Exception:

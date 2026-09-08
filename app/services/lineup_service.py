@@ -12,6 +12,7 @@ from app.providers.lineup_provider import LineupProvider
 from app.services.base.football_client import FootballAPIClient
 from app.services.cache_service import CacheService
 from app.services.lineup_sync_service import LineupSyncService
+from app.services.player_identity_resolution_service import PlayerIdentityResolutionService
 from app.services.team_service import TeamService
 
 logger = logging.getLogger(__name__)
@@ -29,11 +30,15 @@ class LineupService:
         lineup_provider: LineupProvider | None = None,
         lineup_sync_service: LineupSyncService | None = None,
         team_service: TeamService | None = None,
+        player_identity_resolution_service: PlayerIdentityResolutionService | None = None,
     ) -> None:
         self.client = client
         self.cache_service = cache_service or CacheService()
         self.lineup_provider = lineup_provider or LineupProvider(client)
-        self.lineup_sync_service = lineup_sync_service or LineupSyncService(lineup_provider=self.lineup_provider)
+        self.lineup_sync_service = lineup_sync_service or LineupSyncService(
+            lineup_provider=self.lineup_provider,
+            player_identity_resolution_service=player_identity_resolution_service,
+        )
         self.team_service = team_service or TeamService(client=client, cache_service=self.cache_service)
 
     def _is_valid_lineup_response(self, lineup_data: Any) -> bool:

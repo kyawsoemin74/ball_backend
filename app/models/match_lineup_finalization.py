@@ -1,4 +1,4 @@
-from sqlalchemy import CheckConstraint, Column, DateTime, ForeignKey, Index, Integer, String
+from sqlalchemy import CheckConstraint, Column, DateTime, ForeignKey, Index, Integer, JSON, String
 from sqlalchemy.sql import func
 
 from app.db import Base
@@ -9,7 +9,7 @@ class MatchLineupFinalization(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('REQUIRED', 'RETRYABLE', 'SUCCESS')",
+            "status IN ('REQUIRED', 'RUNNING', 'RETRYABLE', 'TERMINAL', 'SUCCESS')",
             name="ck_match_lineup_finalization_status",
         ),
         CheckConstraint(
@@ -20,17 +20,17 @@ class MatchLineupFinalization(Base):
             "failure_category IS NULL OR failure_category IN "
             "('PROVIDER_FAILURE', 'INVALID_RESPONSE', 'MASTER_RESOLUTION_FAILURE', "
             "'ANALYTICS_FAILURE', 'DB_FAILURE', 'FLUSH_FAILURE', 'COMMIT_FAILURE', "
-            "'LOCK_CONFLICT')",
+            "'LOCK_CONFLICT', 'SYNC_UNAVAILABLE', 'IDENTITY_BOUNDARY_VIOLATION', 'MAX_RETRY_ATTEMPTS_EXCEEDED')",
             name="ck_match_lineup_finalization_failure_category",
         ),
         CheckConstraint(
-            "status <> 'RETRYABLE' OR failure_category IS NOT NULL",
+            "status NOT IN ('RETRYABLE', 'TERMINAL') OR failure_category IS NOT NULL",
             name="ck_match_lineup_finalization_retryable_failure",
         ),
         CheckConstraint(
             "(status = 'SUCCESS' AND completed_at IS NOT NULL AND failure_category IS NULL "
             "AND failure_reason IS NULL) OR "
-            "(status IN ('REQUIRED', 'RETRYABLE') AND completed_at IS NULL)",
+            "(status IN ('REQUIRED', 'RUNNING', 'RETRYABLE', 'TERMINAL') AND completed_at IS NULL)",
             name="ck_match_lineup_finalization_state",
         ),
         Index(
@@ -54,5 +54,6 @@ class MatchLineupFinalization(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
     failure_category = Column(String(40), nullable=True)
     failure_reason = Column(String(500), nullable=True)
+    failure_diagnostics = Column(JSON, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())

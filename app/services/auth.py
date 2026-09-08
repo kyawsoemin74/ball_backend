@@ -33,8 +33,7 @@ class AuthService:
         )
 
     async def register_user(self, db: AsyncSession, user_in: UserCreate) -> User:
-        # Temporarily force admin role for all new registrations
-        role = "admin"
+        role = "user"
 
         result = await db.execute(
             select(User).where(

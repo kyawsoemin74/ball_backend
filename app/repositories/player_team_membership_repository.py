@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.player_team_membership import PlayerTeamMembership
@@ -64,3 +64,22 @@ class PlayerTeamMembershipRepository:
             membership.source = "squad"
         await db.flush()
         return membership
+
+    async def close_other_current_memberships(
+        self,
+        db: AsyncSession,
+        *,
+        player_id: int,
+        team_id: int,
+        provider: str,
+    ) -> None:
+        await db.execute(
+            update(PlayerTeamMembership)
+            .where(
+                PlayerTeamMembership.player_id == player_id,
+                PlayerTeamMembership.team_id != team_id,
+                PlayerTeamMembership.provider == provider,
+                PlayerTeamMembership.is_current.is_(True),
+            )
+            .values(is_current=False, valid_to=func.now(), updated_at=func.now())
+        )

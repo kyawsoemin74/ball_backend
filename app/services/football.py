@@ -169,6 +169,9 @@ class FootballAPIService:
     async def sync_live_matches(self, db: AsyncSession) -> dict:
         return await self.fixture_sync_service.sync_live_matches(db)
 
+    async def apply_active_match_updates(self, updates: dict[int, str | None] | None) -> None:
+        await self.fixture_sync_service.apply_active_match_updates(updates)
+
     async def finalize_pending_lineups(self, match_ids: list[int] | None = None) -> dict[str, int]:
         return await self.fixture_sync_service.finalize_pending_lineups(match_ids)
 

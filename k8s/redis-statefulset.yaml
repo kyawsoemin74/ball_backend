@@ -11,7 +11,6 @@ spec:
       targetPort: 6379
       protocol: TCP
       name: redis
-  clusterIP: None
   selector:
     app: redis
 ---
@@ -24,7 +23,7 @@ metadata:
     app: redis
 spec:
   serviceName: redis
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       app: redis
@@ -40,6 +39,9 @@ spec:
             - containerPort: 6379
               name: redis
           command: ["redis-server", "--appendonly", "yes", "--save", "900", "1", "--save", "300", "10", "--requirepass", ""]
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
           readinessProbe:
             tcpSocket:
               port: 6379
@@ -61,3 +63,11 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

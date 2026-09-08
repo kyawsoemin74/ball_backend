@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     """
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
+    APP_ENV: str = "development"
+    CORS_ORIGINS: str = "http://localhost:3000"
+    ENABLE_API_DOCS: bool = True
+    ENABLE_API_METRICS: bool = True
+
     # API-Football settings (assuming these are also in your .env)
     FOOTBALL_API_BASE_URL: str = "https://v3.football.api-sports.io"
     FOOTBALL_API_KEY: str
@@ -39,4 +44,20 @@ class Settings(BaseSettings):
     # Upload settings for admin and public image storage
     NEWS_UPLOAD_DIR: str = "/var/www/fover/uploads/news"
     NEWS_UPLOAD_PUBLIC_URL: str = "https://kyawsoemin.com/uploads/news/"
+
+    def validate_production_secrets(self) -> None:
+        if self.APP_ENV.lower() not in {"production", "prod"}:
+            return
+        weak_values = {
+            "secret",
+            "changeme",
+            "default-secret",
+            "test-secret",
+            "development-secret",
+            "your_random_jwt_secret",
+        }
+        if not self.JWT_SECRET_KEY or self.JWT_SECRET_KEY.lower() in weak_values or len(self.JWT_SECRET_KEY) < 32:
+            raise ValueError("JWT_SECRET_KEY must be a strong production secret.")
+
 settings = Settings()
+settings.validate_production_secrets()

@@ -39,6 +39,7 @@ from app.models import (
     MatchStatistics,
     LineupRefreshState,
     MatchLineupFinalization,
+    AllowedLeague,
 )
 
 from sqlalchemy import engine_from_config, pool, MetaData

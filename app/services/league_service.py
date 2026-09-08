@@ -10,6 +10,7 @@ from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.league_repository import LeagueRepository
 from app.services.base.football_client import FootballAPIClient
 from app.services.cache_service import CacheService
+from app.services.country_sync_service import CountrySyncService
 from app.services.league_sync_service import LeagueSyncService
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ class LeagueService:
         self.cache_service = cache_service or CacheService()
         self._league_repository = LeagueRepository()
         self._allowed_league_repository = AllowedLeagueRepository()
+        self.country_sync_service = CountrySyncService()
         self.league_sync_service = league_sync_service or LeagueSyncService(
             cache_service=self.cache_service,
             league_repository=self._league_repository,
@@ -253,6 +255,17 @@ class LeagueService:
             country = country_payload or league_payload.get("country")
             country_code = league_payload.get("country_code")
 
+        country_result = await self.country_sync_service.sync_country(
+            db,
+            {
+                "name": country,
+                "code": country_code,
+            },
+            source="league_registration",
+        ) if country else {"country": None}
+        country_record = country_result.get("country") if isinstance(country_result, dict) else None
+        country_id = country_record.get("country_id") if isinstance(country_record, dict) else None
+
         row = {
             "league_id": provider_id,
             "provider": provider,
@@ -263,7 +276,7 @@ class LeagueService:
             "logo": league_payload.get("logo"),
             "type": league_payload.get("type"),
             "national": league_payload.get("national"),
-            "country_id": None,
+            "country_id": country_id,
             "season": None,
             "is_featured": False,
             "display_order": 999,

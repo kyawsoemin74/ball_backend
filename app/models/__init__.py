@@ -25,5 +25,6 @@ from app.models.analytics import (
 )
 from app.models.ad import Ad
 from app.models.ad_config import AdConfig
+from app.models.allowed_league import AllowedLeague
 from app.models.news import News
 from app.models.user import User

@@ -16,7 +16,6 @@ from app.repositories.analytics_repository import (
     AnalyticsStatisticsRepository,
 )
 from app.repositories.league_season_repository import LeagueSeasonRepository
-from app.repositories.player_repository import PlayerRepository
 from app.repositories.team_repository import TeamRepository
 
 logger = logging.getLogger(__name__)
@@ -105,7 +104,6 @@ class AnalyticsProjectionService:
 
     def __init__(self, *, team_repository=None, player_repository=None, league_season_repository=None):
         self.team_repository = team_repository or TeamRepository()
-        self.player_repository = player_repository or PlayerRepository()
         self.league_season_repository = league_season_repository or LeagueSeasonRepository()
         self.statistics_repository = AnalyticsStatisticsRepository()
         self.standing_repository = AnalyticsStandingRepository()
@@ -287,17 +285,14 @@ class AnalyticsProjectionService:
                     raise ValueError("invalid lineup section")
                 for entry in players:
                     player_data = entry.get("player") if isinstance(entry, dict) else None
-                    provider_player_id = player_data.get("id") if isinstance(player_data, dict) else None
-                    if provider_player_id is None:
-                        raise ValueError("unresolved Player identity in lineup")
-                    player = await self.player_repository.get_by_provider_id(db, str(provider_player_id))
-                    if player is None:
-                        raise ValueError("unresolved Player identity in lineup")
-                    key = (int(team.team_id), int(player.player_id), role)
+                    player_id = player_data.get("player_id") if isinstance(player_data, dict) else None
+                    if player_id is None:
+                        raise ValueError("IDENTITY_BOUNDARY_VIOLATION: unresolved Player canonical player_id is required")
+                    key = (int(team.team_id), int(player_id), role)
                     if key in seen:
                         return self._result(scope, len(projected) + 1, 0, [], duplicate_count=1, reason="duplicate_source_rejected")
                     seen.add(key)
-                    projected.append({"team_id": key[0], "player_id": key[1], "provider_team_id": str(provider_team_id), "provider_player_id": str(provider_player_id), "roster_role": role, "shirt_number": player_data.get("number"), "position": player_data.get("pos"), "grid": player_data.get("grid"), "formation": lineup.get("formation"), "source_provider": "api-football"})
+                    projected.append({"team_id": key[0], "player_id": key[1], "provider_team_id": str(provider_team_id), "provider_player_id": str(player_data.get("id")), "roster_role": role, "shirt_number": player_data.get("number"), "position": player_data.get("pos"), "grid": player_data.get("grid"), "formation": lineup.get("formation"), "source_provider": "api-football"})
         if not projected:
             existing = await self.lineup_repository.list_by_match(db, match_id)
             return self._result(scope, 0, 0, existing, reason="empty_preserved")

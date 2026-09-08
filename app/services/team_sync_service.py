@@ -130,6 +130,39 @@ class TeamSyncService:
         team = await self.team_repository.find_by_provider_identity(db, "api-football", provider_id)
         if team is None:
             return None
+
+        venue_payload = team_data.get("venue") or {}
+        update_provider_metadata = getattr(self.team_repository, "update_provider_metadata", None)
+        if update_provider_metadata is not None:
+            await update_provider_metadata(
+                db,
+                team.team_id,
+                name=team_payload.get("name") or getattr(team, "name", None),
+                country=team_payload.get("country") or getattr(team, "country", None),
+                logo=team_payload.get("logo") or getattr(team, "logo", None),
+                stadium=venue_payload.get("name") or getattr(team, "stadium", None),
+                founded=team_payload.get("founded") or getattr(team, "founded", None),
+            )
+            team.name = team_payload.get("name") or team.name
+            team.country = team_payload.get("country") or getattr(team, "country", None)
+            team.logo = team_payload.get("logo") or getattr(team, "logo", None)
+            team.stadium = venue_payload.get("name") or getattr(team, "stadium", None)
+            team.founded = team_payload.get("founded") or getattr(team, "founded", None)
+
+        country_result = await self.country_sync_service.sync_from_team_payload(db, team_data)
+        country = country_result.get("country") if isinstance(country_result, dict) else None
+        if isinstance(country, dict) and country.get("country_id") is not None:
+            normalized_country_id = int(country["country_id"])
+            if getattr(team, "country_id", None) != normalized_country_id:
+                update_country_id = getattr(self.team_repository, "update_country_id", None)
+                if update_country_id is not None:
+                    await update_country_id(
+                        db,
+                        team.team_id,
+                        normalized_country_id,
+                    )
+                team.country_id = normalized_country_id
+
         return team
 
     async def sync_team_coach(self, db: AsyncSession, team_id: int) -> dict:
@@ -137,7 +170,28 @@ class TeamSyncService:
         if team is None or getattr(team, "provider_id", None) is None:
             return {"success": True, "team_id": team_id, "coach_id": None, "updated": False, "reason": "unresolved_team"}
 
-        payload = await self.coach_sync_service.provider.get_team_coach(int(team.provider_id))
+        selection_method = getattr(self.coach_sync_service.provider, "get_team_coach_selection", None)
+        if selection_method is None:
+            return {"success": True, "team_id": team_id, "coach_id": None, "updated": False, "reason": "invalid_selection_contract"}
+
+        selection = await selection_method(int(team.provider_id))
+        if not isinstance(selection, dict):
+            return {"success": True, "team_id": team_id, "coach_id": None, "updated": False, "reason": "invalid_selection"}
+
+        selection_status = selection.get("status")
+        payload = selection.get("coach")
+        if selection_status != "VERIFIED":
+            if isinstance(payload, dict):
+                await self.coach_sync_service.sync_team_coach(db, payload)
+            reason = "coach_unavailable" if selection_status == "NO_DATA" else str(selection_status or "invalid_selection").lower()
+            return {
+                "success": True,
+                "team_id": team_id,
+                "coach_id": getattr(team, "coach_id", None),
+                "updated": False,
+                "reason": reason,
+            }
+
         if not isinstance(payload, dict):
             return {"success": True, "team_id": team_id, "coach_id": None, "updated": False, "reason": "coach_unavailable"}
 

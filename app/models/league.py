@@ -10,13 +10,15 @@ class League(Base):
     __table_args__ = (
         UniqueConstraint("provider", "provider_id", name="uq_leagues_provider_provider_id"),
         Index("ix_leagues_provider_id", "provider_id"),
+        Index("ix_leagues_is_featured", "is_featured"),
+        Index("ix_leagues_display_order", "display_order"),
     )
 
     # League Master Identity
-    league_id = Column(Integer, primary_key=True, index=True)
+    league_id = Column(Integer, primary_key=True)
     provider = Column(String(50), nullable=False, server_default='api-football')
     provider_id = Column(String(100), nullable=True, index=True)
-    name = Column(String(255), nullable=False, unique=True, index=True)
+    name = Column(String(255), nullable=False)
     logo = Column(String(500), nullable=True)
     type = Column(String(50), nullable=True)  # e.g., "domestic", "club", "international"
     national = Column(Boolean, nullable=True)  # is_national_team_league
@@ -30,7 +32,7 @@ class League(Base):
     display_order = Column(Integer, nullable=False, server_default='999')
     
     # Timestamps
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     # Relationships

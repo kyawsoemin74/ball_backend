@@ -215,7 +215,7 @@ def test_sync_daily_fixtures_continues_after_flush_failure():
     assert db.savepoint_commits == 1
 
 
-def test_sync_daily_fixtures_registers_live_matches_for_scheduler(monkeypatch):
+def test_sync_daily_fixtures_queues_live_match_registration_until_commit(monkeypatch):
     fixtures = [make_fixture(4001)]
     fixtures[0]["fixture"]["status"]["short"] = "1H"
     service = build_service(fixtures, FakeTeamService())
@@ -226,11 +226,12 @@ def test_sync_daily_fixtures_registers_live_matches_for_scheduler(monkeypatch):
     result = asyncio.run(service.sync_daily_fixtures(db, "2026-06-15"))
 
     assert result["success"] is True
-    assert fake_active_service.marked == [4001]
+    assert result["active_match_updates"] == {4001: "1H"}
+    assert fake_active_service.marked == []
     assert fake_active_service.removed == []
 
 
-def test_sync_daily_fixtures_removes_terminal_matches_from_scheduler(monkeypatch):
+def test_sync_daily_fixtures_queues_terminal_match_cleanup_until_commit(monkeypatch):
     fixtures = [make_fixture(5001)]
     fixtures[0]["fixture"]["status"]["short"] = "FT"
     service = build_service(fixtures, FakeTeamService())
@@ -242,7 +243,8 @@ def test_sync_daily_fixtures_removes_terminal_matches_from_scheduler(monkeypatch
 
     assert result["success"] is True
     assert fake_active_service.marked == []
-    assert fake_active_service.removed == [5001]
+    assert result["active_match_updates"] == {5001: "FT"}
+    assert fake_active_service.removed == []
 
 
 def test_sync_daily_fixtures_skips_cleanup_when_finalization_fails(monkeypatch):

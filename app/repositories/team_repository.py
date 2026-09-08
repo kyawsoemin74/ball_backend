@@ -73,7 +73,38 @@ class TeamRepository:
         stmt = update(Team).where(Team.team_id == team_id).values(**values)
         await db.execute(stmt)
 
+    async def update_country_id(
+        self,
+        db: AsyncSession,
+        team_id: int,
+        country_id: int | None,
+    ) -> None:
+        stmt = update(Team).where(Team.team_id == team_id).values(country_id=country_id)
+        await db.execute(stmt)
+
+    async def update_provider_metadata(
+        self,
+        db: AsyncSession,
+        team_id: int,
+        *,
+        name: str | None = None,
+        country: str | None = None,
+        logo: str | None = None,
+        stadium: str | None = None,
+        founded: int | None = None,
+    ) -> None:
+        values = {
+            "name": name,
+            "country": country,
+            "logo": logo,
+            "stadium": stadium,
+            "founded": founded,
+        }
+        await db.execute(update(Team).where(Team.team_id == team_id).values(**values))
+
     async def update_current_coach(self, db: AsyncSession, team_id: int, coach_id: int | None) -> None:
+        if coach_id is None:
+            return
         await db.execute(
             update(Team)
             .where(Team.team_id == team_id)

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, Index, Integer, String, UniqueConstraint
+from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.sql import func
 from app.db import Base
 
@@ -9,10 +9,10 @@ class Standings(Base):
         UniqueConstraint("league_id", "season", "team_id", name="uq_standings_league_id_season_team_id"),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
-    league_id = Column(Integer, index=True, nullable=False)
+    id = Column(Integer, primary_key=True)
+    league_id = Column(Integer, ForeignKey("leagues.league_id", name="fk_standings_league_id_leagues"), nullable=False)
     season = Column(String(10), nullable=False)
-    team_id = Column(Integer, nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.team_id", name="fk_standings_team_id_teams"), nullable=False)
     team_name = Column(String(255), nullable=True)
     team_logo = Column(String(1024), nullable=True)
     group_name = Column(String(50), nullable=True)

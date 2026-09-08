@@ -481,6 +481,7 @@ async def sync_full_season(
                 await db.rollback()
                 return result
             await db.commit()
+            await football_service.apply_active_match_updates(result.get("active_match_updates"))
             try:
                 await CacheService().delete(make_cache_key("live_matches"))
             except Exception:
@@ -513,6 +514,7 @@ async def sync_daily_matches(
                 await db.rollback()
                 return result
             await db.commit()
+            await football_service.apply_active_match_updates(result.get("active_match_updates"))
             try:
                 await CacheService().delete(make_cache_key("live_matches"))
             except Exception:

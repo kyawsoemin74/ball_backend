@@ -8,6 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.providers.lineup_provider import LineupProvider
 from app.repositories.lineup_repository import LineupRepository
 from app.services.analytics_projection_service import AnalyticsProjectionService, log_projection_failure
+from app.services.player_identity_resolution_service import PlayerIdentityResolutionService
+from app.monitoring import observe_sync
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +45,14 @@ class LineupSyncService:
         lineup_provider: LineupProvider | None = None,
         lineup_repository: LineupRepository | None = None,
         analytics_projection_service: AnalyticsProjectionService | None = None,
+        player_identity_resolution_service: PlayerIdentityResolutionService | None = None,
     ) -> None:
         self.lineup_provider = lineup_provider
         self.lineup_repository = lineup_repository or LineupRepository()
         self.analytics_projection_service = analytics_projection_service or AnalyticsProjectionService()
+        self.player_identity_resolution_service = player_identity_resolution_service or PlayerIdentityResolutionService()
 
+    @observe_sync("lineup")
     async def sync_lineup(
         self,
         db: AsyncSession,
@@ -90,6 +95,31 @@ class LineupSyncService:
                 logger.warning("LINEUP_SYNC_FAILED", extra=_safe_lineup_log_extra(metrics))
                 logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
                 return metrics
+
+            readiness, canonical_lineup_data = await self.player_identity_resolution_service.resolve_lineup(db, lineup_data)
+            unresolved = [item.as_dict() for item in readiness if item.status != "READY"]
+            if unresolved:
+                failure = unresolved[0]
+                metrics = {
+                    "success": False,
+                    "match_id": match_id,
+                    "reason": "player_identity_resolution_failed",
+                    "failure_classification": failure["status"],
+                    "diagnostics": [
+                        {
+                            **item,
+                            "fixture_id": match_id,
+                            "provider_team_id": item.get("team_id"),
+                            "attempt_count": None,
+                        }
+                        for item in unresolved
+                    ],
+                }
+                log_projection_failure("lineup", {"match_id": match_id, "diagnostics": metrics["diagnostics"]}, failure["status"])
+                logger.warning("LINEUP_SYNC_FAILED", extra=_safe_lineup_log_extra(metrics))
+                logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
+                return metrics
+            lineup_data = canonical_lineup_data
 
             existing = await self.lineup_repository.get_by_match_id(db, match_id)
 

@@ -6,6 +6,7 @@ from app.providers.odds_provider import OddsProvider
 from app.repositories.odds_repository import OddsRepository
 from app.services.cache_service import CacheService
 from app.services.analytics_projection_service import AnalyticsProjectionService, log_projection_failure
+from app.monitoring import observe_sync
 
 if TYPE_CHECKING:
     from app.services.odds_service import OddsService
@@ -30,6 +31,7 @@ class OddsSyncService:
         self.odds_repository = odds_repository or OddsRepository()
         self.analytics_projection_service = analytics_projection_service or AnalyticsProjectionService()
 
+    @observe_sync("odds")
     async def refresh_odds(self, db, fixture_id: int, cache_key: str, pre_match_ttl: int) -> dict:
         result = await self.odds_provider.get_match_odds(fixture_id)
         if not result or "response" not in result:

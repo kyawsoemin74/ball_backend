@@ -288,6 +288,38 @@ def test_final_lineup_provider_failure_records_retryable_without_cache(monkeypat
     assert db.commit_calls == 1
 
 
+def test_final_lineup_failure_persists_attempt_count_after_attempt_rollback(monkeypatch):
+    record = MatchLineupFinalization(match_id=1, status="REQUIRED", attempt_count=0)
+    repository = FinalizationRepository(record)
+
+    class RollbackAwareDB(FinalizationDB):
+        async def rollback(self):
+            await super().rollback()
+            self.record.attempt_count = 0
+
+    db = RollbackAwareDB(record)
+    cache = SimpleNamespace(delete=_unexpected_cache_delete)
+
+    async def fake_sync(*args, **kwargs):
+        return {"success": False, "match_id": 1, "reason": "lineup_not_available"}
+
+    monkeypatch.setattr(fixture_sync_module, "async_session", lambda: _session(db))
+    monkeypatch.setattr(fixture_sync_module, "run_with_resource_lock", _lock)
+    service = FixtureSyncService(client=SimpleNamespace(), team_service=FakeTeamService())
+    service.final_lineup_finalization_repository = repository
+    service.cache_service = cache
+
+    async def run():
+        from app.services import football as football_module
+        monkeypatch.setattr(football_module.football_service, "sync_match_lineup", fake_sync)
+        return await service.finalize_pending_lineups([1])
+
+    result = asyncio.run(run())
+    assert result["failed"] == 1
+    assert record.attempt_count == 1
+    assert record.status == "RETRYABLE"
+
+
 def test_commit_ambiguity_preserves_success_and_invalidates_cache(monkeypatch):
     record = MatchLineupFinalization(match_id=1, status="REQUIRED", attempt_count=0)
     repository = FinalizationRepository(record)

@@ -5,7 +5,7 @@ from app.db import Base
 class MatchEvent(Base):
     __tablename__ = "match_events"
 
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
     # Links to the fixture_id column in the matches table
     match_id = Column(Integer, ForeignKey("matches.fixture_id"), index=True, nullable=False)
     
@@ -27,5 +27,5 @@ class MatchEvent(Base):
     detail = Column(String(255), nullable=True)
     comments = Column(Text, nullable=True)
     
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

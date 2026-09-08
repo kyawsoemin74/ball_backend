@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Index
 from sqlalchemy.orm import relationship, synonym
 from sqlalchemy.sql import func
 
@@ -7,13 +7,14 @@ from app.db import Base
 
 class Match(Base):
     __tablename__ = "matches"
+    __table_args__ = (Index("ix_matches_league_id_season", "league_id", "season"),)
 
     # Primary Key
-    match_id = Column("fixture_id", Integer, primary_key=True, index=True)
+    match_id = Column("fixture_id", Integer, primary_key=True)
     fixture_id = synonym("match_id")
     
     # League Info
-    league_id = Column(Integer, ForeignKey("leagues.league_id"), nullable=False, index=True)
+    league_id = Column(Integer, ForeignKey("leagues.league_id", name="fk_matches_league_id_leagues"), nullable=False, index=True)
     season = Column(Integer, nullable=True)
     league_name = Column(String(255), nullable=True)
     league_logo = Column(String(500), nullable=True)
@@ -56,5 +57,5 @@ class Match(Base):
     league_obj = relationship("League", foreign_keys=[league_id], back_populates="matches")
     
     # Timestamps
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

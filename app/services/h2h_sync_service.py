@@ -6,6 +6,7 @@ from app.repositories.h2h_repository import H2HRepository
 from app.services.cache_service import CacheService
 from app.services.analytics_projection_service import AnalyticsProjectionService, log_projection_failure
 from app.repositories.team_repository import TeamRepository
+from app.monitoring import observe_sync
 
 if TYPE_CHECKING:
     from app.services.h2h_service import H2HService
@@ -32,6 +33,7 @@ class H2HSyncService:
         self.analytics_projection_service = analytics_projection_service or AnalyticsProjectionService()
         self.team_repository = team_repository or TeamRepository()
 
+    @observe_sync("h2h")
     async def refresh_h2h(self, db, h2h_key: str) -> dict:
         api_res = await self.h2h_provider.get_h2h_by_key(h2h_key)
         if not api_res or "response" not in api_res:

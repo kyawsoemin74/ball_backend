@@ -6,10 +6,17 @@ services:
       context: .
     container_name: fover_api
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+    restart: unless-stopped
     env_file:
       - .env
     environment:
+      - DATABASE_URL=postgresql://user:password@postgres:5432/fover_db
+      - REDIS_URL=redis://redis:6379/0
       - PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc_dir
+      - SCHEDULER_ENABLED=false
+      - APP_ENV=production
+      - ENABLE_API_DOCS=false
+      - ENABLE_API_METRICS=false
     volumes:
       - prometheus_multiproc:/tmp/prometheus_multiproc_dir
     ports:
@@ -20,7 +27,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready').read()\""]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -31,17 +38,21 @@ services:
       context: .
     container_name: fover_worker
     command: python worker.py
+    restart: unless-stopped
     env_file:
       - .env
+    environment:
+      - DATABASE_URL=postgresql://user:password@postgres:5432/fover_db
+      - REDIS_URL=redis://redis:6379/0
+      - SCHEDULER_ENABLED=true
+      - APP_ENV=production
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-      api:
-        condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'python worker.py' >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/metrics').read()\""]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -67,6 +78,7 @@ services:
     image: redis:7-alpine
     container_name: fover_redis
     restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
     healthcheck:

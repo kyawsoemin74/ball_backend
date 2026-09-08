@@ -12,6 +12,11 @@ RUN python -m pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
 
-EXPOSE 8000
+RUN addgroup --system --gid 1000 app && adduser --system --uid 1000 --ingroup app app \
+	&& mkdir -p /var/www/fover/uploads/news \
+	&& chown -R app:app /usr/src/app /var/www/fover
+USER app
+
+EXPOSE 8000 8001
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
