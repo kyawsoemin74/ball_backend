@@ -56,13 +56,19 @@ def upgrade() -> None:
         ),
         {"provider": _PROVIDER, "provider_id": _PROVIDER_ID},
     ).mappings().all()
-    if len(source) != 1:
+    if not source:
+        return
+    if len(source) > 1:
         raise RuntimeError(
-            "Expected exactly one API-Football League provider_id=140 before identity alignment"
+            "Cannot align API-Football provider_id=140: duplicate provider identity rows found"
         )
-    if int(source[0]["league_id"]) != _SOURCE_LOCAL_ID:
+    current_local_id = int(source[0]["league_id"])
+    if current_local_id == _TARGET_LOCAL_ID:
+        return
+    if current_local_id != _SOURCE_LOCAL_ID:
         raise RuntimeError(
-            f"Expected provider_id=140 at local league_id=1, found {source[0]['league_id']}"
+            "Cannot align API-Football provider_id=140: "
+            f"current local league_id={current_local_id}; expected 1 or 140"
         )
 
     target_count = _count(bind, "SELECT count(*) FROM leagues WHERE league_id = :local_id", local_id=_TARGET_LOCAL_ID)
