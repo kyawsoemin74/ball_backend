@@ -80,6 +80,22 @@ class TrackingTeamRepository:
             founded=row.get("founded"),
         )
 
+    async def upsert_by_provider_identity(self, db, row):
+        team_id = max(self.existing_ids or {1000}) + 1
+        self.provider_ids[(row["provider"], str(row["provider_id"]))] = team_id
+        team = SimpleNamespace(
+            team_id=team_id,
+            provider=row["provider"],
+            provider_id=str(row["provider_id"]),
+            name=row["name"],
+            country=row.get("country"),
+            logo=row.get("logo"),
+            stadium=row.get("stadium"),
+            founded=row.get("founded"),
+            country_id=None,
+        )
+        return team
+
 
 class FakeSessionWithInfo:
     def __init__(self):
@@ -286,10 +302,10 @@ def test_upsert_team_resolves_existing_master_without_persistence(monkeypatch):
     assert team.team_id == 1001
     assert repository.upsert_one_rows == []
     assert db.flush_calls == 0
-    assert deleted_keys == []
+    assert deleted_keys == [make_cache_key("team", 1001)]
 
 
-def test_upsert_team_does_not_create_missing_master_or_invalidate_cache():
+def test_upsert_team_creates_missing_master_from_provider_payload():
     repository = TrackingTeamRepository()
     cache_service = RecordingCacheService()
     service = TeamSyncService(cache_service=cache_service, team_repository=repository)
@@ -305,10 +321,9 @@ def test_upsert_team_does_not_create_missing_master_or_invalidate_cache():
         )
     )
 
-    assert result is None
+    assert result.team_id == 1001
     assert repository.upsert_one_rows == []
-    assert db.sync_session.info.get(_TEAM_POST_COMMIT_CACHE_KEYS) is None
-    assert cache_service.deleted == []
+    assert make_cache_key("team", 1001) in db.sync_session.info[_TEAM_POST_COMMIT_CACHE_KEYS]
 
 
 def test_team_cache_invalidation_runs_only_after_commit(monkeypatch):

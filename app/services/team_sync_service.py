@@ -1,11 +1,13 @@
 import logging
 
 from sqlalchemy import event
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 from app.cache import cache_delete_sync, make_cache_key
 from app.services.coach_sync_service import CoachSyncService
+from app.providers.team_provider import TeamProvider
 from app.repositories.team_repository import TeamRepository
 from app.services.cache_service import CacheService
 from app.services.country_sync_service import CountrySyncService
@@ -37,10 +39,12 @@ class TeamSyncService:
         cache_service: CacheService,
         team_repository: TeamRepository | None = None,
         coach_sync_service: CoachSyncService | None = None,
+        team_provider: TeamProvider | None = None,
     ) -> None:
         self.cache_service = cache_service
         self.team_repository = team_repository or TeamRepository()
         self.coach_sync_service = coach_sync_service or CoachSyncService()
+        self.team_provider = team_provider
         self.country_sync_service = CountrySyncService()
 
     @staticmethod
@@ -85,7 +89,7 @@ class TeamSyncService:
         )
 
     async def resolve_provider_teams(self, db: AsyncSession, teams_data: list[dict]) -> dict:
-        """Resolve provider Team IDs to existing local Team Master IDs."""
+        """Resolve provider Team IDs to local Team Master IDs."""
         if not teams_data:
             return {"resolved": {}, "unresolved": [], "total": 0}
 
@@ -115,39 +119,143 @@ class TeamSyncService:
         return {"resolved": resolved, "unresolved": unresolved, "total": len(teams_data)}
 
     async def ensure_teams_exist(self, db: AsyncSession, teams_data: list[dict]) -> dict:
-        """Compatibility wrapper that now resolves existing Masters only."""
-        result = await self.resolve_provider_teams(db, teams_data)
-        return {
-            "created": 0,
-            "existing": len(result["resolved"]),
-            "unresolved": len(result["unresolved"]),
-            "total": result["total"],
-        }
+        """Resolve existing Teams and create missing Masters from the provider."""
+        resolved = {}
+        unresolved = []
+        created = 0
+        errors = []
+        for item in teams_data or []:
+            if not isinstance(item, dict):
+                unresolved.append(item)
+                continue
 
-    async def upsert_team(self, db: AsyncSession, team_data: dict):
+            provider_id = item.get("provider_id", item.get("id"))
+            if provider_id is None:
+                unresolved.append(item)
+                continue
+
+            existing = await self.team_repository.find_by_provider_identity(
+                db,
+                "api-football",
+                provider_id,
+            )
+            if existing is not None:
+                resolved[int(provider_id)] = int(existing.team_id)
+                continue
+
+            if self.team_provider is None:
+                unresolved.append(item)
+                continue
+
+            try:
+                payload = item if item.get("team") or item.get("name") else None
+                if payload is None:
+                    payload = await self.team_provider.get_team_details(int(provider_id))
+                team = await self.upsert_team(db, payload, provider_id=provider_id)
+                if team is None:
+                    unresolved.append(item)
+                    errors.append({"provider_id": provider_id, "reason": "team_sync_failed"})
+                    continue
+                resolved[int(provider_id)] = int(team.team_id)
+                created += 1
+            except ValueError:
+                raise
+            except SQLAlchemyError:
+                logger.exception("TEAM_SYNC_DATABASE_FAILURE provider_id=%s", provider_id)
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "TEAM_SYNC_FAILED provider_id=%s error=%s",
+                    provider_id,
+                    exc,
+                )
+                unresolved.append(item)
+                errors.append({"provider_id": provider_id, "reason": "provider_or_database_failure"})
+
+        result = {
+            "created": created,
+            "existing": len(resolved) - created,
+            "unresolved": len(unresolved),
+            "total": len(teams_data or []),
+        }
+        if errors:
+            result["errors"] = errors
+        return result
+
+    async def upsert_team(
+        self,
+        db: AsyncSession,
+        team_data: dict | None,
+        *,
+        provider_id: str | int | None = None,
+    ):
+        if not isinstance(team_data, dict):
+            raise ValueError("Team payload must be an object")
+
+        response = team_data.get("response")
+        if isinstance(response, list):
+            if len(response) != 1 or not isinstance(response[0], dict):
+                raise ValueError("Team provider response must contain exactly one Team")
+            team_data = response[0]
+
         team_payload = team_data.get("team") or team_data
-        provider_id = team_payload.get("id")
-        team = await self.team_repository.find_by_provider_identity(db, "api-football", provider_id)
-        if team is None:
-            return None
+        if not isinstance(team_payload, dict):
+            raise ValueError("Team payload is missing the team object")
+        provider_id = provider_id if provider_id is not None else team_payload.get("id")
+        if provider_id is None:
+            raise ValueError("Team payload is missing the id field")
+        if team_payload.get("id") is not None and str(team_payload["id"]) != str(provider_id):
+            raise ValueError("Team provider identity does not match the requested Team")
+        name = team_payload.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Team payload is missing a valid name")
 
         venue_payload = team_data.get("venue") or {}
-        update_provider_metadata = getattr(self.team_repository, "update_provider_metadata", None)
-        if update_provider_metadata is not None:
-            await update_provider_metadata(
+        team = await self.team_repository.find_by_provider_identity(db, "api-football", provider_id)
+        if team is None:
+            upsert_by_identity = getattr(self.team_repository, "upsert_by_provider_identity", None)
+            if upsert_by_identity is None:
+                raise RuntimeError("Team repository lacks provider-identity upsert support")
+            team = await upsert_by_identity(
                 db,
-                team.team_id,
-                name=team_payload.get("name") or getattr(team, "name", None),
-                country=team_payload.get("country") or getattr(team, "country", None),
-                logo=team_payload.get("logo") or getattr(team, "logo", None),
-                stadium=venue_payload.get("name") or getattr(team, "stadium", None),
-                founded=team_payload.get("founded") or getattr(team, "founded", None),
+                {
+                    "provider": "api-football",
+                    "provider_id": str(provider_id),
+                    "name": name.strip(),
+                    "country": team_payload.get("country"),
+                    "logo": team_payload.get("logo"),
+                    "stadium": venue_payload.get("name"),
+                    "founded": team_payload.get("founded"),
+                },
             )
-            team.name = team_payload.get("name") or team.name
-            team.country = team_payload.get("country") or getattr(team, "country", None)
-            team.logo = team_payload.get("logo") or getattr(team, "logo", None)
-            team.stadium = venue_payload.get("name") or getattr(team, "stadium", None)
-            team.founded = team_payload.get("founded") or getattr(team, "founded", None)
+            verified_team = await self.team_repository.find_by_provider_identity(
+                db,
+                "api-football",
+                provider_id,
+            )
+            if verified_team is None or int(verified_team.team_id) != int(team.team_id):
+                raise RuntimeError(
+                    "Team provider identity verification failed for "
+                    f"provider_id={provider_id}"
+                )
+            team = verified_team
+        else:
+            update_provider_metadata = getattr(self.team_repository, "update_provider_metadata", None)
+            if update_provider_metadata is not None:
+                await update_provider_metadata(
+                    db,
+                    team.team_id,
+                    name=name.strip(),
+                    country=team_payload.get("country") or getattr(team, "country", None),
+                    logo=team_payload.get("logo") or getattr(team, "logo", None),
+                    stadium=venue_payload.get("name") or getattr(team, "stadium", None),
+                    founded=team_payload.get("founded") or getattr(team, "founded", None),
+                )
+                team.name = name.strip()
+                team.country = team_payload.get("country") or getattr(team, "country", None)
+                team.logo = team_payload.get("logo") or getattr(team, "logo", None)
+                team.stadium = venue_payload.get("name") or getattr(team, "stadium", None)
+                team.founded = team_payload.get("founded") or getattr(team, "founded", None)
 
         country_result = await self.country_sync_service.sync_from_team_payload(db, team_data)
         country = country_result.get("country") if isinstance(country_result, dict) else None
@@ -162,6 +270,8 @@ class TeamSyncService:
                         normalized_country_id,
                     )
                 team.country_id = normalized_country_id
+
+        self._queue_team_cache_invalidation(db, int(team.team_id))
 
         return team
 

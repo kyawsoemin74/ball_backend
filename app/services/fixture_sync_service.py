@@ -6,6 +6,7 @@ from typing import Optional
 import httpx
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache import make_cache_key
@@ -360,14 +361,44 @@ class FixtureSyncService:
         prewarm_candidates: set[tuple[int, int]] = set()
         for fixture_raw, master_league_id in filtered_fixtures:
             fixture_id = fixture_raw.get("fixture", {}).get("id")
-            fixture_savepoint = await self._begin_fixture_savepoint(db)
+            fixture_savepoint = None
             try:
                 match = self.parse_fixture_to_match(fixture_raw, league_id=master_league_id)
                 if match is None:
                     result["failed"] += 1
                     logger.warning("Fixture ID %s failed parsing.", fixture_id)
-                    await self._release_fixture_savepoint(fixture_savepoint)
                     continue
+
+                provider_team_ids = [
+                    team_id
+                    for team_id in (match.home_team_id, match.away_team_id)
+                    if team_id is not None
+                ]
+                resolution = await self.team_service.resolve_provider_teams(
+                    db,
+                    [{"provider_id": team_id} for team_id in provider_team_ids],
+                )
+                if resolution["unresolved"]:
+                    logger.info(
+                        "TEAM_IDENTITY_MISSING fixture_id=%s provider_team_ids=%s",
+                        fixture_id,
+                        [item.get("provider_id") for item in resolution["unresolved"] if isinstance(item, dict)],
+                    )
+                    await self.team_sync_service.ensure_teams_exist(
+                        db,
+                        resolution["unresolved"],
+                    )
+                    resolution = await self.team_service.resolve_provider_teams(
+                        db,
+                        [{"provider_id": team_id} for team_id in provider_team_ids],
+                    )
+                if resolution["unresolved"]:
+                    result["failed"] += 1
+                    result.setdefault("retryable_team_identity_missing", []).append(fixture_id)
+                    logger.warning("Fixture ID %s has unresolved provider Team identity", fixture_id)
+                    continue
+
+                fixture_savepoint = await self._begin_fixture_savepoint(db)
 
                 if match.season is not None and getattr(db, "sync_session", None) is not None:
                     await self.league_season_sync_service.upsert_season(
@@ -403,21 +434,6 @@ class FixtureSyncService:
                         prewarm_candidates.add((int(match.league_id), int(match.season)))
                     except (TypeError, ValueError):
                         pass
-
-                provider_team_ids = [
-                    team_id
-                    for team_id in (match.home_team_id, match.away_team_id)
-                    if team_id is not None
-                ]
-                resolution = await self.team_service.resolve_provider_teams(
-                    db,
-                    [{"provider_id": team_id} for team_id in provider_team_ids],
-                )
-                if resolution["unresolved"]:
-                    result["failed"] += 1
-                    logger.warning("Fixture ID %s has unresolved provider Team identity", fixture_id)
-                    await self._release_fixture_savepoint(fixture_savepoint)
-                    continue
 
                 resolved_ids = resolution["resolved"]
                 if hasattr(self.team_sync_service, "sync_team_coach"):
@@ -526,6 +542,10 @@ class FixtureSyncService:
                 result["inserted"] += inserted
                 result["updated"] += updated
                 await self._release_fixture_savepoint(fixture_savepoint)
+            except SQLAlchemyError as exc:
+                await self._rollback_fixture_savepoint(fixture_savepoint, exc)
+                logger.exception("Fixture ID %s failed due to database error", fixture_id)
+                raise
             except Exception as exc:
                 await self._rollback_fixture_savepoint(fixture_savepoint, exc)
                 result["failed"] += 1

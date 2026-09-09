@@ -82,6 +82,7 @@ class FootballAPIService:
             self.cache_service,
             league_provider=self.league_provider,
             league_sync_service=self.league_sync_service,
+            team_sync_service=self.team_sync_service,
         )
         if self.league_sync_service is None:
             self.league_sync_service = self.league_service.league_sync_service

@@ -43,6 +43,8 @@ class LeagueSyncService:
         league_repository: LeagueRepository | None = None,
         allowed_league_repository: AllowedLeagueRepository | None = None,
         fetch_all_leagues: Callable[[], Awaitable[Optional[dict]]] | None = None,
+        fetch_league_teams: Callable[[int, int], Awaitable[Optional[list[dict]]]] | None = None,
+        team_sync_service=None,
     ) -> None:
         self.cache_service = cache_service
         self.league_repository = league_repository or LeagueRepository()
@@ -52,6 +54,8 @@ class LeagueSyncService:
         self.country_sync_service = CountrySyncService()
         self.league_season_sync_service = LeagueSeasonSyncService()
         self.fetch_all_leagues = fetch_all_leagues
+        self.fetch_league_teams = fetch_league_teams
+        self.team_sync_service = team_sync_service
 
     def _queue_league_cache_invalidation(
         self,
@@ -107,7 +111,9 @@ class LeagueSyncService:
             )
             return None
 
-        return await self._upsert_league(db, league_data, master=master)
+        upserted = await self._upsert_league(db, league_data, master=master)
+        await self._sync_league_teams(db, league_data, master)
+        return upserted
 
     async def _upsert_league(
         self,
@@ -148,6 +154,50 @@ class LeagueSyncService:
 
         self._queue_league_cache_invalidation(db, master.league_id)
         return master
+
+    async def _sync_league_teams(
+        self,
+        db: AsyncSession,
+        league_data: dict,
+        master: League,
+    ) -> dict:
+        if self.team_sync_service is None or self.fetch_league_teams is None:
+            return {"success": True, "status": "not_configured"}
+
+        seasons = league_data.get("seasons") or []
+        current_season = next(
+            (
+                season.get("year")
+                for season in seasons
+                if isinstance(season, dict) and season.get("current") is True
+            ),
+            getattr(master, "season", None),
+        )
+        if current_season is None:
+            raise ValueError(
+                f"Cannot synchronize League Teams: current season is undefined for league_id={master.league_id}"
+            )
+        try:
+            season = int(current_season)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Cannot synchronize League Teams: invalid season={current_season!r} "
+                f"for league_id={master.league_id}"
+            ) from exc
+
+        teams = await self.fetch_league_teams(int(master.provider_id), season)
+        if teams is None:
+            raise RuntimeError(
+                f"League Team discovery failed for provider league_id={master.provider_id} season={season}"
+            )
+        result = await self.team_sync_service.ensure_teams_exist(db, teams)
+        result["league_id"] = int(master.league_id)
+        result["season"] = season
+        if result.get("unresolved"):
+            raise RuntimeError(
+                f"League Team synchronization incomplete for league_id={master.league_id}: {result}"
+            )
+        return result
 
     async def sync_all_leagues(self, db: AsyncSession) -> dict:
         logger.info("League sync started")

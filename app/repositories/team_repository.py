@@ -131,3 +131,40 @@ class TeamRepository:
         if team is None:
             raise RuntimeError(f"Team upsert failed for team_id={row['team_id']}")
         return team
+
+    async def upsert_by_provider_identity(
+        self,
+        db: AsyncSession,
+        row: dict,
+    ) -> Team:
+        provider = row.get("provider")
+        provider_id = row.get("provider_id")
+        if not provider or provider_id is None:
+            raise ValueError("Team provider identity is required")
+
+        insert_stmt = pg_insert(Team).values(
+            {
+                **row,
+                "provider": provider,
+                "provider_id": str(provider_id),
+            }
+        )
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            constraint="uq_teams_provider_provider_id",
+            set_={
+                "name": insert_stmt.excluded.name,
+                "country": insert_stmt.excluded.country,
+                "logo": insert_stmt.excluded.logo,
+                "stadium": insert_stmt.excluded.stadium,
+                "founded": insert_stmt.excluded.founded,
+            },
+        )
+        await db.execute(upsert_stmt)
+
+        team = await self.find_by_provider_identity(db, provider, provider_id)
+        if team is None:
+            raise RuntimeError(
+                "Team upsert failed for provider="
+                f"{provider} provider_id={provider_id}"
+            )
+        return team

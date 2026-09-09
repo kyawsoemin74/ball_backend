@@ -35,6 +35,7 @@ class LeagueService:
         cache_service: CacheService | None = None,
         league_provider: LeagueProvider | None = None,
         league_sync_service: LeagueSyncService | None = None,
+        team_sync_service=None,
     ) -> None:
         self.client = client
         self.league_provider = league_provider or LeagueProvider(client)
@@ -47,6 +48,8 @@ class LeagueService:
             league_repository=self._league_repository,
             allowed_league_repository=self._allowed_league_repository,
             fetch_all_leagues=self.get_all_leagues,
+            fetch_league_teams=self.get_league_teams,
+            team_sync_service=team_sync_service,
         )
         self._league_sync_upsert_impl = self.league_sync_service.upsert_league
         self.league_sync_service.upsert_league = self._upsert_league_bridge
@@ -204,6 +207,9 @@ class LeagueService:
 
     async def get_all_leagues(self) -> Optional[dict]:
         return await self.league_provider.get_all_leagues()
+
+    async def get_league_teams(self, league_id: int, season: int) -> Optional[list[dict]]:
+        return await self.league_provider.get_league_teams(league_id, season)
 
     async def register_league(
         self,

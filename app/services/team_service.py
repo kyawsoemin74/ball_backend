@@ -29,6 +29,7 @@ class TeamService:
         self.team_sync_service = TeamSyncService(
             cache_service=self.cache_service,
             team_repository=self._team_repository,
+            team_provider=self.team_provider,
         )
         self._team_sync_ensure_impl = self.team_sync_service.ensure_teams_exist
         self._team_sync_upsert_impl = self.team_sync_service.upsert_team
@@ -48,9 +49,15 @@ class TeamService:
         # Compatibility hook: preserve TeamService subclass interception.
         return await self.ensure_teams_exist(db, teams_data)
 
-    async def _upsert_team_bridge(self, db: AsyncSession, team_data: dict):
+    async def _upsert_team_bridge(
+        self,
+        db: AsyncSession,
+        team_data: dict,
+        *,
+        provider_id: str | int | None = None,
+    ):
         # Compatibility hook: preserve TeamService subclass interception.
-        return await self.upsert_team(db, team_data)
+        return await self.upsert_team(db, team_data, provider_id=provider_id)
 
     @staticmethod
     def _normalize_fixture_result(fixture: dict, team_id: int) -> Optional[str]:
@@ -262,5 +269,15 @@ class TeamService:
     async def resolve_provider_teams(self, db: AsyncSession, teams_data: list[dict]) -> dict:
         return await self.team_sync_service.resolve_provider_teams(db, teams_data)
 
-    async def upsert_team(self, db: AsyncSession, team_data: dict):
-        return await self._team_sync_upsert_impl(db, team_data)
+    async def upsert_team(
+        self,
+        db: AsyncSession,
+        team_data: dict,
+        *,
+        provider_id: str | int | None = None,
+    ):
+        return await self._team_sync_upsert_impl(
+            db,
+            team_data,
+            provider_id=provider_id,
+        )
