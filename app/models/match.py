@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Index
+from sqlalchemy import Column, Identity, Integer, String, DateTime, Text, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.orm import relationship, synonym
 from sqlalchemy.sql import func
 
@@ -7,11 +7,17 @@ from app.db import Base
 
 class Match(Base):
     __tablename__ = "matches"
-    __table_args__ = (Index("ix_matches_league_id_season", "league_id", "season"),)
+    __table_args__ = (
+        Index("ix_matches_league_id_season", "league_id", "season"),
+        UniqueConstraint("provider", "provider_fixture_id", name="uq_matches_provider_fixture_id"),
+    )
 
-    # Primary Key
-    match_id = Column("fixture_id", Integer, primary_key=True)
-    fixture_id = synonym("match_id")
+    # Local Match identity is independent from the provider fixture identity.
+    local_match_id = Column(Integer, Identity(), primary_key=True)
+    match_id = synonym("local_match_id")
+    provider = Column(String(50), nullable=False, server_default="api-football")
+    provider_fixture_id = Column(Integer, nullable=False, index=True)
+    fixture_id = synonym("provider_fixture_id")
     
     # League Info
     league_id = Column(Integer, ForeignKey("leagues.league_id", name="fk_matches_league_id_leagues"), nullable=False, index=True)

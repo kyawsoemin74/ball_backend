@@ -115,7 +115,7 @@ class FinalLineupFinalizationRepository:
     async def get_retry_candidates(self, db: AsyncSession, limit: int) -> list[MatchLineupFinalization]:
         result = await db.execute(
             select(MatchLineupFinalization)
-            .join(Match, Match.fixture_id == MatchLineupFinalization.match_id)
+            .join(Match, Match.local_match_id == MatchLineupFinalization.match_id)
             .where(MatchLineupFinalization.status.in_(FINAL_LINEUP_REQUIRED_STATES))
             .where(Match.status.in_(FINAL_LINEUP_TERMINAL_STATUSES))
             .order_by(

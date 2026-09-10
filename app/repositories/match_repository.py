@@ -9,6 +9,14 @@ from app.models.match import Match
 
 
 class MatchRepository:
+    async def get_by_provider_fixture_id(self, db: AsyncSession, provider: str, provider_fixture_id: int) -> Match | None:
+        result = await db.execute(
+            select(Match).where(
+                Match.provider == provider,
+                Match.provider_fixture_id == int(provider_fixture_id),
+            )
+        )
+        return result.scalar_one_or_none()
     async def get_many_by_ids(self, db: AsyncSession, match_ids: list[int], allowed_ids: set[int] | None = None) -> list[Match]:
         if not match_ids:
             return []

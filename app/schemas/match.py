@@ -5,8 +5,9 @@ from pydantic import BaseModel, Field
 
 # Schema for creating a new match
 class MatchCreate(BaseModel):
-    # Primary Key
-    match_id: int = Field(..., description="Unique match ID (Primary Key)")
+    # Provider identity is resolved to a local Match Master ID during sync.
+    match_id: Optional[int] = Field(None, description="Local Match Master ID")
+    provider_fixture_id: int = Field(..., description="Provider fixture identity")
     
     # League Info
     league_id: int = Field(..., description="League ID")

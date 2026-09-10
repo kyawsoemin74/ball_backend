@@ -8,7 +8,7 @@ class Odds(Base):
     __tablename__ = "odds"
 
     id = Column(Integer, primary_key=True)
-    fixture_id = Column(Integer, ForeignKey("matches.fixture_id"), nullable=False, index=True)
+    fixture_id = Column(Integer, ForeignKey("matches.local_match_id"), nullable=False, index=True)
     bookmaker_name = Column(String(255), nullable=True)
     market_name = Column(String(255), nullable=False, index=True)
     selection = Column(String(255), nullable=False, index=True)

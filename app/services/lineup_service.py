@@ -1,5 +1,6 @@
-import copy
+import inspect
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select
@@ -41,10 +42,65 @@ class LineupService:
         )
         self.team_service = team_service or TeamService(client=client, cache_service=self.cache_service)
 
+    @staticmethod
+    def _cache_payload_and_timestamp(cached: Any) -> tuple[Any, datetime | None]:
+        if isinstance(cached, dict) and isinstance(cached.get("data"), list):
+            updated_at_value = cached.get("updated_at")
+            try:
+                updated_at = LineupService._parse_timestamp(updated_at_value)
+            except Exception:
+                updated_at = None
+            return cached.get("data"), updated_at
+        return cached, None
+
+    @staticmethod
+    def _parse_timestamp(value: Any) -> datetime | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value
+        if isinstance(value, str):
+            normalized = value.replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except Exception:
+                parsed = None
+            if parsed is not None and parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        return None
+
+    @staticmethod
+    def _cache_payload(record: MatchLineup) -> dict[str, Any]:
+        updated_at = getattr(record, "updated_at", None)
+        return {
+            "data": record.data,
+            "updated_at": updated_at.isoformat() if isinstance(updated_at, datetime) else str(updated_at) if updated_at else None,
+        }
+
+    async def _is_cached_lineup_stale(self, db: AsyncSession, match_id: int, cached: Any) -> bool:
+        if not isinstance(cached, dict) or not isinstance(cached.get("data"), list):
+            return False
+        updated_at_value = cached.get("updated_at")
+        cache_updated_at = self._parse_timestamp(updated_at_value)
+        if cache_updated_at is None:
+            return False
+
+        db_record = (await db.execute(select(MatchLineup).where(MatchLineup.match_id == match_id))).scalar_one_or_none()
+        if db_record is None:
+            return False
+        db_updated_at = getattr(db_record, "updated_at", None)
+        if not isinstance(db_updated_at, datetime):
+            return False
+        return db_updated_at.tzinfo is not None and db_updated_at > cache_updated_at
+
     def _is_valid_lineup_response(self, lineup_data: Any) -> bool:
         if not isinstance(lineup_data, list) or not lineup_data:
             return False
 
+        seen_players: set[tuple[Any, str]] = set()
         for lineup in lineup_data:
             if not isinstance(lineup, dict):
                 return False
@@ -58,105 +114,93 @@ class LineupService:
 
             if not isinstance(lineup.get("substitutes"), list):
                 return False
+            formation = lineup.get("formation")
+            if formation is not None and (not isinstance(formation, str) or not formation.strip()):
+                return False
+            for section, role in (("startXI", "STARTER"), ("substitutes", "SUBSTITUTE")):
+                for entry in lineup[section]:
+                    if not isinstance(entry, dict) or not isinstance(entry.get("player"), dict):
+                        return False
+                    player_id = entry["player"].get("id")
+                    if player_id is None or str(player_id).strip() == "":
+                        return False
+                    key = str(player_id)
+                    if key in seen_players:
+                        return False
+                    seen_players.add(key)
 
         return True
 
-    def _build_player_photo_map(self, squad_payload: Any) -> Dict[int, Optional[str]]:
-        if not isinstance(squad_payload, dict):
-            return {}
-
-        players = squad_payload.get("players") if isinstance(squad_payload.get("players"), list) else []
-        photo_map: Dict[int, Optional[str]] = {}
-        for player in players:
-            if not isinstance(player, dict):
-                continue
-            player_id = player.get("player_id")
-            if player_id is None:
-                continue
-            try:
-                photo_map[int(player_id)] = player.get("photo")
-            except (TypeError, ValueError):
-                photo_map[str(player_id)] = player.get("photo")
-        return photo_map
-
-    async def _enrich_lineup_with_photos(self, db: AsyncSession, lineup_payload: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not isinstance(lineup_payload, list):
-            return lineup_payload
-
-        team_ids: set[int] = set()
-        for lineup in lineup_payload:
+    @staticmethod
+    def _canonical_response(match_id: int, payload: Any) -> Any:
+        if not isinstance(payload, list):
+            return payload
+        response = []
+        for lineup in payload:
             if not isinstance(lineup, dict):
                 continue
-            team = lineup.get("team")
-            if not isinstance(team, dict):
-                continue
-            team_id = team.get("id")
-            if team_id is None:
-                continue
-            try:
-                team_key = int(team_id)
-            except (TypeError, ValueError):
-                continue
-            for section_key in ("startXI", "substitutes"):
-                players = lineup.get(section_key)
-                if not isinstance(players, list) or not players:
-                    continue
-                team_ids.add(team_key)
-                break
+            item = dict(lineup)
+            item["local_match_id"] = int(match_id)
+            provider_team = dict(item.get("team") or {})
+            local_team_id = item.pop("local_team_id", None)
+            if local_team_id is not None:
+                provider_team_id = provider_team.pop("id", None)
+                item["team"] = {
+                    "local_team_id": int(local_team_id),
+                    "provider_team_id": str(provider_team_id) if provider_team_id is not None else None,
+                    **provider_team,
+                }
+            for section in ("startXI", "substitutes"):
+                entries = []
+                for entry in item.get(section, []):
+                    entry_copy = dict(entry)
+                    player = dict(entry_copy.get("player") or {})
+                    local_player_id = player.pop("player_id", None)
+                    provider_player_id = player.pop("id", None)
+                    if local_player_id is not None:
+                        entry_copy["player"] = {
+                            "local_player_id": int(local_player_id),
+                            "provider_player_id": str(provider_player_id) if provider_player_id is not None else None,
+                            **player,
+                        }
+                    entries.append(entry_copy)
+                item[section] = entries
+            response.append(item)
+        return response
 
-        if not team_ids:
-            return lineup_payload
+    async def get_match_lineup(self, match_id: int, db: AsyncSession | None = None) -> Optional[List[Dict[str, Any]]]:
+        """Compatibility read path: cache first, then DB fallback, never provider fetch."""
+        cache_key = make_lineup_cache_key(match_id)
+        try:
+            cached = await self.cache_service.get_json(cache_key)
+        except Exception:
+            logger.exception("LINEUP_CACHE_READ_FAILED", extra={"match_id": match_id})
+            cached = None
+        if cached is not None:
+            payload, _ = self._cache_payload_and_timestamp(cached)
+            stale = False
+            if db is not None and isinstance(cached, dict) and isinstance(cached.get("data"), list):
+                stale = await self._is_cached_lineup_stale(db, match_id, cached)
+            if stale:
+                logger.warning("LINEUP_CACHE_STALE", extra={"match_id": match_id, "cache_key": cache_key})
+                cached = None
+            else:
+                logger.debug("LINEUP_CACHE_HIT", extra={"match_id": match_id})
+                return self._canonical_response(match_id, payload)
 
-        photo_maps: Dict[int, Dict[int, Optional[str]]] = {}
-        for team_id in team_ids:
+        logger.debug("LINEUP_CACHE_MISS", extra={"match_id": match_id})
+        if db is None:
+            return None
+
+        db_record = (await db.execute(select(MatchLineup).where(MatchLineup.match_id == match_id))).scalar_one_or_none()
+        if db_record:
             try:
-                provider_team = await self.team_service.team_repository.find_by_provider_identity(db, "api-football", team_id)
-                if provider_team is None:
-                    return lineup_payload
-                squad_payload = await self.team_service.get_cached_team_squad(db, int(provider_team.team_id))
+                await self.cache_service.set_json(cache_key, self._cache_payload(db_record), settings.REDIS_TTL_LINEUP)
             except Exception:
-                return lineup_payload
-            photo_maps[team_id] = self._build_player_photo_map(squad_payload)
+                logger.exception("LINEUP_CACHE_WRITE_FAILED", extra={"match_id": match_id})
+            logger.debug("LINEUP_CACHE_SET", extra={"match_id": match_id})
+            return self._canonical_response(match_id, db_record.data)
 
-        enriched_payload = copy.deepcopy(lineup_payload)
-        for lineup in enriched_payload:
-            if not isinstance(lineup, dict):
-                continue
-            team = lineup.get("team")
-            if not isinstance(team, dict):
-                continue
-            team_id = team.get("id")
-            if team_id is None:
-                continue
-            try:
-                team_key = int(team_id)
-            except (TypeError, ValueError):
-                continue
-            photo_map = photo_maps.get(team_key, {})
-
-            for section_key in ("startXI", "substitutes"):
-                players = lineup.get(section_key)
-                if not isinstance(players, list):
-                    continue
-                for player_entry in players:
-                    if not isinstance(player_entry, dict):
-                        continue
-                    player_data = player_entry.get("player")
-                    if not isinstance(player_data, dict):
-                        continue
-                    player_id = player_data.get("id")
-                    if player_id is None:
-                        player_data["photo"] = None
-                        continue
-                    try:
-                        player_key = int(player_id)
-                    except (TypeError, ValueError):
-                        player_key = player_id
-                    player_data["photo"] = photo_map.get(player_key)
-
-        return enriched_payload
-
-    async def get_match_lineup(self, match_id: int) -> Optional[dict]:
         return None
 
     async def sync_lineup(
@@ -165,7 +209,7 @@ class LineupService:
         match_id: int,
         *,
         allow_terminal_status: bool = False,
-        invalidate_cache: bool = True,
+        invalidate_cache: bool = False,
     ) -> Dict[str, Any]:
         cache_key = make_lineup_cache_key(match_id)
         sync_kwargs = {
@@ -177,6 +221,9 @@ class LineupService:
         }
         if allow_terminal_status:
             sync_kwargs["allow_terminal_status"] = True
+        sync_signature = inspect.signature(self.lineup_sync_service.sync_lineup)
+        if "invalidate_cache" in sync_signature.parameters:
+            sync_kwargs["invalidate_cache"] = invalidate_cache
         sync_result = await self.lineup_sync_service.sync_lineup(
             **sync_kwargs,
         )
@@ -184,16 +231,29 @@ class LineupService:
 
     async def get_cached_match_lineup(self, db: AsyncSession, match_id: int) -> Optional[List[Dict[str, Any]]]:
         cache_key = make_lineup_cache_key(match_id)
-        cached = await self.cache_service.get_json(cache_key)
+        try:
+            cached = await self.cache_service.get_json(cache_key)
+        except Exception:
+            logger.exception("LINEUP_CACHE_READ_FAILED", extra={"match_id": match_id})
+            cached = None
         if cached is not None:
-            logger.debug("LINEUP_CACHE_HIT", extra={"match_id": match_id})
-            return await self._enrich_lineup_with_photos(db, cached)
+            payload, _ = self._cache_payload_and_timestamp(cached)
+            stale = await self._is_cached_lineup_stale(db, match_id, cached)
+            if stale:
+                logger.warning("LINEUP_CACHE_STALE", extra={"match_id": match_id, "cache_key": cache_key})
+                cached = None
+            else:
+                logger.debug("LINEUP_CACHE_HIT", extra={"match_id": match_id})
+                return self._canonical_response(match_id, payload)
 
         logger.debug("LINEUP_CACHE_MISS", extra={"match_id": match_id})
         db_record = (await db.execute(select(MatchLineup).where(MatchLineup.match_id == match_id))).scalar_one_or_none()
         if db_record:
-            await self.cache_service.set_json(cache_key, db_record.data, settings.REDIS_TTL_LINEUP)
+            try:
+                await self.cache_service.set_json(cache_key, self._cache_payload(db_record), settings.REDIS_TTL_LINEUP)
+            except Exception:
+                logger.exception("LINEUP_CACHE_WRITE_FAILED", extra={"match_id": match_id})
             logger.debug("LINEUP_CACHE_SET", extra={"match_id": match_id})
-            return await self._enrich_lineup_with_photos(db, db_record.data)
+            return self._canonical_response(match_id, db_record.data)
 
         return None

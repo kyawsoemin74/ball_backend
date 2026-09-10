@@ -396,7 +396,7 @@ async def sync_match_lineup_route(
         try:
             await CacheService().delete(make_cache_key("lineup", match_id))
         except Exception:
-            pass
+            logger.exception("LINEUP_CACHE_INVALIDATION_PENDING", extra={"match_id": match_id})
         return result
 
     locked, result = await run_with_resource_lock(db, "lineup", match_id, sync)

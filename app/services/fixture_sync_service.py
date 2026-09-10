@@ -292,7 +292,7 @@ class FixtureSyncService:
             if resolved_league_id is None:
                 return None
             return MatchCreate(
-                match_id=int(f_info.get("id")),
+                provider_fixture_id=int(f_info.get("id")),
                 league_id=resolved_league_id,
                 season=self._coerce_season(f_league.get("season")),
                 league_name=f_league.get("name"),
@@ -444,15 +444,26 @@ class FixtureSyncService:
                 if match.away_team_id is not None:
                     match.away_team_id = resolved_ids[int(match.away_team_id)]
 
-                existing_rows = await self.match_repository.get_many_by_ids(db, [match.match_id])
+                get_by_provider_fixture_id = getattr(self.match_repository, "get_by_provider_fixture_id", None)
+                if get_by_provider_fixture_id is not None:
+                    existing_match = await get_by_provider_fixture_id(
+                        db, "api-football", match.provider_fixture_id
+                    )
+                else:
+                    legacy_rows = await self.match_repository.get_many_by_ids(db, [match.provider_fixture_id])
+                    existing_match = legacy_rows[0] if legacy_rows else None
+                existing_rows = [existing_match] if existing_match is not None else []
                 existing_ids = {row.match_id for row in existing_rows}
                 previous_status = None
                 if existing_rows:
                     previous_status = str(getattr(existing_rows[0], "status", "") or "").upper() or None
-                updated = 1 if match.match_id in existing_ids else 0
+                updated = 1 if existing_rows else 0
                 inserted = 1 - updated
 
                 match_row = match.model_dump()
+                match_row.pop("match_id", None)
+                if existing_rows:
+                    match_row["local_match_id"] = getattr(existing_rows[0], "local_match_id", existing_rows[0].match_id)
                 match_row["venue_id"] = venue_id
                 match_row["referee_id"] = referee_id
                 insert_stmt = pg_insert(Match).values([match_row])
@@ -481,10 +492,22 @@ class FixtureSyncService:
                 if venue_id is not None:
                     match_update_fields["venue_id"] = insert_stmt.excluded.venue_id
                 upsert_stmt = insert_stmt.on_conflict_do_update(
-                    index_elements=["fixture_id"],
+                    constraint="uq_matches_provider_fixture_id",
                     set_=match_update_fields,
                 )
                 await db.execute(upsert_stmt)
+                if get_by_provider_fixture_id is not None:
+                    persisted_match = await get_by_provider_fixture_id(
+                        db, "api-football", match.provider_fixture_id
+                    )
+                else:
+                    persisted_match = existing_match
+                if persisted_match is None:
+                    if get_by_provider_fixture_id is not None:
+                        raise ValueError("MATCH_IDENTITY_MISSING")
+                    local_match_id = int(match.provider_fixture_id)
+                else:
+                    local_match_id = int(getattr(persisted_match, "local_match_id", getattr(persisted_match, "match_id", 0)))
 
                 home_team_id = getattr(match, "home_team_id", None)
                 away_team_id = getattr(match, "away_team_id", None)
@@ -511,33 +534,25 @@ class FixtureSyncService:
                 await db.flush()
 
                 normalized_status = str(match.status or "").upper()
-                finalization_completed = False
-                if normalized_status in FINALIZATION_TERMINAL_STATUSES:
-                    finalization_completed = await self._finalize_terminal_match_events(db, match.match_id, match.status)
 
-                if (
-                    finalization_completed
-                    and previous_status in NON_TERMINAL_STATUSES
-                    and normalized_status in FINAL_LINEUP_TERMINAL_STATUSES
-                ):
+                if previous_status in NON_TERMINAL_STATUSES and normalized_status in FINAL_LINEUP_TERMINAL_STATUSES:
                     finalization = await self.final_lineup_finalization_repository.create_required(
                         db,
-                        match.match_id,
+                        local_match_id,
                     )
                     if finalization.status != "SUCCESS":
                         logger.info(
                             "FINAL_LINEUP_REQUIRED match_id=%s previous_status=%s new_status=%s",
-                            match.match_id,
+                            local_match_id,
                             previous_status,
                             normalized_status,
                         )
-                        result["final_lineup_candidates"].append(match.match_id)
+                        result["final_lineup_candidates"].append(local_match_id)
 
-                if finalization_completed or normalized_status not in FINALIZATION_TERMINAL_STATUSES:
-                    if getattr(self, "_defer_live_cache_invalidation", False):
-                        result["active_match_updates"][match.match_id] = match.status
-                    else:
-                        await self._sync_active_match_registration(match.match_id, match.status)
+                if getattr(self, "_defer_live_cache_invalidation", False):
+                    result["active_match_updates"][local_match_id] = match.status
+                else:
+                    await self._sync_active_match_registration(local_match_id, match.status)
 
                 result["inserted"] += inserted
                 result["updated"] += updated

@@ -7,7 +7,7 @@ class MatchEvent(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     # Links to the fixture_id column in the matches table
-    match_id = Column(Integer, ForeignKey("matches.fixture_id"), index=True, nullable=False)
+    match_id = Column(Integer, ForeignKey("matches.local_match_id"), index=True, nullable=False)
     
     time_elapsed = Column(Integer, nullable=False)
     time_extra = Column(Integer, nullable=True)

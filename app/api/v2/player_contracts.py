@@ -120,27 +120,7 @@ async def get_match_lineup_v2(
     if not payload:
         raise HTTPException(status_code=404, detail="Lineup not found")
 
-    enriched = []
-    for lineup in payload:
-        lineup_copy = dict(lineup)
-        for section in ("startXI", "substitutes"):
-            entries = []
-            for entry in lineup_copy.get(section, []):
-                entry_copy = dict(entry)
-                provider_player = dict(entry_copy.get("player") or {})
-                provider_player_id = provider_player.get("id")
-                if provider_player_id is not None:
-                    provider_player_id = str(provider_player_id)
-                    master = await player_repository.get_by_provider_id(
-                        db, provider_player_id, "api-football"
-                    )
-                    provider_player["provider_player_id"] = provider_player_id
-                    provider_player["player_id"] = master.player_id if master else None
-                entry_copy["player"] = provider_player
-                entries.append(entry_copy)
-            lineup_copy[section] = entries
-        enriched.append(lineup_copy)
-    return enriched
+    return payload
 
 
 @router.get("/matches/{match_id}/events", response_model=list[EventResponseV2])

@@ -179,8 +179,8 @@ class FootballAPIService:
     async def get_match_events(self, match_id: int) -> Optional[dict]:
         return await self.event_service.get_match_events(match_id)
 
-    async def get_match_lineup(self, match_id: int) -> Optional[dict]:
-        return await self.lineup_service.get_match_lineup(match_id)
+    async def get_match_lineup(self, match_id: int, db: AsyncSession | None = None) -> Optional[dict]:
+        return await self.lineup_service.get_match_lineup(match_id, db=db)
 
     async def get_cached_match_lineup(self, db: AsyncSession, match_id: int) -> Optional[List[Dict[str, Any]]]:
         return await self.lineup_service.get_cached_match_lineup(db, match_id)
@@ -191,7 +191,7 @@ class FootballAPIService:
         match_id: int,
         *,
         allow_terminal_status: bool = False,
-        invalidate_cache: bool = True,
+        invalidate_cache: bool = False,
     ) -> Dict[str, Any]:
         return await self.lineup_sync_service.sync_lineup(
             db=db,
@@ -200,6 +200,7 @@ class FootballAPIService:
             cache_service=self.cache_service,
             cache_key=make_cache_key("lineup", match_id),
             allow_terminal_status=allow_terminal_status,
+            invalidate_cache=invalidate_cache,
         )
 
     async def get_match_h2h(self, match_id: int) -> Optional[dict]:

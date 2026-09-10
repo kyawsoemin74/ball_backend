@@ -43,7 +43,7 @@ class MatchLineupFinalization(Base):
 
     match_id = Column(
         Integer,
-        ForeignKey("matches.fixture_id", ondelete="NO ACTION"),
+        ForeignKey("matches.local_match_id", ondelete="NO ACTION"),
         primary_key=True,
         nullable=False,
     )

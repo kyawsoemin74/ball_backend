@@ -15,7 +15,7 @@ class AnalyticsMatchTeamStatistic(Base):
         Index("ix_analytics_statistics_team", "team_id"),
     )
     statistic_fact_id = mapped_column(BigInteger, Identity(), primary_key=True)
-    match_id = mapped_column(Integer, ForeignKey("matches.fixture_id"), nullable=False)
+    match_id = mapped_column(Integer, ForeignKey("matches.local_match_id"), nullable=False)
     team_id = mapped_column(Integer, ForeignKey("teams.team_id"), nullable=False)
     provider_team_id = mapped_column(Text, nullable=False)
     statistic_name = mapped_column(Text, nullable=False)
@@ -70,7 +70,7 @@ class AnalyticsMatchOddsSnapshot(Base):
         Index("ix_analytics_odds_market", "bookmaker_name", "market_name"),
     )
     odds_fact_id = mapped_column(BigInteger, Identity(), primary_key=True)
-    match_id = mapped_column(Integer, ForeignKey("matches.fixture_id"), nullable=False)
+    match_id = mapped_column(Integer, ForeignKey("matches.local_match_id"), nullable=False)
     bookmaker_name = mapped_column(Text, nullable=False)
     market_name = mapped_column(Text, nullable=False)
     selection = mapped_column(Text, nullable=False)
@@ -124,7 +124,7 @@ class AnalyticsMatchLineup(Base):
         Index("ix_analytics_lineups_player", "player_id"),
     )
     lineup_fact_id = mapped_column(BigInteger, Identity(), primary_key=True)
-    match_id = mapped_column(Integer, ForeignKey("matches.fixture_id"), nullable=False)
+    match_id = mapped_column(Integer, ForeignKey("matches.local_match_id"), nullable=False)
     team_id = mapped_column(Integer, ForeignKey("teams.team_id"), nullable=False)
     player_id = mapped_column(Integer, ForeignKey("players.player_id"), nullable=False)
     provider_team_id = mapped_column(Text, nullable=False)

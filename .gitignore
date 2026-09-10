@@ -8,3 +8,4 @@ __pycache__/
 # Virtual Environment သုံးထားရင် ၎င်းကိုပါ ဖျောက်ထားမယ်
 venv/
 env/
+tests/

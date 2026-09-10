@@ -4,7 +4,6 @@ from typing import Any
 from sqlalchemy.exc import MultipleResultsFound
 
 from app.repositories.player_repository import PlayerRepository
-from app.services.player_sync_service import PlayerSyncService
 
 
 PLAYER_READINESS_STATES = {
@@ -45,13 +44,10 @@ class PlayerIdentityResolutionService:
         self,
         *,
         player_repository: PlayerRepository | None = None,
-        player_sync_service: PlayerSyncService | None = None,
+        player_sync_service: object | None = None,
         provider: str = "api-football",
     ) -> None:
         self.player_repository = player_repository or PlayerRepository()
-        self.player_sync_service = player_sync_service or PlayerSyncService(
-            player_repository=self.player_repository,
-        )
         self.provider = provider
 
     def _failure(self, status: str, player_data: Any, team_id: Any, reason: str, *, retryable: bool, terminal: bool) -> PlayerReadiness:
@@ -112,19 +108,7 @@ class PlayerIdentityResolutionService:
             return PlayerReadiness(**{**result.as_dict(), "lineup_side": lineup_side, "lineup_position": lineup_position, "roster_role": roster_role})
 
         if player is None:
-            try:
-                normalized = self.player_sync_service.normalize_lineup_player({"player": player_data})
-                if not normalized:
-                    result = self._failure("INVALID", player_data, team_id, "player data could not be normalized", retryable=False, terminal=True)
-                    return PlayerReadiness(**{**result.as_dict(), "lineup_side": lineup_side, "lineup_position": lineup_position, "roster_role": roster_role})
-                await self.player_sync_service.upsert_player(db, normalized)
-                player = await self.player_repository.get_by_provider_id(db, provider_player_id, self.provider)
-            except Exception as exc:
-                result = self._failure("SYNC_UNAVAILABLE", player_data, team_id, f"Player ensure failed: {exc}", retryable=True, terminal=False)
-                return PlayerReadiness(**{**result.as_dict(), "lineup_side": lineup_side, "lineup_position": lineup_position, "roster_role": roster_role})
-
-        if player is None:
-            result = self._failure("PERMANENT_IDENTITY_FAILURE", player_data, team_id, "Player remains absent after ensure", retryable=False, terminal=True)
+            result = self._failure("MISSING", player_data, team_id, "Player Master identity is unavailable", retryable=False, terminal=True)
             return PlayerReadiness(**{**result.as_dict(), "lineup_side": lineup_side, "lineup_position": lineup_position, "roster_role": roster_role})
 
         return PlayerReadiness(
