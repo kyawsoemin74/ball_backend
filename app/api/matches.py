@@ -24,6 +24,7 @@ from app.services.cache_service import CacheService
 from app.services.league_structure_resolver import LeagueStructureResolver
 from app.services.active_match_service import active_match_service
 from app.services.resource_lock import run_with_resource_lock
+from app.services.odds_sync_service import SUCCESS, OddsTransactionFailure
 from app.services.football import football_service, LIVE_STATUSES
 
 router = APIRouter(prefix="/matches", tags=["matches"])
@@ -326,18 +327,20 @@ async def heartbeat_match(
 
 # --- POST/Sync Routes (Grouped Together) ---
 
-@router.post("/sync/h2h/{team1_id}/{team2_id}", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
+@router.post("/sync/{match_id}/h2h", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
 async def refresh_h2h_route(
-    team1_id: int = Path(..., gt=0),
-    team2_id: int = Path(..., gt=0),
+    match_id: int = Path(..., gt=0),
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
-    """Explicitly refresh and publish H2H for an authenticated admin pair request."""
-    if team1_id == team2_id:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="H2H requires two distinct teams")
+    """Explicitly refresh and publish H2H for the canonical local match identity."""
+    match = await _assert_match_allowed(match_id, db)
+    home_team_id = getattr(match, "home_team_id", None)
+    away_team_id = getattr(match, "away_team_id", None)
+    if home_team_id is None or away_team_id is None or int(home_team_id) == int(away_team_id):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="H2H requires a match with two distinct teams")
 
     async def refresh() -> dict:
-        result = await football_service.refresh_h2h(db=db, team1_id=team1_id, team2_id=team2_id)
+        result = await football_service.refresh_h2h(db=db, match_id=match_id)
         if "error" in result:
             await db.rollback()
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="H2H provider refresh failed")
@@ -349,17 +352,16 @@ async def refresh_h2h_route(
             analytics = dict(analytics)
             analytics["transaction_outcome"] = "committed"
         try:
-            pair_key = f"{min(team1_id, team2_id)}-{max(team1_id, team2_id)}"
-            await CacheService().delete(make_cache_key("match", "h2h", pair_key))
+            await CacheService().delete(make_cache_key("match", "h2h", str(match_id)))
         except Exception:
-            logger.exception("H2H refresh cache invalidation failed", extra={"team_low_id": min(team1_id, team2_id), "team_high_id": max(team1_id, team2_id)})
+            logger.exception("H2H refresh cache invalidation failed", extra={"match_id": match_id})
         return {"success": True, "updated": result.get("updated", False), "analytics": analytics}
 
     try:
         locked, result = await run_with_resource_lock(
             db,
             "h2h",
-            f"{min(team1_id, team2_id)}:{max(team1_id, team2_id)}",
+            str(match_id),
             refresh,
         )
     except HTTPException:
@@ -372,6 +374,66 @@ async def refresh_h2h_route(
         raise
     if not locked:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="H2H refresh already in progress")
+    return result
+
+
+@router.post("/sync/{match_id}/odds", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
+async def sync_match_odds_route(
+    match_id: int = Path(..., gt=0),
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    """Synchronize the current Odds snapshot for a canonical local Match."""
+    await _assert_match_allowed(match_id, db)
+    cache_key = make_cache_key("match", match_id, "odds")
+
+    async def sync() -> Dict[str, Any]:
+        try:
+            result = await football_service.odds_sync_service.refresh_odds(
+                db,
+                match_id,
+                cache_key,
+                1800,
+            )
+            if result.get("status") != SUCCESS:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=result,
+                )
+
+            await db.commit()
+            try:
+                cache_invalidated = await CacheService().delete(cache_key)
+            except Exception:
+                logger.exception("Odds refresh cache invalidation failed", extra={"match_id": match_id})
+                cache_invalidated = False
+            return {
+                "success": True,
+                "result": result,
+                "cache_invalidated": cache_invalidated,
+            }
+        except HTTPException:
+            raise
+        except OddsTransactionFailure:
+            await db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Odds persistence failed",
+            )
+        except Exception:
+            await db.rollback()
+            logger.exception("Odds refresh failed", extra={"match_id": match_id})
+            raise
+
+    try:
+        locked, result = await run_with_resource_lock(db, "odds", str(match_id), sync)
+    except HTTPException:
+        raise
+    except Exception:
+        await db.rollback()
+        raise
+    if not locked:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Odds refresh already in progress")
     return result
 
 @router.post("/sync/{match_id}/lineup", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
@@ -479,6 +541,13 @@ async def sync_full_season(
             result = await football_service.sync_full_season(db=db, league=league_id, season=season)
             if not result.get("success"):
                 await db.rollback()
+                if result.get("error_code") == "LEAGUE_IDENTITY_UNRESOLVED" or str(
+                    result.get("state", "")
+                ).startswith("IDENTITY_RESOLUTION"):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=result,
+                    )
                 return result
             await db.commit()
             await football_service.apply_active_match_updates(result.get("active_match_updates"))

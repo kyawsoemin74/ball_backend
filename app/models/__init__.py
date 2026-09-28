@@ -16,6 +16,7 @@ from app.models.match_event import MatchEvent
 from app.models.match_statistics import MatchStatistics
 from app.models.lineup_refresh_state import LineupRefreshState
 from app.models.match_lineup_finalization import MatchLineupFinalization
+from app.models.missing_lineup_identity import MissingLineupIdentity
 from app.models.analytics import (
 	AnalyticsH2HSnapshot,
 	AnalyticsMatchLineup,
@@ -26,5 +27,6 @@ from app.models.analytics import (
 from app.models.ad import Ad
 from app.models.ad_config import AdConfig
 from app.models.allowed_league import AllowedLeague
+from app.models.league_identity_recovery import LeagueIdentityRecovery
 from app.models.news import News
 from app.models.user import User

@@ -11,6 +11,7 @@ from app.services.analytics_projection_service import AnalyticsProjectionService
 from app.services.player_identity_resolution_service import PlayerIdentityResolutionService
 from app.repositories.match_repository import MatchRepository
 from app.repositories.team_repository import TeamRepository
+from app.repositories.missing_lineup_identity_repository import MissingLineupIdentityRepository
 from app.monitoring import observe_sync
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ class LineupSyncService:
         self.player_identity_resolution_service = player_identity_resolution_service or PlayerIdentityResolutionService()
         self.match_repository = MatchRepository()
         self.team_repository = team_repository or TeamRepository()
+        self.missing_identity_repository = MissingLineupIdentityRepository()
 
     async def _rollback_then_verify_existing_lineup(self, db: AsyncSession, match_id: int):
         """Crash-proof recovery contract: rollback before any repository verification query.
@@ -166,11 +168,17 @@ class LineupSyncService:
         allow_terminal_status: bool = False,
         invalidate_cache: bool = False,
     ) -> Dict[str, Any]:
-        logger.info("LINEUP_SYNC_START", extra={"match_id": match_id})
+        logger.info("LINEUP_SYNC_START", extra={"local_match_id": match_id})
 
         try:
             match = await self.lineup_repository.get_match_status(db, match_id)
-            status = (match.status or "").upper() if match and match.status else None
+            if match is None:
+                metrics = {"success": False, "match_id": match_id, "reason": "match_not_found"}
+                logger.warning("LINEUP_SYNC_FAILED", extra=_safe_lineup_log_extra(metrics))
+                logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
+                return metrics
+
+            status = (match.status or "").upper() if match.status else None
             logger.debug("LINEUP_STATUS_GATE", extra={"match_id": match_id, "status": status})
 
             if status in LINEUP_SYNC_BLOCKED_STATUSES and not allow_terminal_status:
@@ -185,11 +193,58 @@ class LineupSyncService:
                 logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
                 return metrics
 
-            api_res = await self.lineup_provider.get_match_lineup(match_id)
+            provider = str(getattr(match, "provider", "") or "").strip().casefold()
+            provider_fixture_id = getattr(match, "provider_fixture_id", None)
+            if provider != "api-football":
+                metrics = {
+                    "success": False,
+                    "match_id": match_id,
+                    "provider": provider or None,
+                    "reason": "unsupported_provider",
+                }
+                logger.warning("LINEUP_SYNC_FAILED", extra=_safe_lineup_log_extra(metrics))
+                logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
+                return metrics
+            if provider_fixture_id is None:
+                metrics = {
+                    "success": False,
+                    "match_id": match_id,
+                    "provider": provider,
+                    "reason": "provider_fixture_id_missing",
+                }
+                logger.warning("LINEUP_SYNC_FAILED", extra=_safe_lineup_log_extra(metrics))
+                logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
+                return metrics
+            if isinstance(provider_fixture_id, bool) or not isinstance(provider_fixture_id, int) or provider_fixture_id <= 0:
+                metrics = {
+                    "success": False,
+                    "match_id": match_id,
+                    "provider": provider,
+                    "provider_fixture_id": provider_fixture_id,
+                    "reason": "invalid_provider_fixture_id",
+                }
+                logger.warning("LINEUP_SYNC_FAILED", extra=_safe_lineup_log_extra(metrics))
+                logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
+                return metrics
+
+            logger.info(
+                "LINEUP_SYNC_IDENTITY_RESOLVED",
+                extra={
+                    "local_match_id": match_id,
+                    "provider": provider,
+                    "provider_fixture_id": provider_fixture_id,
+                },
+            )
+            api_res = await self.lineup_provider.get_match_lineup(provider_fixture_id)
             lineup_data = api_res.get("response") if isinstance(api_res, dict) else None
             logger.debug(
                 "LINEUP_SYNC_FETCHED",
-                extra={"match_id": match_id, "has_response": lineup_data is not None},
+                extra={
+                    "local_match_id": match_id,
+                    "provider": provider,
+                    "provider_fixture_id": provider_fixture_id,
+                    "has_response": lineup_data is not None,
+                },
             )
 
             if not validate_lineup(lineup_data):
@@ -234,8 +289,9 @@ class LineupSyncService:
 
             readiness, canonical_lineup_data = await self.player_identity_resolution_service.resolve_lineup(db, lineup_data)
             unresolved = [item.as_dict() for item in readiness if item.status != "READY"]
-            if unresolved:
-                failure = unresolved[0]
+            terminal_unresolved = [item for item in unresolved if item["status"] != "MISSING"]
+            if terminal_unresolved:
+                failure = terminal_unresolved[0]
                 metrics = {
                     "success": False,
                     "match_id": match_id,
@@ -255,7 +311,69 @@ class LineupSyncService:
                 logger.warning("LINEUP_SYNC_FAILED", extra=_safe_lineup_log_extra(metrics))
                 logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
                 return metrics
+            partial = bool(unresolved)
+            if partial:
+                partial_diagnostics = [
+                    {
+                        **item,
+                        "fixture_id": match_id,
+                        "provider_team_id": item.get("team_id"),
+                    }
+                    for item in unresolved
+                ]
+                if hasattr(db, "execute"):
+                    for item in partial_diagnostics:
+                        await self.missing_identity_repository.upsert_missing(
+                            db,
+                            match_id=match_id,
+                            provider_fixture_id=str(getattr(match, "provider_fixture_id", match_id)),
+                            local_team_id=None,
+                            provider_team_id=str(item.get("team_id")),
+                            provider="api-football",
+                            player_name=item.get("player_name"),
+                            shirt_number=None,
+                            position=None,
+                            grid=None,
+                            roster_role=item.get("roster_role") or "UNKNOWN",
+                            lineup_position=int(item.get("lineup_position") or 0),
+                            missing_reason=item.get("failure_reason") or "provider player id is missing",
+                            raw_identity_state="missing",
+                        )
+                canonical_lineup_data = [
+                    {
+                        **lineup,
+                        "startXI": [entry for entry in lineup.get("startXI", []) if entry.get("player", {}).get("player_id") is not None],
+                        "substitutes": [entry for entry in lineup.get("substitutes", []) if entry.get("player", {}).get("player_id") is not None],
+                    }
+                    for lineup in canonical_lineup_data
+                ]
             lineup_data = canonical_lineup_data
+
+            if partial:
+                valid_entries = sum(
+                    len(lineup.get("startXI", [])) + len(lineup.get("substitutes", []))
+                    for lineup in canonical_lineup_data
+                )
+                existing_partial = await self.lineup_repository.get_by_match_id(db, match_id)
+                if valid_entries:
+                    if existing_partial:
+                        await self.lineup_repository.update_one(db, existing_partial, canonical_lineup_data)
+                    else:
+                        await self.lineup_repository.create_one(db, match_id, canonical_lineup_data)
+                    if hasattr(db, "flush"):
+                        await db.flush()
+                metrics = {
+                    "success": False,
+                    "partial": True,
+                    "match_id": match_id,
+                    "created": False,
+                    "updated": False,
+                    "failure_classification": "PARTIAL",
+                    "reason": "missing_player_identity",
+                    "diagnostics": partial_diagnostics,
+                }
+                logger.warning("LINEUP_SYNC_PARTIAL", extra=_safe_lineup_log_extra(metrics))
+                return metrics
 
             validation_failure = self._validate_canonical_lineup_payload(lineup_data)
             if validation_failure:

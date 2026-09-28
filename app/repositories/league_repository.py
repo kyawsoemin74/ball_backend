@@ -38,6 +38,8 @@ class LeagueRepository:
         db: AsyncSession,
         row: dict,
     ) -> League:
+        row = dict(row)
+        row.pop("league_id", None)
         league = League(**row)
         db.add(league)
         await db.flush()
@@ -57,6 +59,21 @@ class LeagueRepository:
             query = query.where(League.league_id.in_(allowed_ids))
         result = await db.execute(query)
         return result.scalar_one_or_none()
+
+    async def attach_provider_identity(
+        self,
+        db: AsyncSession,
+        league_id: int,
+        provider: str,
+        provider_id: str | int,
+    ) -> League:
+        league = await self.get_by_id(db, league_id)
+        if league is None:
+            raise ValueError(f"League not found for league_id={league_id}")
+        league.provider = str(provider).strip()
+        league.provider_id = str(provider_id).strip()
+        await db.flush()
+        return league
 
     async def get_many_by_ids(
         self,

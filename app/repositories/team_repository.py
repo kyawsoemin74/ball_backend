@@ -27,6 +27,15 @@ class TeamRepository:
             raise ValueError(f"Multiple teams found for provider={provider} provider_id={provider_id_key}")
         return rows[0] if rows else None
 
+    async def get_null_provider_api_football_teams(self, db: AsyncSession) -> list[Team]:
+        result = await db.execute(
+            select(Team)
+            .where(Team.provider == "api-football")
+            .where(Team.provider_id.is_(None))
+            .order_by(Team.team_id)
+        )
+        return list(result.scalars().all())
+
     async def get_by_id(self, db: AsyncSession, team_id: int) -> Team | None:
         result = await db.execute(select(Team).where(Team.team_id == team_id))
         return result.scalar_one_or_none()
@@ -36,6 +45,80 @@ class TeamRepository:
             return []
         result = await db.execute(select(Team).where(Team.team_id.in_(team_ids)))
         return list(result.scalars().all())
+
+    async def list_supported_provider_teams(
+        self,
+        db: AsyncSession,
+        *,
+        league_ids: set[int],
+        seasons: dict[int, str],
+        provider: str = "api-football",
+    ) -> list[Team]:
+        if not league_ids:
+            return []
+        result = await db.execute(
+            select(Team)
+            .where(Team.provider == provider)
+            .where(Team.provider_id.is_not(None))
+            .where(Team.current_league_id.in_(league_ids))
+            .order_by(Team.team_id)
+        )
+        return [
+            team for team in result.scalars().all()
+            if str(getattr(team, "current_season", "")) == str(seasons.get(int(team.current_league_id), ""))
+        ]
+
+    async def find_candidate_null_provider_teams(
+        self,
+        db: AsyncSession,
+        provider: str,
+        name: str | None = None,
+        country: str | None = None,
+    ) -> list[Team]:
+        if not provider:
+            return []
+
+        stmt = select(Team).where(
+            Team.provider == provider,
+            Team.provider_id.is_(None),
+        )
+        if name and name.strip():
+            normalized_name = name.strip()
+            stmt = stmt.where(Team.name == normalized_name)
+        if country and country.strip():
+            stmt = stmt.where(Team.country == country.strip())
+
+        result = await db.execute(stmt.order_by(Team.team_id))
+        return list(result.scalars().all())
+
+    async def attach_provider_identity(
+        self,
+        db: AsyncSession,
+        team_id: int,
+        provider: str,
+        provider_id: str | int,
+    ) -> Team:
+        provider_id_key = str(provider_id)
+        await db.execute(
+            update(Team)
+            .where(Team.team_id == team_id)
+            .values(provider=provider, provider_id=provider_id_key)
+        )
+        await db.flush()
+        return await self.get_by_id(db, team_id)
+
+    async def release_provider_identity(
+        self,
+        db: AsyncSession,
+        team_id: int,
+    ) -> Team | None:
+        await db.execute(
+            update(Team)
+            .where(Team.team_id == team_id)
+            .values(provider_id=None)
+        )
+        await db.flush()
+        return await self.get_by_id(db, team_id)
 
     async def upsert_many(self, db: AsyncSession, rows: list[dict]) -> None:
         if not rows:

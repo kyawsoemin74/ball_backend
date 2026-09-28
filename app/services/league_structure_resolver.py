@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.match import Match
+from app.models.league_season import LeagueSeason
 from app.models.standing import Standings
 
 
@@ -87,9 +88,10 @@ class LeagueStructureResolver:
             # are reused across years; league-only checks leak previous-season data.
             result = await db.execute(
                 select(Standings.id, Standings.group_name)
+                .join(LeagueSeason, LeagueSeason.id == Standings.league_season_id)
                 .where(
-                    Standings.league_id == match.league_id,
-                    Standings.season == str(standings_season),
+                    LeagueSeason.league_id == match.league_id,
+                    LeagueSeason.season == str(standings_season),
                 )
                 .order_by(Standings.group_name.is_(None), Standings.position)
                 .limit(1)

@@ -98,6 +98,7 @@ class FootballAPIService:
             self.cache_service,
             self.standing_service,
             fixture_provider=self.fixture_provider,
+            league_service=self.league_service,
         )
         self.match_service = match_service or MatchService(
             self.client,
@@ -170,6 +171,9 @@ class FootballAPIService:
     async def sync_live_matches(self, db: AsyncSession) -> dict:
         return await self.fixture_sync_service.sync_live_matches(db)
 
+    async def reconcile_recent_non_terminal(self, db: AsyncSession) -> dict:
+        return await self.fixture_sync_service.reconcile_recent_non_terminal(db)
+
     async def apply_active_match_updates(self, updates: dict[int, str | None] | None) -> None:
         await self.fixture_sync_service.apply_active_match_updates(updates)
 
@@ -203,8 +207,8 @@ class FootballAPIService:
             invalidate_cache=invalidate_cache,
         )
 
-    async def get_match_h2h(self, match_id: int) -> Optional[dict]:
-        return await self.h2h_service.get_match_h2h(match_id)
+    async def get_match_h2h(self, provider_fixture_id: int) -> Optional[dict]:
+        return await self.h2h_service.get_match_h2h(provider_fixture_id)
 
     async def get_cached_statistics(self, db: AsyncSession, match_id: int) -> Optional[dict]:
         return await self.statistics_service.get_cached_statistics(db, match_id)
@@ -216,10 +220,10 @@ class FootballAPIService:
         return await self.statistics_service.sync_match_statistics(db, match_id)
 
     async def get_cached_h2h(self, db: AsyncSession, team1_id: int, team2_id: int, match_id: int) -> Optional[dict]:
-        return await self.h2h_service.get_cached_h2h(db, team1_id, team2_id, match_id)
+        return await self.h2h_service.get_cached_h2h(db, team1_id=team1_id, team2_id=team2_id, match_id=match_id)
 
-    async def refresh_h2h(self, db: AsyncSession, team1_id: int, team2_id: int) -> dict:
-        return await self.h2h_service.refresh_h2h(db, team1_id, team2_id)
+    async def refresh_h2h(self, db: AsyncSession, match_id: int) -> dict:
+        return await self.h2h_service.refresh_h2h(db, match_id=match_id)
 
     async def get_match_odds(self, match_id: int) -> Optional[dict]:
         return await self.odds_service.get_match_odds(match_id)
@@ -257,8 +261,8 @@ class FootballAPIService:
     async def get_team_statistics(self, db: AsyncSession, team_id: int, league_id: int, season: int) -> Optional[dict]:
         return await self.team_service.get_cached_team_statistics(db, team_id, league_id, season)
 
-    async def get_league_standings(self, league_id: int, season: int) -> Optional[dict]:
-        return await self.standing_service.get_league_standings(league_id, season)
+    async def get_league_standings(self, provider_league_id: int, season: int) -> Optional[dict]:
+        return await self.standing_service.get_league_standings(provider_league_id, season)
 
     async def upsert_league(self, db: AsyncSession, league_data: dict) -> League:
         return await self.league_sync_service.upsert_league(db, league_data)
@@ -272,8 +276,21 @@ class FootballAPIService:
     async def sync_standings(self, db: AsyncSession, league_id: int, season: int) -> dict:
         return await self.standing_service.sync_standings(db, league_id, season)
 
-    async def upsert_standings(self, db: AsyncSession, standings_data: list, league_id: int, season: str):
-        return await self.standing_service.upsert_standings(db, standings_data, league_id, season)
+    async def upsert_standings(
+        self,
+        db: AsyncSession,
+        standings_data: list,
+        league_id: int,
+        season: str,
+        league_season_id: int | None = None,
+    ):
+        return await self.standing_service.upsert_standings(
+            db,
+            standings_data,
+            league_id,
+            season,
+            league_season_id=league_season_id,
+        )
 
     async def get_cached_standings(self, db: AsyncSession, league_id: int, season: int | str) -> Optional[list]:
         return await self.standing_service.get_cached_standings(db, league_id, season)

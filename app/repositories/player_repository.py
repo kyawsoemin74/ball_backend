@@ -42,6 +42,14 @@ class PlayerRepository:
         result = await db.execute(select(Player))
         return result.scalars().all()
 
+    async def get_null_provider_candidates(self, db: AsyncSession) -> List[Player]:
+        """Get only legacy candidates eligible for evidence-backed reuse."""
+        result = await db.execute(
+            select(Player)
+            .where((Player.provider_id.is_(None)) | (Player.provider_id == ""))
+        )
+        return result.scalars().all()
+
     async def create(self, db: AsyncSession, player_data: dict) -> Player:
         """Create a new player."""
         db_player = Player(**player_data)

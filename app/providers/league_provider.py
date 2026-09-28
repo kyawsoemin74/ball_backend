@@ -15,5 +15,8 @@ class LeagueProvider:
     async def get_league_details(self, league_id: int) -> Optional[dict]:
         return await self.client.get("/leagues", params={"id": league_id})
 
+    async def get_leagues_by_name(self, name: str) -> Optional[dict]:
+        return await self.client.get("/leagues", params={"name": name})
+
     async def get_all_leagues(self) -> Optional[dict]:
         return await self.client.get("/leagues")

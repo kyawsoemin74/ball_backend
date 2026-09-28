@@ -13,8 +13,8 @@ class CacheService:
     async def set_json(self, key: str, value: Any, ttl: int) -> None:
         await cache_set_json(key, value, ttl)
 
-    async def delete(self, key: str) -> None:
-        await cache_delete(key)
+    async def delete(self, key: str) -> bool:
+        return await cache_delete(key)
 
     def delete_sync(self, key: str) -> None:
         cache_delete_sync(key)

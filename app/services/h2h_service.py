@@ -53,20 +53,46 @@ class H2HService:
 
         return sorted(payload, key=sort_key, reverse=True)
 
-    async def get_match_h2h(self, match_id: int) -> Optional[dict]:
-        return await self.h2h_provider.get_match_h2h(match_id)
+    @staticmethod
+    def _build_h2h_key(team1_id: int, team2_id: int) -> str:
+        ids = sorted([int(team1_id), int(team2_id)])
+        return f"{ids[0]}-{ids[1]}"
 
-    async def get_cached_h2h(self, db: AsyncSession, team1_id: int, team2_id: int, match_id: int) -> Optional[dict]:
-        ids = sorted([team1_id, team2_id])
-        h2h_key = f"{ids[0]}-{ids[1]}"
-        cache_key = make_cache_key("match", "h2h", h2h_key)
+    async def get_match_h2h(self, provider_fixture_id: int) -> Optional[dict]:
+        return await self.h2h_provider.get_match_h2h(provider_fixture_id)
 
+    async def get_cached_h2h(
+        self,
+        db: AsyncSession,
+        *args,
+        match_id: int | None = None,
+        team1_id: int | None = None,
+        team2_id: int | None = None,
+    ) -> Optional[dict]:
+        if args:
+            if len(args) == 1:
+                match_id = int(args[0])
+            elif len(args) == 2:
+                team1_id, team2_id = int(args[0]), int(args[1])
+            elif len(args) == 3:
+                team1_id, team2_id, match_id = int(args[0]), int(args[1]), int(args[2])
+
+        if match_id is not None:
+            match = (await db.execute(select(Match).where(Match.match_id == match_id))).scalar_one_or_none()
+            if match is not None:
+                team1_id = int(getattr(match, "home_team_id", 0) or 0)
+                team2_id = int(getattr(match, "away_team_id", 0) or 0)
+
+        if team1_id is None or team2_id is None:
+            return None
+
+        local_h2h_key = self._build_h2h_key(team1_id, team2_id)
+        cache_key = make_cache_key("match", "h2h", str(match_id) if match_id is not None else local_h2h_key)
         cached = await self.cache_service.get_json(cache_key)
         if cached is not None:
             return self._prepare_h2h_payload(cached)
 
-        match = (await db.execute(select(Match).where(Match.match_id == match_id))).scalar_one_or_none()
-        if not match:
+        if match_id is None:
             return None
 
         team_repository = TeamRepository()
@@ -74,13 +100,7 @@ class H2HService:
         away_team = await team_repository.get_by_id(db, team2_id)
         if home_team is None or away_team is None:
             return None
-        home_provider_id = getattr(home_team, "provider_id", None)
-        away_provider_id = getattr(away_team, "provider_id", None)
-        if home_provider_id is None or away_provider_id is None:
-            return None
-        provider_h2h_key = "-".join(sorted([str(home_provider_id), str(away_provider_id)], key=int))
-
-        db_record = (await db.execute(select(MatchH2H).where(MatchH2H.h2h_key == h2h_key))).scalar_one_or_none()
+        db_record = (await db.execute(select(MatchH2H).where(MatchH2H.h2h_key == local_h2h_key))).scalar_one_or_none()
         if db_record:
             prepared_payload = self._prepare_h2h_payload(db_record.data)
             # Read path remains read-only for H2H. Cache rebuilds are owned by
@@ -90,18 +110,8 @@ class H2HService:
         # Reads never trigger Analytics publication. Call refresh_h2h explicitly from a source owner.
         return None
 
-    async def refresh_h2h(self, db: AsyncSession, team1_id: int, team2_id: int) -> dict:
-        teams = await self._resolve_provider_team_ids(db, team1_id, team2_id)
-        provider_h2h_key = "-".join(sorted([str(teams[0]), str(teams[1])], key=int))
-        result = await self.h2h_sync_service.refresh_h2h(db, provider_h2h_key)
+    async def refresh_h2h(self, db: AsyncSession, match_id: int) -> dict:
+        result = await self.h2h_sync_service.refresh_h2h(db, int(match_id))
         if "data" in result:
             result["data"] = self._prepare_h2h_payload(result["data"])
         return result
-
-    async def _resolve_provider_team_ids(self, db: AsyncSession, team1_id: int, team2_id: int) -> tuple[int, int]:
-        repository = TeamRepository()
-        first = await repository.get_by_id(db, team1_id)
-        second = await repository.get_by_id(db, team2_id)
-        if first is None or second is None or getattr(first, "provider_id", None) is None or getattr(second, "provider_id", None) is None:
-            raise ValueError("unresolved Team identity for H2H refresh")
-        return int(first.provider_id), int(second.provider_id)

@@ -7,6 +7,7 @@ from functools import wraps
 import re
 import logging
 from typing import Any
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.repositories.analytics_repository import (
     AnalyticsH2HRepository,
@@ -16,6 +17,8 @@ from app.repositories.analytics_repository import (
     AnalyticsStatisticsRepository,
 )
 from app.repositories.league_season_repository import LeagueSeasonRepository
+from app.repositories.match_repository import MatchRepository
+from app.repositories.player_repository import PlayerRepository
 from app.repositories.team_repository import TeamRepository
 
 logger = logging.getLogger(__name__)
@@ -102,8 +105,12 @@ class AnalyticsProjectionService:
     def unavailable_for_fake_db(exc: AttributeError) -> bool:
         return True
 
-    def __init__(self, *, team_repository=None, player_repository=None, league_season_repository=None):
+    def __init__(self, *, team_repository=None, player_repository=None, league_season_repository=None, match_repository=None):
+        self._custom_player_repository = player_repository is not None
+        self._custom_match_repository = match_repository is not None
         self.team_repository = team_repository or TeamRepository()
+        self.player_repository = player_repository or PlayerRepository()
+        self.match_repository = match_repository or MatchRepository()
         self.league_season_repository = league_season_repository or LeagueSeasonRepository()
         self.statistics_repository = AnalyticsStatisticsRepository()
         self.standing_repository = AnalyticsStandingRepository()
@@ -241,8 +248,8 @@ class AnalyticsProjectionService:
     @_projection_observer("odds", lambda args, kwargs: {"match_id": args[0] if args else kwargs.get("match_id")})
     async def project_odds(self, db, match_id: int, rows: list[dict]) -> dict:
         scope = {"match_id": match_id}
-        approved_bookmakers = {"1xbet", "1xbet"}
-        approved_markets = {"Match Winner", "Asian Handicap", "Goals Over/Under", "Both Teams Score"}
+        approved_bookmakers = {"bet365"}
+        approved_markets = {"MATCH_WINNER", "ASIAN_HANDICAP", "GOALS_OVER_UNDER", "CORNERS_OVER_UNDER"}
         source = [row for row in rows if str(row.get("bookmaker_name", "")).strip().lower() in approved_bookmakers and row.get("market_name") in approved_markets]
         projected = []
         seen = set()
@@ -271,28 +278,71 @@ class AnalyticsProjectionService:
     @_projection_observer("lineup", lambda args, kwargs: {"match_id": args[0] if args else kwargs.get("match_id")})
     async def project_lineup(self, db, match_id: int, payload: list[dict]) -> dict:
         scope = {"match_id": match_id}
+        if not isinstance(match_id, int) or match_id <= 0:
+            raise ValueError("LINEUP_VALIDATION_FAILED: local match identity is invalid")
+        validate_database = isinstance(db, AsyncSession)
+        validate_match = validate_database or self._custom_match_repository
+        validate_player = validate_database or self._custom_player_repository
+        if validate_match and hasattr(self.match_repository, "get_by_id"):
+            match = await self.match_repository.get_by_id(db, match_id)
+            if match is None:
+                raise ValueError("MATCH_IDENTITY_RESOLUTION_FAILED: match does not exist")
+        if not isinstance(payload, list):
+            raise ValueError("LINEUP_VALIDATION_FAILED: lineup payload must be a list")
+
         projected = []
         seen = set()
         for lineup in payload:
-            team_data = lineup.get("team") if isinstance(lineup, dict) else None
+            if not isinstance(lineup, dict):
+                raise ValueError("LINEUP_VALIDATION_FAILED: lineup entry is invalid")
+            team_data = lineup.get("team")
             provider_team_id = team_data.get("id") if isinstance(team_data, dict) else None
+            if provider_team_id in (None, ""):
+                raise ValueError("TEAM_IDENTITY_RESOLUTION_FAILED: provider team identity is missing")
             team = await self.team_repository.find_by_provider_identity(db, "api-football", provider_team_id)
             if team is None:
-                raise ValueError("unresolved Team identity in lineup")
+                raise ValueError("TEAM_IDENTITY_RESOLUTION_FAILED: unresolved Team identity in lineup")
+            team_provider = getattr(team, "provider", None)
+            team_provider_id = getattr(team, "provider_id", None)
+            if team_provider is not None and str(team_provider).casefold() != "api-football":
+                raise ValueError("TEAM_IDENTITY_RESOLUTION_FAILED: Team provider mismatch")
+            if team_provider_id is not None and str(team_provider_id) != str(provider_team_id):
+                raise ValueError("TEAM_IDENTITY_RESOLUTION_FAILED: Team provider identity mismatch")
             for section, role in (("startXI", "STARTER"), ("substitutes", "SUBSTITUTE")):
                 players = lineup.get(section)
                 if not isinstance(players, list):
-                    raise ValueError("invalid lineup section")
+                    raise ValueError("LINEUP_VALIDATION_FAILED: invalid lineup section")
                 for entry in players:
                     player_data = entry.get("player") if isinstance(entry, dict) else None
-                    player_id = player_data.get("player_id") if isinstance(player_data, dict) else None
+                    if not isinstance(player_data, dict):
+                        raise ValueError("LINEUP_VALIDATION_FAILED: lineup Player entry is invalid")
+                    player_id = player_data.get("player_id")
                     if player_id is None:
                         raise ValueError("IDENTITY_BOUNDARY_VIOLATION: unresolved Player canonical player_id is required")
+                    try:
+                        player_id = int(player_id)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("IDENTITY_BOUNDARY_VIOLATION: canonical player_id is invalid") from exc
+                    if player_id <= 0:
+                        raise ValueError("IDENTITY_BOUNDARY_VIOLATION: canonical player_id is invalid")
+                    provider_player_id = player_data.get("id") or player_data.get("provider_player_id")
+                    if provider_player_id in (None, ""):
+                        raise ValueError("PLAYER_IDENTITY_RESOLUTION_FAILED: provider Player identity is missing")
+                    if validate_player and hasattr(self.player_repository, "get_by_id"):
+                        player = await self.player_repository.get_by_id(db, player_id)
+                        if player is None:
+                            raise ValueError("PLAYER_IDENTITY_RESOLUTION_FAILED: canonical Player does not exist")
+                        player_provider = getattr(player, "provider", None)
+                        player_provider_id = getattr(player, "provider_id", None)
+                        if player_provider is not None and str(player_provider).casefold() != "api-football":
+                            raise ValueError("PLAYER_IDENTITY_RESOLUTION_FAILED: Player provider mismatch")
+                        if player_provider_id is not None and str(player_provider_id) != str(provider_player_id):
+                            raise ValueError("PLAYER_IDENTITY_RESOLUTION_FAILED: Player provider identity mismatch")
                     key = (int(team.team_id), int(player_id), role)
                     if key in seen:
                         return self._result(scope, len(projected) + 1, 0, [], duplicate_count=1, reason="duplicate_source_rejected")
                     seen.add(key)
-                    projected.append({"team_id": key[0], "player_id": key[1], "provider_team_id": str(provider_team_id), "provider_player_id": str(player_data.get("id")), "roster_role": role, "shirt_number": player_data.get("number"), "position": player_data.get("pos"), "grid": player_data.get("grid"), "formation": lineup.get("formation"), "source_provider": "api-football"})
+                    projected.append({"team_id": key[0], "player_id": key[1], "provider_team_id": str(provider_team_id), "provider_player_id": str(provider_player_id), "roster_role": role, "shirt_number": player_data.get("number"), "position": player_data.get("pos"), "grid": player_data.get("grid"), "formation": lineup.get("formation"), "source_provider": "api-football"})
         if not projected:
             existing = await self.lineup_repository.list_by_match(db, match_id)
             return self._result(scope, 0, 0, existing, reason="empty_preserved")

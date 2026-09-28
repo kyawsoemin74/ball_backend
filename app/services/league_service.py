@@ -6,12 +6,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.league import League
 from app.providers.league_provider import LeagueProvider
+from app.providers.team_provider import TeamProvider
 from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.league_repository import LeagueRepository
 from app.services.base.football_client import FootballAPIClient
 from app.services.cache_service import CacheService
 from app.services.country_sync_service import CountrySyncService
 from app.services.league_sync_service import LeagueSyncService
+from app.services.league_identity_recovery_service import LeagueIdentityRecoveryService
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,7 @@ class LeagueService:
     ) -> None:
         self.client = client
         self.league_provider = league_provider or LeagueProvider(client)
+        self.team_provider = getattr(team_sync_service, "team_provider", None) or TeamProvider(client)
         self.cache_service = cache_service or CacheService()
         self._league_repository = LeagueRepository()
         self._allowed_league_repository = AllowedLeagueRepository()
@@ -50,6 +53,11 @@ class LeagueService:
             fetch_all_leagues=self.get_all_leagues,
             fetch_league_teams=self.get_league_teams,
             team_sync_service=team_sync_service,
+        )
+        self.league_identity_recovery_service = LeagueIdentityRecoveryService(
+            league_provider=self.league_provider,
+            league_repository=self._league_repository,
+            cache_service=self.cache_service,
         )
         self._league_sync_upsert_impl = self.league_sync_service.upsert_league
         self.league_sync_service.upsert_league = self._upsert_league_bridge
@@ -209,7 +217,7 @@ class LeagueService:
         return await self.league_provider.get_all_leagues()
 
     async def get_league_teams(self, league_id: int, season: int) -> Optional[list[dict]]:
-        return await self.league_provider.get_league_teams(league_id, season)
+        return await self.team_provider.get_league_teams(league_id, season)
 
     async def register_league(
         self,
@@ -217,14 +225,7 @@ class LeagueService:
         provider: str,
         provider_id: int,
     ) -> tuple[League, bool]:
-        if provider != "api-football":
-            raise ValueError("Unsupported league provider")
-        if (
-            not isinstance(provider_id, int)
-            or isinstance(provider_id, bool)
-            or provider_id <= 0
-        ):
-            raise ValueError("provider_id must be a positive integer")
+        self._validate_provider_identity(provider, provider_id)
 
         provider_id_text = str(provider_id)
         existing = await self._league_repository.find_by_provider_identity(
@@ -234,10 +235,6 @@ class LeagueService:
         )
         if existing is not None:
             return existing, False
-
-        local_collision = await self._league_repository.get_by_id(db, provider_id)
-        if local_collision is not None:
-            raise ValueError("Canonical local league_id is already occupied")
 
         result = await self.league_provider.get_league_details(provider_id)
         if result is None:
@@ -261,33 +258,87 @@ class LeagueService:
             country = country_payload or league_payload.get("country")
             country_code = league_payload.get("country_code")
 
-        country_result = await self.country_sync_service.sync_country(
+        league, created = await self.onboard_provider_league(
             db,
+            provider,
             {
-                "name": country,
-                "code": country_code,
+                "league": league_payload,
+                "country": {"name": country, "code": country_code} if country else None,
             },
-            source="league_registration",
-        ) if country else {"country": None}
+        )
+        return league, created
+
+    @staticmethod
+    def _validate_provider_identity(provider: str, provider_id: object) -> None:
+        if provider != "api-football":
+            raise ValueError("Unsupported league provider")
+        if (
+            not isinstance(provider_id, int)
+            or isinstance(provider_id, bool)
+            or provider_id <= 0
+        ):
+            raise ValueError("provider_id must be a positive integer")
+
+    async def onboard_provider_league(
+        self,
+        db: AsyncSession,
+        provider: str,
+        league_data: dict,
+    ) -> tuple[League, bool]:
+        league_payload = league_data.get("league") or league_data
+        provider_id = league_payload.get("id")
+        self._validate_provider_identity(provider, provider_id)
+        provider_id_text = str(provider_id)
+
+        existing = await self._league_repository.find_by_provider_identity(
+            db, provider, provider_id_text
+        )
+        if existing is not None:
+            if getattr(existing, "country_id", None) is None:
+                await self._sync_required_country(db, league_data, existing)
+            return existing, False
+
+        name = league_payload.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Provider league metadata is missing a name")
+
+        country_result = await self.country_sync_service.sync_from_league_payload(
+            db, league_data
+        )
         country_record = country_result.get("country") if isinstance(country_result, dict) else None
         country_id = country_record.get("country_id") if isinstance(country_record, dict) else None
+        if country_id is None:
+            raise ValueError("Provider league country could not be resolved")
 
         row = {
-            "league_id": provider_id,
             "provider": provider,
             "provider_id": provider_id_text,
             "name": name.strip(),
-            "country": country,
-            "country_code": country_code,
+            "country": country_record.get("name"),
+            "country_code": country_record.get("code"),
             "logo": league_payload.get("logo"),
             "type": league_payload.get("type"),
             "national": league_payload.get("national"),
-            "country_id": country_id,
+            "country_id": int(country_id),
             "season": None,
             "is_featured": False,
             "display_order": 999,
         }
         return await self._league_repository.create_registered(db, row), True
+
+    async def _sync_required_country(
+        self,
+        db: AsyncSession,
+        league_data: dict,
+        league: League,
+    ) -> None:
+        result = await self.country_sync_service.sync_from_league_payload(db, league_data)
+        country = result.get("country") if isinstance(result, dict) else None
+        country_id = country.get("country_id") if isinstance(country, dict) else None
+        if country_id is None:
+            raise ValueError("Provider league country could not be resolved")
+        league.country_id = int(country_id)
+        await self._league_repository.update_country_id(db, league.league_id, int(country_id))
 
     async def upsert_league(
         self,
@@ -303,3 +354,6 @@ class LeagueService:
 
     async def sync_all_leagues(self, db: AsyncSession) -> dict:
         return await self.league_sync_service.sync_all_leagues(db)
+
+    async def recover_provider_identity(self, league_id: int) -> dict:
+        return await self.league_identity_recovery_service.recover(league_id)

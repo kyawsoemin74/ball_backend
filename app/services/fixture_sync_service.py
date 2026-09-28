@@ -35,11 +35,15 @@ logger = logging.getLogger(__name__)
 
 FINISHED_STATUSES = {"FT", "AET", "PEN", "CANC", "ABD", "AWD", "WO"}
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "LIVE", "BT", "P"}
-ACTIVE_MATCH_REGISTER_STATUSES = {"1H", "2H", "HT", "LIVE"}
+ACTIVE_MATCH_REGISTER_STATUSES = {"1H", "2H", "HT", "ET", "BT", "P", "LIVE"}
 ACTIVE_MATCH_TERMINAL_STATUSES = FINISHED_STATUSES | {"PST"}
 FINALIZATION_TERMINAL_STATUSES = ACTIVE_MATCH_TERMINAL_STATUSES
 FINAL_LINEUP_TERMINAL_STATUSES = {"FT", "AET", "PEN"}
 NON_TERMINAL_STATUSES = {"NS", "TBD", "1H", "2H", "HT", "ET", "LIVE", "BT", "P"}
+RECENT_RECONCILIATION_LOOKBACK = timedelta(hours=24)
+RECENT_RECONCILIATION_LOOKAHEAD = timedelta(hours=24)
+RECENT_RECONCILIATION_BATCH_SIZE = 20
+RECENT_RECONCILIATION_LIMIT = 200
 
 
 class FixtureSyncService:
@@ -51,6 +55,7 @@ class FixtureSyncService:
         standing_service: StandingService | None = None,
         fixture_provider: FixtureProvider | None = None,
         referee_sync_service: RefereeSyncService | None = None,
+        league_service=None,
     ) -> None:
         self.client = client
         self.fixture_provider = fixture_provider or FixtureProvider(self.client)
@@ -65,6 +70,8 @@ class FixtureSyncService:
         self.venue_sync_service = VenueSyncService()
         self.referee_sync_service = referee_sync_service or RefereeSyncService()
         self.league_season_sync_service = LeagueSeasonSyncService()
+        self.league_service = league_service
+        self._allow_terminal_transition = False
 
     @staticmethod
     async def _begin_fixture_savepoint(db):
@@ -317,6 +324,196 @@ class FixtureSyncService:
             logger.error("Parsing error for Fixture ID %s: %s", fixture.get("fixture", {}).get("id"), exc)
             return None
 
+    async def process_fixture(self, db: AsyncSession, fixture: dict) -> dict:
+        """Process one provider fixture through the shared sync and transition path."""
+        result, _ = await self._process_sync_with_candidates(db, [fixture])
+        return result
+
+    async def final_live_sync(
+        self,
+        db: AsyncSession,
+        provider_fixture_id: int,
+        *,
+        trigger_status: str,
+        local_match_id: int,
+    ) -> dict:
+        """Fetch and persist one authoritative terminal fixture state."""
+        metrics = {
+            "success": False,
+            "provider_fixture_id": int(provider_fixture_id),
+            "local_match_id": int(local_match_id),
+            "trigger_status": str(trigger_status).upper(),
+        }
+        logger.info("FINAL_LIVE_SYNC_REQUIRED", extra=metrics)
+
+        async def sync_final_fixture() -> dict:
+            logger.info("FINAL_LIVE_SYNC_STARTED", extra=metrics)
+            try:
+                response = await self.fixture_provider.get_fixtures_by_ids([str(provider_fixture_id)])
+            except Exception as exc:
+                metrics.update({"reason": "provider_request_failed", "failure_category": "PROVIDER_FAILURE"})
+                logger.warning("FINAL_LIVE_SYNC_RETRYABLE", extra={**metrics, "error_type": exc.__class__.__name__})
+                return metrics
+
+            fixtures = response.get("response") if isinstance(response, dict) else None
+            final_fixture = next(
+                (
+                    fixture
+                    for fixture in (fixtures or [])
+                    if str((fixture.get("fixture") or {}).get("id")) == str(provider_fixture_id)
+                ),
+                None,
+            )
+            final_status = str(
+                ((final_fixture or {}).get("fixture") or {}).get("status", {}).get("short", "")
+            ).upper()
+            logger.info(
+                "FINAL_LIVE_SYNC_PROVIDER_FETCH",
+                extra={**metrics, "final_status": final_status, "response_count": len(fixtures or [])},
+            )
+            if final_fixture is None:
+                metrics.update({"reason": "final_fixture_missing", "failure_category": "INVALID_RESPONSE"})
+                logger.warning("FINAL_LIVE_SYNC_RETRYABLE", extra=metrics)
+                return metrics
+            if final_status not in FINAL_LINEUP_TERMINAL_STATUSES:
+                metrics.update({"reason": "fresh_response_non_terminal", "failure_category": "NON_TERMINAL_FINAL_RESPONSE"})
+                logger.warning("FINAL_LIVE_SYNC_RETRYABLE", extra={**metrics, "final_status": final_status})
+                return metrics
+
+            sync_result, _ = await self._process_sync_with_candidates(db, [final_fixture])
+            if (
+                not sync_result.get("success")
+                or sync_result.get("failed", 0)
+                or sync_result.get("total") != 1
+                or sync_result.get("inserted", 0) + sync_result.get("updated", 0) != 1
+            ):
+                metrics.update({"reason": "final_fixture_persistence_failed", "failure_category": "PERSISTENCE_FAILURE"})
+                logger.warning("FINAL_LIVE_SYNC_RETRYABLE", extra={**metrics, "final_status": final_status})
+                return metrics
+
+            metrics.update(
+                {
+                    "success": True,
+                    "final_status": final_status,
+                    "home_score": ((final_fixture.get("goals") or {}).get("home")),
+                    "away_score": ((final_fixture.get("goals") or {}).get("away")),
+                    "elapsed": (((final_fixture.get("fixture") or {}).get("status") or {}).get("elapsed")),
+                }
+            )
+            logger.info("FINAL_LIVE_SYNC_PERSISTED", extra=metrics)
+            logger.info("FINAL_LIVE_SYNC_SUCCESS", extra=metrics)
+            return metrics
+
+        locked, outcome = await run_with_resource_lock(
+            db,
+            "fixture",
+            provider_fixture_id,
+            sync_final_fixture,
+        )
+        if not locked:
+            metrics.update({"reason": "lock_not_acquired", "failure_category": "LOCK_CONTENTION"})
+            logger.info("FINAL_LIVE_SYNC_RETRYABLE", extra=metrics)
+            return metrics
+        return outcome or metrics
+
+    async def handle_terminal_transition(
+        self,
+        db: AsyncSession,
+        local_match_id: int,
+        provider_fixture_id: int,
+        previous_status: str | None,
+        normalized_status: str,
+        result: dict,
+    ) -> None:
+        allow_terminal_transition = getattr(self, "_allow_terminal_transition", None)
+        if allow_terminal_transition is False:
+            return
+        if previous_status not in NON_TERMINAL_STATUSES:
+            return
+        if normalized_status not in FINAL_LINEUP_TERMINAL_STATUSES:
+            return
+
+        final_sync = await self.final_live_sync(
+            db,
+            int(provider_fixture_id),
+            trigger_status=normalized_status,
+            local_match_id=local_match_id,
+        )
+        result["final_live_sync"] = final_sync
+        if not final_sync.get("success"):
+            result["success"] = False
+            raise RuntimeError(f"FINAL_LIVE_SYNC_FAILED: {final_sync.get('reason', 'unknown')}")
+
+        finalization = await self.final_lineup_finalization_repository.create_required(
+            db,
+            local_match_id,
+        )
+        if finalization.status != "SUCCESS":
+            logger.info(
+                "FINAL_LINEUP_REQUIRED match_id=%s previous_status=%s new_status=%s",
+                local_match_id,
+                previous_status,
+                normalized_status,
+            )
+            result["final_lineup_candidates"].append(local_match_id)
+
+    async def reconcile_recent_non_terminal(self, db: AsyncSession) -> dict:
+        """Re-check bounded recent local non-terminal fixtures by provider ID."""
+        allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
+        now_utc = datetime.now(timezone.utc)
+        candidates = await self.match_repository.get_recent_non_terminal(
+            db,
+            allowed_ids,
+            now_utc - RECENT_RECONCILIATION_LOOKBACK,
+            now_utc + RECENT_RECONCILIATION_LOOKAHEAD,
+            NON_TERMINAL_STATUSES,
+            limit=RECENT_RECONCILIATION_LIMIT,
+        )
+        provider_ids = [str(match.provider_fixture_id) for match in candidates if match.provider_fixture_id is not None]
+        result = {
+            "success": True,
+            "selected": len(provider_ids),
+            "fetched": 0,
+            "inserted": 0,
+            "updated": 0,
+            "failed": 0,
+            "final_lineup_candidates": [],
+            "active_match_updates": {},
+        }
+        if not provider_ids:
+            return result
+
+        provider_fixtures = []
+        try:
+            for offset in range(0, len(provider_ids), RECENT_RECONCILIATION_BATCH_SIZE):
+                response = await self.fixture_provider.get_fixtures_by_ids(
+                    provider_ids[offset : offset + RECENT_RECONCILIATION_BATCH_SIZE]
+                )
+                if not isinstance(response, dict) or not isinstance(response.get("response"), list):
+                    return {**result, "success": False, "message": "Invalid provider response"}
+                provider_fixtures.extend(response["response"])
+        except Exception as exc:
+            logger.warning("RECENT_FIXTURE_RECONCILIATION_PROVIDER_FAILED error=%s", exc)
+            return {**result, "success": False, "message": "Provider request failed"}
+
+        result["fetched"] = len(provider_fixtures)
+        if not provider_fixtures:
+            return result
+
+        try:
+            self._defer_live_cache_invalidation = True
+            for fixture in provider_fixtures:
+                sync_result = await self.process_fixture(db, fixture)
+                for key in ("inserted", "updated", "failed"):
+                    result[key] += sync_result.get(key, 0)
+                result["final_lineup_candidates"].extend(sync_result.get("final_lineup_candidates", []))
+                result["active_match_updates"].update(sync_result.get("active_match_updates", {}))
+                result["success"] = result["success"] and sync_result.get("success", False)
+            result["final_lineup_candidates"] = sorted(set(result["final_lineup_candidates"]))
+        finally:
+            self._defer_live_cache_invalidation = False
+        return result
+
     async def _process_sync_with_candidates(self, db: AsyncSession, fixtures: list) -> tuple[dict, set[tuple[int, int]]]:
         allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
         if not allowed_ids:
@@ -324,17 +521,20 @@ class FixtureSyncService:
             return {"success": True, "inserted": 0, "updated": 0, "total": 0, "failed": 0, "final_lineup_candidates": []}, set()
 
         filtered_fixtures = []
+        unresolved_identity_count = 0
         for fixture_raw in fixtures:
             league_info = fixture_raw.get("league") or {}
             provider_id = league_info.get("id")
             league_name = league_info.get("name") or "Unknown league"
             if provider_id is None:
                 logger.warning("Skipping fixture %s with missing league_id", fixture_raw.get("fixture", {}).get("id"))
+                unresolved_identity_count += 1
                 continue
 
             master = await self.league_repository.find_by_provider_identity(db, "api-football", provider_id)
             if master is None:
                 logger.warning("Skipping fixture with unresolved provider League: provider_id=%s", provider_id)
+                unresolved_identity_count += 1
                 continue
 
             if master.league_id not in allowed_ids:
@@ -345,6 +545,20 @@ class FixtureSyncService:
             filtered_fixtures.append((fixture_raw, master.league_id))
 
         if not filtered_fixtures:
+            if unresolved_identity_count:
+                logger.warning(
+                    "Fixture sync aborted: provider League identity is unresolved for %s fixture(s); no local league mapping was available.",
+                    unresolved_identity_count,
+                )
+                return {
+                    "success": False,
+                    "inserted": 0,
+                    "updated": 0,
+                    "total": 0,
+                    "failed": unresolved_identity_count,
+                    "message": "Fixture sync aborted because provider League identity is unresolved for the payload.",
+                    "final_lineup_candidates": [],
+                }, set()
             logger.info("No allowed leagues were present in the fixture payload; skipping fixture synchronization.")
             return {"success": True, "inserted": 0, "updated": 0, "total": 0, "failed": 0, "final_lineup_candidates": []}, set()
 
@@ -535,19 +749,15 @@ class FixtureSyncService:
 
                 normalized_status = str(match.status or "").upper()
 
-                if previous_status in NON_TERMINAL_STATUSES and normalized_status in FINAL_LINEUP_TERMINAL_STATUSES:
-                    finalization = await self.final_lineup_finalization_repository.create_required(
+                if getattr(self, "_allow_terminal_transition", False):
+                    await self.handle_terminal_transition(
                         db,
                         local_match_id,
+                        match.provider_fixture_id,
+                        previous_status,
+                        normalized_status,
+                        result,
                     )
-                    if finalization.status != "SUCCESS":
-                        logger.info(
-                            "FINAL_LINEUP_REQUIRED match_id=%s previous_status=%s new_status=%s",
-                            local_match_id,
-                            previous_status,
-                            normalized_status,
-                        )
-                        result["final_lineup_candidates"].append(local_match_id)
 
                 if getattr(self, "_defer_live_cache_invalidation", False):
                     result["active_match_updates"][local_match_id] = match.status
@@ -564,6 +774,8 @@ class FixtureSyncService:
             except Exception as exc:
                 await self._rollback_fixture_savepoint(fixture_savepoint, exc)
                 result["failed"] += 1
+                if str(exc).startswith("FINAL_LIVE_SYNC_FAILED:"):
+                    result["success"] = False
                 logger.warning("Fixture ID %s failed during sync: %s", fixture_id, exc)
                 continue
 
@@ -609,6 +821,10 @@ class FixtureSyncService:
                 metrics["attempted"] += 1
                 metrics["succeeded"] += 1
                 FINALIZATION_TOTAL.labels("success", "none").inc()
+            elif state == "partial":
+                metrics["attempted"] += 1
+                metrics["failed"] += 1
+                FINALIZATION_TOTAL.labels("failure", "LINEUP_PARTIAL").inc()
             elif state == "skipped":
                 metrics["skipped"] += 1
                 FINALIZATION_TOTAL.labels("skipped", "already_complete").inc()
@@ -671,6 +887,18 @@ class FixtureSyncService:
                     "attempted_at": attempted_at,
                     "provider_attempted": provider_attempted,
                 }
+
+            if result.get("partial"):
+                await self.final_lineup_finalization_repository.mark_retryable(
+                    db,
+                    record,
+                    "LINEUP_PARTIAL",
+                    result.get("reason", "missing player identity"),
+                    attempted_at,
+                    failure_diagnostics=result.get("diagnostics", []),
+                )
+                await db.commit()
+                return {"state": "partial"}
 
             completed_at = datetime.now(timezone.utc)
             await self.final_lineup_finalization_repository.mark_success(db, record, completed_at)
@@ -792,6 +1020,8 @@ class FixtureSyncService:
 
     @staticmethod
     def _final_lineup_failure_category(result: dict) -> str:
+        if result.get("failure_classification") == "PARTIAL":
+            return "LINEUP_PARTIAL"
         if result.get("failure_classification") in {
             "MISSING",
             "INVALID",
@@ -835,18 +1065,67 @@ class FixtureSyncService:
             logger.debug("SKIPPED LEAGUE: league_id=%s league_name=%s", league, "requested league")
             return {"success": True, "inserted": 0, "updated": 0, "total": 0, "message": "League is not allowed for synchronization", "final_lineup_candidates": []}
 
-        result = await self.fixture_provider.get_fixtures(league=league, season=season)
+        master = await self.league_repository.get_by_id(db, league, allowed_ids=allowed_ids)
+        provider = str(getattr(master, "provider", "") or "").strip() if master is not None else ""
+        provider_id = str(getattr(master, "provider_id", "") or "").strip() if master is not None else ""
+        if provider != "api-football" or not provider_id:
+            if self.league_service is not None:
+                recovery = await self.league_service.recover_provider_identity(int(league))
+                if recovery.get("success"):
+                    master = await self.league_repository.get_by_id(db, league, allowed_ids=allowed_ids)
+                    if master is not None and hasattr(db, "refresh"):
+                        await db.refresh(master)
+                    provider = str(getattr(master, "provider", "") or "").strip() if master is not None else ""
+                    provider_id = str(getattr(master, "provider_id", "") or "").strip() if master is not None else ""
+                    if provider == "api-football" and provider_id:
+                        logger.info("FIXTURE_SYNC_IDENTITY_RECOVERED league_id=%s provider_id=%s", league, provider_id)
+                    else:
+                        return {
+                            "success": False,
+                            "state": "IDENTITY_RESOLUTION_RETRY",
+                            "error_code": "IDENTITY_RERESOLUTION_FAILED",
+                            "league_id": league,
+                            "retryable": True,
+                            "final_lineup_candidates": [],
+                        }
+                else:
+                    return {
+                        **recovery,
+                        "operation": "fixture_season_sync",
+                        "final_lineup_candidates": [],
+                    }
+            if provider != "api-football" or not provider_id:
+                logger.warning(
+                    "Fixture sync aborted: local League identity is unresolved: league_id=%s",
+                    league,
+                )
+                return {
+                    "success": False,
+                    "state": "IDENTITY_RESOLUTION_FAILED",
+                    "error_code": "LEAGUE_IDENTITY_UNRESOLVED",
+                    "inserted": 0,
+                    "updated": 0,
+                    "total": 0,
+                    "failed": 0,
+                    "message": "League provider identity is unresolved; fixture provider was not called.",
+                    "final_lineup_candidates": [],
+                }
+
+        result = await self.fixture_provider.get_fixtures(league=provider_id, season=season)
         if not result or "response" not in result:
             return {"success": False, "message": "API error", "final_lineup_candidates": []}
         fixtures = result.get("response", [])
         if not fixtures:
             return {"success": False, "message": "No fixtures found", "final_lineup_candidates": []}
 
+        previous_terminal_mode = getattr(self, "_allow_terminal_transition", False)
+        self._allow_terminal_transition = False
         try:
             self._defer_live_cache_invalidation = True
             sync_result = await self._process_sync(db, fixtures)
             return sync_result
         finally:
+            self._allow_terminal_transition = previous_terminal_mode
             self._defer_live_cache_invalidation = False
 
     @observe_sync("fixture")
@@ -858,10 +1137,13 @@ class FixtureSyncService:
         if not fixtures:
             return {"success": True, "message": "No matches for today", "updated": 0, "final_lineup_candidates": []}
 
+        previous_terminal_mode = getattr(self, "_allow_terminal_transition", False)
+        self._allow_terminal_transition = False
         try:
             self._defer_live_cache_invalidation = True
             sync_result, prewarm_candidates = await self._process_sync_with_candidates(db, fixtures)
         finally:
+            self._allow_terminal_transition = previous_terminal_mode
             self._defer_live_cache_invalidation = False
 
         if not sync_result.get("success"):
@@ -901,18 +1183,36 @@ class FixtureSyncService:
             return {"success": False, "message": "API error", "final_lineup_candidates": []}
 
         fixtures = result.get("response", [])
-        api_live_ids = {item["fixture"]["id"] for item in fixtures if item.get("fixture") and item["fixture"].get("id")}
+        api_live_provider_ids = {
+            item["fixture"]["id"]
+            for item in fixtures
+            if item.get("fixture") and item["fixture"].get("id")
+        }
         stale_threshold = datetime.now(timezone.utc) - timedelta(hours=24)
-        stale_matches = await self.match_repository.get_live_stale(db, api_live_ids, stale_threshold)
+        stale_matches = await self.match_repository.get_live_stale(
+            db,
+            api_live_provider_ids,
+            stale_threshold,
+        )
         logger.debug("get_live_stale returned %d stale matches", len(stale_matches))
         for match in stale_matches[:20]:
             logger.debug("fixture_id=%s status=%s match_time=%s", match.match_id, getattr(match, "status", None), getattr(match, "match_time", None))
 
         if stale_matches:
-            stale_ids = [str(match.match_id) for match in stale_matches]
-            logger.debug("Syncing %d stale matches that are no longer in live feed", len(stale_ids))
+            stale_provider_ids = [
+                str(match.provider_fixture_id)
+                for match in stale_matches
+                if match.provider_fixture_id is not None
+            ]
+            logger.debug(
+                "Syncing %d stale matches that are no longer in live feed",
+                len(stale_provider_ids),
+            )
             try:
-                stale_chunks = [stale_ids[i : i + 20] for i in range(0, len(stale_ids), 20)]
+                stale_chunks = [
+                    stale_provider_ids[i : i + 20]
+                    for i in range(0, len(stale_provider_ids), 20)
+                ]
                 total_chunks = len(stale_chunks)
                 stale_api_fixtures = []
 
@@ -921,16 +1221,6 @@ class FixtureSyncService:
                     stale_resp = await self.fixture_provider.get_fixtures_by_ids(chunk)
                     chunk_response = stale_resp.get("response", []) if isinstance(stale_resp, dict) else []
                     logger.debug("Chunk returned %s fixtures", len(chunk_response))
-
-                    print("STALE_RESULTS =", stale_resp.get("results"))
-                    print("STALE_ERRORS =", stale_resp.get("errors"))
-                    print("STALE_RESPONSE_LEN =", len(chunk_response))
-                    if chunk_response:
-                        first = chunk_response[0]
-                        print("FIRST_FIXTURE_ID =", first.get("fixture", {}).get("id"))
-                        print("FIRST_STATUS =", first.get("fixture", {}).get("status", {}).get("short"))
-                        print("FIRST_ELAPSED =", first.get("fixture", {}).get("status", {}).get("elapsed"))
-                    print(f"STALE_API_COUNT={len(chunk_response)}")
 
                     stale_api_fixtures.extend(chunk_response)
 
@@ -952,8 +1242,11 @@ class FixtureSyncService:
         if not fixtures:
             return {"success": True, "message": "No live matches", "updated": 0, "final_lineup_candidates": []}
 
+        previous_terminal_mode = getattr(self, "_allow_terminal_transition", False)
+        self._allow_terminal_transition = True
         try:
             self._defer_live_cache_invalidation = True
             return await self._process_sync(db, fixtures)
         finally:
+            self._allow_terminal_transition = previous_terminal_mode
             self._defer_live_cache_invalidation = False

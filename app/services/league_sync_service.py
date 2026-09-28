@@ -115,6 +115,62 @@ class LeagueSyncService:
         await self._sync_league_teams(db, league_data, master)
         return upserted
 
+    async def onboard_provider_league(
+        self,
+        db: AsyncSession,
+        league_data: dict,
+    ) -> tuple[League, bool] | None:
+        league_payload = league_data.get("league") or league_data
+        provider_id = league_payload.get("id")
+        if provider_id is None:
+            raise ValueError("League payload is missing the id field")
+
+        master = await self.league_repository.find_by_provider_identity(
+            db, "api-football", provider_id
+        )
+        if master is not None:
+            if getattr(master, "country_id", None) is None:
+                country_result = await self.country_sync_service.sync_from_league_payload(db, league_data)
+                country = country_result.get("country") if isinstance(country_result, dict) else None
+                country_id = country.get("country_id") if isinstance(country, dict) else None
+                if country_id is None:
+                    logger.warning("Skipping incomplete provider League: provider_id=%s", provider_id)
+                    return None
+                master.country_id = int(country_id)
+                update_country_id = getattr(self.league_repository, "update_country_id", None)
+                if update_country_id is not None:
+                    await update_country_id(db, master.league_id, int(country_id))
+            return master, False
+
+        name = league_payload.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Provider league metadata is missing a name")
+        country_result = await self.country_sync_service.sync_from_league_payload(db, league_data)
+        country = country_result.get("country") if isinstance(country_result, dict) else None
+        country_id = country.get("country_id") if isinstance(country, dict) else None
+        if country_id is None:
+            logger.warning("Skipping incomplete provider League: provider_id=%s", provider_id)
+            return None
+        create_registered = getattr(self.league_repository, "create_registered", None)
+        if create_registered is None:
+            logger.warning("Skipping unregistered provider League: provider_id=%s", provider_id)
+            return None
+        master = await create_registered(db, {
+            "provider": "api-football",
+            "provider_id": str(provider_id),
+            "name": name.strip(),
+            "country": country.get("name"),
+            "country_code": country.get("code"),
+            "logo": league_payload.get("logo"),
+            "type": league_payload.get("type"),
+            "national": league_payload.get("national"),
+            "country_id": int(country_id),
+            "season": None,
+            "is_featured": False,
+            "display_order": 999,
+        })
+        return master, True
+
     async def _upsert_league(
         self,
         db: AsyncSession,
@@ -213,14 +269,6 @@ class LeagueSyncService:
             return {"success": False, "message": "No leagues data found from API"}
 
         leagues = result.get("response", [])
-        allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
-        if not allowed_ids:
-            logger.info(
-                "Allowed league list is empty; "
-                "skipping all league synchronization."
-            )
-            return {"success": True, "inserted": 0, "updated": 0, "total": 0}
-
         filtered_leagues = []
         for league_data in leagues:
             league_payload = league_data.get("league") or league_data
@@ -229,17 +277,11 @@ class LeagueSyncService:
                 logger.warning("Skipping invalid league payload: %s", league_data)
                 continue
 
-            master = await self.league_repository.find_by_provider_identity(
-                db,
-                "api-football",
-                provider_id,
-            )
-            if master is None:
-                logger.warning(
-                    "Skipping unresolved provider League: provider_id=%s",
-                    provider_id,
-                )
+            onboarding = await self.onboard_provider_league(db, league_data)
+            if onboarding is None:
                 continue
+            master, _ = onboarding
+            allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
 
             if master.league_id not in allowed_ids:
                 logger.debug(

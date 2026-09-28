@@ -59,12 +59,6 @@ class PlayerTeamMembershipService:
                 provider=provider,
                 valid_from=None,
             )
-            await self.membership_repository.close_other_current_memberships(
-                db,
-                player_id=player.player_id,
-                team_id=team.team_id,
-                provider=provider,
-            )
             await self.membership_repository.upsert_current_squad_membership(
                 db,
                 player_id=player.player_id,

@@ -1,3 +1,4 @@
+import logging
 import secrets
 import string
 
@@ -11,6 +12,8 @@ from app.models.user import AvatarSource, User
 from app.schemas.token import GoogleAuthResponse, GoogleAuthUser
 from app.schemas.user import UserCreate
 from app.services.token import TokenService
+
+logger = logging.getLogger(__name__)
 
 
 class AuthService:
@@ -149,7 +152,7 @@ class AuthService:
                 await db.refresh(user)
             except Exception as e:
                 await db.rollback()
-                print("GOOGLE DB ERROR:", repr(e))
+                logger.exception("GOOGLE_DB_ERROR")
                 raise HTTPException(
                     status_code=400,
                     detail="Could not create user from Google account"

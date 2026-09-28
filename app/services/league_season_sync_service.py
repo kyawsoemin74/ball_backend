@@ -4,6 +4,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.repositories.league_season_repository import LeagueSeasonRepository
+from app.services.season_identity import normalize_season
 
 
 class LeagueSeasonSyncService:
@@ -13,12 +14,9 @@ class LeagueSeasonSyncService:
     async def normalize_season_value(self, value: Any) -> str | None:
         if value is None:
             return None
-        if isinstance(value, str):
-            value = value.strip()
-            if not value:
-                return None
-            return value
-        return str(value)
+        if isinstance(value, str) and not value.strip():
+            return None
+        return normalize_season(value)
 
     @staticmethod
     def _parse_provider_date(value: Any) -> datetime | None:
@@ -59,14 +57,12 @@ class LeagueSeasonSyncService:
             if not isinstance(season_data, dict):
                 raise ValueError("Season payload must be an object")
 
-            season_text = await self.normalize_season_value(season_data.get("year"))
+            try:
+                season_text = await self.normalize_season_value(season_data.get("year"))
+            except ValueError as exc:
+                raise ValueError("Season year must be a positive integer") from exc
             if season_text is None:
                 raise ValueError("Season year is required")
-            try:
-                if isinstance(season_data.get("year"), bool) or int(season_text) <= 0:
-                    raise ValueError("Season year must be a positive integer")
-            except (TypeError, ValueError) as exc:
-                raise ValueError("Season year must be a positive integer") from exc
 
             start_date = self._parse_provider_date(season_data.get("start"))
             end_date = self._parse_provider_date(season_data.get("end"))

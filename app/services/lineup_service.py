@@ -122,12 +122,11 @@ class LineupService:
                     if not isinstance(entry, dict) or not isinstance(entry.get("player"), dict):
                         return False
                     player_id = entry["player"].get("id")
-                    if player_id is None or str(player_id).strip() == "":
-                        return False
-                    key = str(player_id)
-                    if key in seen_players:
-                        return False
-                    seen_players.add(key)
+                    if player_id is not None and str(player_id).strip() != "":
+                        key = str(player_id)
+                        if key in seen_players:
+                            return False
+                        seen_players.add(key)
 
         return True
 

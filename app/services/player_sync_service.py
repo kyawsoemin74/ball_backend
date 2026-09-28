@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.player import Player
 from app.providers.player_provider import PlayerProvider
 from app.repositories.player_repository import PlayerRepository
+from app.services.player_identity_resolution_service import PlayerIdentityResolutionService
 from app.services.player_team_membership_service import PlayerTeamMembershipService
 
 logger = logging.getLogger(__name__)
@@ -31,12 +32,16 @@ class PlayerSyncService:
         player_provider: Optional[PlayerProvider] = None,
         player_repository: Optional[PlayerRepository] = None,
         membership_service: Optional[PlayerTeamMembershipService] = None,
+        player_identity_resolution_service: Optional[PlayerIdentityResolutionService] = None,
     ) -> None:
         from app.services.base.football_client import FootballAPIClient
 
         self.client = FootballAPIClient()
         self.player_provider = player_provider or PlayerProvider(self.client)
         self.player_repository = player_repository or PlayerRepository()
+        self.player_identity_resolution_service = player_identity_resolution_service or PlayerIdentityResolutionService(
+            player_repository=self.player_repository,
+        )
         self.membership_service = membership_service or PlayerTeamMembershipService(
             player_repository=self.player_repository,
         )
@@ -234,9 +239,9 @@ class PlayerSyncService:
                     continue
 
                 existing = await self.player_repository.get_by_provider_id(
-                    db, provider_id, "api-football"
+                    db, str(provider_id), str(player_data.get("provider") or "api-football")
                 )
-                await self.player_repository.upsert_one(db, player_data)
+                await self.upsert_player(db, player_data)
                 if existing:
                     updated += 1
                 else:
@@ -256,11 +261,33 @@ class PlayerSyncService:
 
     async def upsert_player(self, db: AsyncSession, player_data: dict) -> Player:
         """
-        Upsert a single player by (provider, provider_id).
-        
-        Safe for idempotent operations.
+        Upsert a single player by (provider, provider_id) through the shared resolver.
         """
-        return await self.player_repository.upsert_one(db, player_data)
+        if not isinstance(player_data, dict):
+            raise ValueError("player payload must be a dict")
+
+        provider = str(player_data.get("provider") or "api-football")
+        provider_id = player_data.get("provider_id")
+        if provider_id in (None, ""):
+            raise ValueError("provider_id is required for provider-backed player creation")
+
+        resolution = await self.player_identity_resolution_service.resolve_provider_player_identity(
+            db,
+            provider,
+            str(provider_id),
+            player_data=player_data,
+        )
+
+        if resolution.status == "RESOLVED_EXISTING":
+            existing = await self.player_repository.get_by_provider_id(db, str(provider_id), provider)
+            if existing is None:
+                raise RuntimeError(f"Resolver reported existing player but none was found for provider={provider} provider_id={provider_id}")
+            return existing
+
+        if resolution.status == "CREATE_NEW":
+            return await self.player_repository.upsert_one(db, {**player_data, "provider": provider, "provider_id": str(provider_id)})
+
+        raise ValueError(f"Player identity resolution failed: {resolution.status} ({resolution.reason or resolution.evidence or 'unknown reason'})")
 
     async def sync_team_squad(
         self, db: AsyncSession, team_id: int

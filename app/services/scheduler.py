@@ -1,23 +1,35 @@
 import logging
 from datetime import datetime, timezone, timedelta
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED, EVENT_JOB_MISSED, EVENT_JOB_SUBMITTED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import select, func, text
+from sqlalchemy import select, func, text, or_
 from app.cache import make_cache_key
 from app.core.config import settings
 from app.db import async_session
 from app.models.allowed_league import AllowedLeague
 from app.models.match import Match
+from app.models.league_season import LeagueSeason
+from app.models.match_h2h import MatchH2H
 from app.models.match_event import MatchEvent
 from app.models.odds import Odds
+from app.models.league_identity_recovery import LeagueIdentityRecovery
 from app.monitoring import SCHEDULER_JOB_ERRORS, SCHEDULER_JOB_RUNS
 from app.repositories.lineup_refresh_state_repository import LineupRefreshStateRepository
+from app.repositories.league_identity_recovery_repository import LeagueIdentityRecoveryRepository
 from app.services.active_match_service import active_match_service
 from app.services.analytics_projection_service import log_projection_transaction
 from app.services.cache_service import CacheService
 from app.services.football import football_service, FINISHED_STATUSES, LIVE_STATUSES
+from app.services.odds_sync_service import (
+    CACHE_INVALIDATION_FAILED,
+    COMMIT_CONFIRMED,
+    COMMIT_UNKNOWN,
+    OddsSyncService,
+)
 from app.services.resource_lock import run_with_resource_lock
+from app.services.season_identity import normalize_season
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +50,138 @@ LIVE_MATCH_SYNC_LOCK_KEY = 9342002
 DAILY_FIXTURE_SYNC_LOCK_KEY = 9342003
 REPAIR_DAILY_MATCHES_LOCK_KEY = 9342004
 STANDINGS_REFRESH_LOCK_KEY = 9342001
+RECENT_RECONCILIATION_LOCK_KEY = 9342005
+
+
+async def commit_odds_refresh(db, odds_sync_service: OddsSyncService, local_match_id: int, refresh_result: dict) -> dict:
+    """Commit an Odds snapshot and verify ambiguous commit outcomes without retrying."""
+    context = refresh_result.get("_transaction_context", {})
+    try:
+        await db.commit()
+    except Exception as exc:
+        if not odds_sync_service.is_commit_ambiguous(exc):
+            await db.rollback()
+            logger.error(
+                "ODDS_COMMIT_FAILED",
+                extra={"local_match_id": local_match_id, "commit_state": "FAILED", "exception_type": exc.__class__.__name__},
+            )
+            return {"state": "failed", "reason": "COMMIT_FAILED"}
+
+        logger.error(
+            "ODDS_COMMIT_UNKNOWN",
+            extra={
+                "local_match_id": local_match_id,
+                "provider_fixture_id": context.get("provider_fixture_id"),
+                "commit_state": COMMIT_UNKNOWN,
+            },
+        )
+        try:
+            async with async_session() as verification_db:
+                verification = await odds_sync_service.verify_commit_unknown(
+                    verification_db,
+                    local_match_id,
+                    context.get("persistence_rows", []),
+                )
+        except Exception as verification_error:
+            logger.error(
+                "ODDS_COMMIT_UNKNOWN",
+                extra={
+                    "local_match_id": local_match_id,
+                    "provider_fixture_id": context.get("provider_fixture_id"),
+                    "commit_state": COMMIT_UNKNOWN,
+                    "verification_error": verification_error.__class__.__name__,
+                },
+            )
+            return {"state": "failed", "reason": COMMIT_UNKNOWN}
+
+        verification_state = verification.get("state")
+        if verification_state == COMMIT_CONFIRMED:
+            logger.info(
+                "ODDS_COMMIT_CONFIRMED",
+                extra={"local_match_id": local_match_id, "provider_fixture_id": context.get("provider_fixture_id"), "commit_state": COMMIT_CONFIRMED},
+            )
+            return {"state": "refreshed", "commit_state": COMMIT_CONFIRMED, "result": refresh_result}
+
+        logger.warning(
+            "ODDS_COMMIT_NOT_CONFIRMED",
+            extra={"local_match_id": local_match_id, "provider_fixture_id": context.get("provider_fixture_id"), "commit_state": verification_state or COMMIT_UNKNOWN},
+        )
+        return {"state": "failed", "reason": verification_state or COMMIT_UNKNOWN}
+
+    return {"state": "refreshed", "commit_state": "COMMITTED", "result": refresh_result}
+
+
+async def invalidate_odds_cache_after_commit(
+    cache_service: CacheService,
+    pending_matches: set[int],
+    local_match_id: int,
+    cache_key: str,
+) -> str:
+    """Invalidate only after commit and retain failed keys for scheduler recovery."""
+    try:
+        invalidated = await cache_service.delete(cache_key)
+    except Exception:
+        invalidated = False
+    if invalidated:
+        pending_matches.discard(local_match_id)
+        logger.info("ODDS_CACHE_INVALIDATED", extra={"local_match_id": local_match_id, "state": "CACHE_INVALIDATED"})
+        return "CACHE_INVALIDATED"
+    pending_matches.add(local_match_id)
+    logger.error(
+        "ODDS_CACHE_INVALIDATION_FAILED",
+        extra={"local_match_id": local_match_id, "state": CACHE_INVALIDATION_FAILED},
+    )
+    return CACHE_INVALIDATION_FAILED
 
 class LiveUpdateScheduler:
+    EXPECTED_JOB_IDS = (
+        "sync_live_matches",
+        "reconcile_recent_non_terminal",
+        "recover_league_identities",
+        "sync_daily_fixtures",
+        "repair_daily_matches",
+        "refresh_standings",
+        "refresh_odds",
+        "refresh_lineups",
+        "refresh_events",
+        "refresh_statistics",
+        "refresh_h2h",
+    )
+
     def __init__(self):
         self.scheduler = AsyncIOScheduler()
+        self.scheduler.add_listener(
+            self._handle_scheduler_event,
+            EVENT_JOB_ERROR | EVENT_JOB_EXECUTED | EVENT_JOB_MISSED | EVENT_JOB_SUBMITTED,
+        )
         self.is_running = False
         self.lineup_refresh_state_repository = LineupRefreshStateRepository()
         self.cache_service = CacheService()
+        self.pending_odds_cache_invalidations: set[int] = set()
+
+    @staticmethod
+    def _handle_scheduler_event(event) -> None:
+        job_id = getattr(event, "job_id", "unknown")
+        if event.code == EVENT_JOB_SUBMITTED:
+            logger.info("SCHEDULER_JOB_STARTED job=%s", job_id)
+        elif event.code == EVENT_JOB_EXECUTED:
+            result = getattr(event, "retval", None)
+            summary = {}
+            if isinstance(result, dict):
+                for key in ("success", "updated", "synced_matches", "failed_matches", "processed_matches"):
+                    if key in result:
+                        summary[key] = result[key]
+            logger.info("SCHEDULER_JOB_COMPLETED job=%s result=%s", job_id, summary)
+        elif event.code == EVENT_JOB_MISSED:
+            logger.warning("SCHEDULER_JOB_MISSED job=%s", job_id)
+        elif event.code == EVENT_JOB_ERROR:
+            exception = getattr(event, "exception", None)
+            logger.error(
+                "SCHEDULER_JOB_FAILED job=%s exception_type=%s",
+                job_id,
+                exception.__class__.__name__ if exception else "unknown",
+                exc_info=exception,
+            )
         
     def start(self):
         """Start the live update scheduler"""
@@ -58,6 +195,22 @@ class LiveUpdateScheduler:
             id="sync_live_matches",
             name="Sync Live Matches",
             max_instances=1  # Prevent overlapping jobs
+        )
+
+        self.scheduler.add_job(
+            self._reconcile_recent_non_terminal_job,
+            trigger=IntervalTrigger(minutes=5),
+            id="reconcile_recent_non_terminal",
+            name="Reconcile Recent Fixtures",
+            max_instances=1,
+        )
+
+        self.scheduler.add_job(
+            self._recover_league_identities_job,
+            trigger=IntervalTrigger(minutes=15),
+            id="recover_league_identities",
+            name="Recover League Identities",
+            max_instances=1,
         )
 
         # Add Daily Fixtures Sync at 00:01 AM Myanmar Time
@@ -119,47 +272,50 @@ class LiveUpdateScheduler:
             name="Refresh Active Match Statistics",
             max_instances=1,
         )
+
+        self.scheduler.add_job(
+            self._refresh_h2h_job,
+            trigger=IntervalTrigger(hours=6),
+            id="refresh_h2h",
+            name="Refresh Match H2H",
+            max_instances=1,
+        )
         
         self.scheduler.start()
         self.is_running = True
-        logger.info("Live update scheduler started")
+        logger.info(
+            "SCHEDULER_STARTED jobs=%s",
+            list(self.EXPECTED_JOB_IDS),
+        )
         
     def stop(self):
         """Stop the live update scheduler"""
         if self.is_running:
             self.scheduler.shutdown(wait=True)
             self.is_running = False
-            logger.info("Live update scheduler stopped")
+            logger.info("SCHEDULER_STOPPED")
             
     async def _should_sync_live_matches(self, db) -> bool:
         now = datetime.now(timezone.utc)
         past_threshold = now - timedelta(hours=24)
-        kickoff_start = now - timedelta(minutes=10)
-        kickoff_end = now + timedelta(minutes=10)
+        discovery_horizon_end = now + timedelta(hours=24)
 
-        live_result = await db.execute(
+        candidate_result = await db.execute(
             select(func.count())
             .select_from(Match)
             .where(Match.match_time >= past_threshold)
-            .where(Match.status.in_(LIVE_STATUSES))
+            .where(Match.match_time <= discovery_horizon_end)
         )
-        live_match_count = live_result.scalar_one()
+        candidate_match_count = candidate_result.scalar_one()
 
-        kickoff_result = await db.execute(
-            select(func.count())
-            .select_from(Match)
-            .where(Match.match_time >= kickoff_start)
-            .where(Match.match_time <= kickoff_end)
-        )
-        kickoff_window_count = kickoff_result.scalar_one()
-
-        should_sync = live_match_count > 0 or kickoff_window_count > 0
+        should_sync = candidate_match_count > 0
 
         logger.debug(
             "Live sync gate evaluated",
             extra={
-                "live_match_count": live_match_count,
-                "kickoff_window_count": kickoff_window_count,
+                "candidate_match_count": candidate_match_count,
+                "discovery_horizon_start": past_threshold.isoformat(),
+                "discovery_horizon_end": discovery_horizon_end.isoformat(),
                 "should_sync": should_sync,
             },
         )
@@ -184,7 +340,10 @@ class LiveUpdateScheduler:
                             result = await football_service.sync_live_matches(db)
                             if result.get("success"):
                                 await db.commit()
-                                await football_service.apply_active_match_updates(result.get("active_match_updates"))
+                                try:
+                                    await football_service.apply_active_match_updates(result.get("active_match_updates"))
+                                except Exception:
+                                    logger.exception("LIVE_SYNC_ACTIVE_REGISTRY_UPDATE_FAILED")
                                 try:
                                     await self.cache_service.delete(make_cache_key("live_matches"))
                                 except Exception:
@@ -201,7 +360,7 @@ class LiveUpdateScheduler:
                             raise
 
                     resource_locked, result = await run_with_resource_lock(
-                        db, "fixture_query", "global", sync_live
+                        db, "live_sync", "global", sync_live
                     )
                     if not resource_locked:
                         logger.info("LIVE_SYNC_SKIPPED reason=resource_lock_not_acquired")
@@ -218,6 +377,38 @@ class LiveUpdateScheduler:
             SCHEDULER_JOB_ERRORS.labels(job="sync_live_matches").inc()
             logger.error(f"Error in live sync job: {e}")
             # Continue running even if one job fails
+
+    async def _recover_league_identities_job(self):
+        now = datetime.now(timezone.utc)
+        metrics = {"selected": 0, "resolved": 0, "retryable": 0, "failed": 0}
+        repository = LeagueIdentityRecoveryRepository()
+        try:
+            async with async_session() as db:
+                candidates = await repository.get_retry_candidates(db, now, limit=100)
+                metrics["selected"] = len(candidates)
+            for candidate in candidates:
+                try:
+                    result = await football_service.league_service.recover_provider_identity(
+                        int(candidate.league_id)
+                    )
+                    if result.get("success"):
+                        metrics["resolved"] += 1
+                    elif result.get("retryable"):
+                        metrics["retryable"] += 1
+                    else:
+                        metrics["failed"] += 1
+                except Exception:
+                    metrics["failed"] += 1
+                    logger.exception(
+                        "LEAGUE_IDENTITY_RECOVERY_JOB_FAILED league_id=%s",
+                        candidate.league_id,
+                    )
+            logger.info("LEAGUE_IDENTITY_RECOVERY_JOB_COMPLETE metrics=%s", metrics)
+            return metrics
+        except Exception:
+            SCHEDULER_JOB_ERRORS.labels(job="recover_league_identities").inc()
+            logger.exception("LEAGUE_IDENTITY_RECOVERY_JOB_FAILED metrics=%s", metrics)
+            return metrics
 
     async def _sync_daily_fixtures_job(self):
         """Job function to sync all fixtures for the current day"""
@@ -266,6 +457,46 @@ class LiveUpdateScheduler:
         except Exception as e:
             SCHEDULER_JOB_ERRORS.labels(job="sync_daily_fixtures").inc()
             logger.error(f"Error in daily sync job: {e}")
+
+    async def _reconcile_recent_non_terminal_job(self):
+        try:
+            async with async_session() as db:
+                if not await self._acquire_advisory_lock(db, RECENT_RECONCILIATION_LOCK_KEY):
+                    logger.info("RECENT_RECONCILIATION_SKIPPED reason=lock_not_acquired")
+                    return
+                try:
+                    async def reconcile() -> dict:
+                        try:
+                            result = await football_service.reconcile_recent_non_terminal(db)
+                            if result.get("success"):
+                                await db.commit()
+                                await football_service.apply_active_match_updates(result.get("active_match_updates"))
+                                try:
+                                    await self.cache_service.delete(make_cache_key("live_matches"))
+                                except Exception:
+                                    logger.exception("RECENT_RECONCILIATION_CACHE_INVALIDATION_FAILED")
+                                if result.get("final_lineup_candidates"):
+                                    await football_service.finalize_pending_lineups(
+                                        result["final_lineup_candidates"]
+                                    )
+                            else:
+                                await db.rollback()
+                            return result
+                        except Exception:
+                            await db.rollback()
+                            raise
+
+                    resource_locked, result = await run_with_resource_lock(
+                        db, "fixture_query", "recent_reconciliation", reconcile
+                    )
+                    if resource_locked:
+                        SCHEDULER_JOB_RUNS.labels(job="reconcile_recent_non_terminal").inc()
+                        logger.info("RECENT_RECONCILIATION_COMPLETE result=%s", result)
+                finally:
+                    await self._release_advisory_lock(db, RECENT_RECONCILIATION_LOCK_KEY)
+        except Exception:
+            SCHEDULER_JOB_ERRORS.labels(job="reconcile_recent_non_terminal").inc()
+            logger.exception("Error in recent fixture reconciliation job")
 
     async def _repair_daily_matches_job(self):
         """Job function to repair live/stuck matches by re-syncing yesterday and today."""
@@ -375,6 +606,24 @@ class LiveUpdateScheduler:
                     metrics["eligible_matches"] += 1
                     metrics["processed_matches"] += 1
                     async def refresh_fixture() -> dict:
+                        cache_key = make_cache_key("match", match_id, "odds")
+                        if match_id in self.pending_odds_cache_invalidations:
+                            try:
+                                recovered = await self.cache_service.delete(cache_key)
+                            except Exception:
+                                recovered = False
+                            if recovered:
+                                self.pending_odds_cache_invalidations.discard(match_id)
+                                logger.info(
+                                    "ODDS_CACHE_RECOVERY",
+                                    extra={"local_match_id": match_id, "state": "CACHE_INVALIDATED"},
+                                )
+                            else:
+                                logger.warning(
+                                    "ODDS_CACHE_RECOVERY",
+                                    extra={"local_match_id": match_id, "state": CACHE_INVALIDATION_FAILED},
+                                )
+
                         latest_result = await db.execute(
                             select(Odds.last_updated)
                             .where(Odds.fixture_id == match_id)
@@ -383,7 +632,6 @@ class LiveUpdateScheduler:
                         latest_row = latest_result.first()
                         latest_update = latest_row[0] if latest_row else None
 
-                        cache_key = make_cache_key("match", match_id, "odds")
                         if latest_update and (now_utc - latest_update) < ODDS_REFRESH_MAX_AGE:
                             return {"state": "skipped"}
 
@@ -397,12 +645,21 @@ class LiveUpdateScheduler:
                             await db.rollback()
                             return {"state": "failed", "reason": refresh_result.get("reason")}
 
-                        await db.commit()
-                        try:
-                            await self.cache_service.delete(cache_key)
-                        except Exception:
-                            logger.exception("ODDS_REFRESH_CACHE_INVALIDATION_FAILED match_id=%s", match_id)
-                        return {"state": "refreshed", "result": refresh_result}
+                        commit_result = await commit_odds_refresh(
+                            db,
+                            football_service.odds_sync_service,
+                            match_id,
+                            refresh_result,
+                        )
+                        if commit_result["state"] != "refreshed":
+                            return commit_result
+                        commit_result["cache_state"] = await invalidate_odds_cache_after_commit(
+                            self.cache_service,
+                            self.pending_odds_cache_invalidations,
+                            match_id,
+                            cache_key,
+                        )
+                        return commit_result
 
                     try:
                         resource_locked, refresh_result = await run_with_resource_lock(
@@ -421,7 +678,13 @@ class LiveUpdateScheduler:
                             metrics["skipped_matches"] += 1
                         elif state == "failed":
                             metrics["failed_matches"] += 1
-                            logger.error("ODDS_REFRESH_FAILED match_id=%s reason=%s", match_id, refresh_result.get("reason"))
+                            reason = refresh_result.get("reason")
+                            logger.error(
+                                "ODDS_REFRESH_FAILED match_id=%s reason=%s retry_classification=%s",
+                                match_id,
+                                reason,
+                                football_service.odds_sync_service.classify_retry_state(reason),
+                            )
                         else:
                             committed_projection = refresh_result["result"].get("analytics")
                             if committed_projection:
@@ -443,13 +706,23 @@ class LiveUpdateScheduler:
 
     async def _get_allowed_standings_pairs(self, db) -> list[tuple[int, int]]:
         result = await db.execute(
-            select(Match.league_id, Match.season)
-            .join(AllowedLeague, AllowedLeague.league_id == Match.league_id)
-            .where(Match.season.is_not(None))
-            .distinct()
-            .order_by(Match.league_id.asc(), Match.season.asc())
+            select(LeagueSeason.league_id, LeagueSeason.season)
+            .join(AllowedLeague, AllowedLeague.league_id == LeagueSeason.league_id)
+            .order_by(LeagueSeason.league_id.asc(), LeagueSeason.season.asc())
         )
-        return [(int(league_id), int(season)) for league_id, season in result.all()]
+        pairs = set()
+        for league_id, season in result.all():
+            try:
+                season_value = int(normalize_season(season))
+            except ValueError:
+                logger.warning(
+                    "STANDINGS_REFRESH_SKIPPED league_id=%s season=%s reason=invalid_league_season",
+                    league_id,
+                    season,
+                )
+                continue
+            pairs.add((int(league_id), season_value))
+        return sorted(pairs)
 
     async def _refresh_standings_job(self):
         metrics = {
@@ -897,6 +1170,102 @@ class LiveUpdateScheduler:
         except Exception:
             SCHEDULER_JOB_ERRORS.labels(job="refresh_statistics").inc()
             logger.exception("Error in active statistics refresh job")
+            return metrics
+
+    async def _refresh_h2h_job(self):
+        metrics = {"candidate_matches": 0, "synced_matches": 0, "skipped_matches": 0, "failed_matches": 0}
+        now = datetime.now(timezone.utc)
+        window_start = now - timedelta(days=7)
+        window_end = now + timedelta(days=7)
+
+        try:
+            async with async_session() as db:
+                result = await db.execute(
+                    select(Match)
+                    .outerjoin(
+                        MatchH2H,
+                        MatchH2H.h2h_key
+                        == func.concat(
+                            func.least(Match.home_team_id, Match.away_team_id),
+                            "-",
+                            func.greatest(Match.home_team_id, Match.away_team_id),
+                        ),
+                    )
+                    .where(Match.provider == "api-football")
+                    .where(Match.match_time >= window_start)
+                    .where(Match.match_time <= window_end)
+                    .where(Match.home_team_id.is_not(None))
+                    .where(Match.away_team_id.is_not(None))
+                    .where(Match.home_team_id != Match.away_team_id)
+                    .where(
+                        or_(
+                            MatchH2H.id.is_(None),
+                            MatchH2H.updated_at.is_(None),
+                            MatchH2H.updated_at <= now - timedelta(hours=24),
+                        )
+                    )
+                    .order_by(Match.match_time.asc(), Match.local_match_id.asc())
+                    .limit(100)
+                )
+                candidates = list(result.scalars().all())
+                metrics["candidate_matches"] = len(candidates)
+                processed_pairs = set()
+
+                for match in candidates:
+                    local_match_id = int(match.local_match_id)
+                    team_pair = tuple(sorted((int(match.home_team_id), int(match.away_team_id))))
+                    if team_pair in processed_pairs:
+                        metrics["skipped_matches"] += 1
+                        continue
+                    processed_pairs.add(team_pair)
+
+                    try:
+                        async def sync_h2h() -> dict:
+                            result = await football_service.refresh_h2h(db=db, match_id=local_match_id)
+                            if "error" in result:
+                                await db.rollback()
+                                return result
+                            await db.commit()
+                            try:
+                                await self.cache_service.delete(
+                                    make_cache_key("match", "h2h", str(local_match_id))
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "H2H_REFRESH_CACHE_INVALIDATION_FAILED local_match_id=%s",
+                                    local_match_id,
+                                )
+                            return result
+
+                        locked, refresh_result = await run_with_resource_lock(
+                            db,
+                            "h2h",
+                            str(local_match_id),
+                            sync_h2h,
+                        )
+                        if not locked:
+                            metrics["skipped_matches"] += 1
+                            logger.info(
+                                "H2H_REFRESH_SKIPPED local_match_id=%s reason=resource_lock_not_acquired",
+                                local_match_id,
+                            )
+                        elif "error" in refresh_result:
+                            metrics["failed_matches"] += 1
+                            logger.error("H2H_REFRESH_FAILED local_match_id=%s", local_match_id)
+                        else:
+                            metrics["synced_matches"] += 1
+                            logger.info("H2H_REFRESH_SYNCED local_match_id=%s", local_match_id)
+                    except Exception:
+                        await db.rollback()
+                        metrics["failed_matches"] += 1
+                        logger.exception("H2H_REFRESH_FAILED local_match_id=%s", local_match_id)
+
+                SCHEDULER_JOB_RUNS.labels(job="refresh_h2h").inc()
+                logger.info("H2H_REFRESH_COMPLETE metrics=%s", metrics)
+                return metrics
+        except Exception:
+            SCHEDULER_JOB_ERRORS.labels(job="refresh_h2h").inc()
+            logger.exception("Error in H2H refresh job")
             return metrics
 
 # Global scheduler instance

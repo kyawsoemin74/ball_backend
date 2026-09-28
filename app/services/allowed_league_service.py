@@ -27,6 +27,18 @@ class AllowedLeagueService:
         league_record = league_result.scalar_one_or_none()
         if league_record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="League not found")
+        if not str(getattr(league_record, "provider", "") or "").strip() or not str(
+            getattr(league_record, "provider_id", "") or ""
+        ).strip():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="League provider identity is incomplete",
+            )
+        if getattr(league_record, "country_id", None) is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="League country relationship is incomplete",
+            )
 
         try:
             return await self.repository.create(db, league_id), True

@@ -91,8 +91,8 @@ async def get_league_details(league_id: int, db: AsyncSession = Depends(get_db))
 
 @router.get("/{league_id}/standing/{season}", response_model=List[StandingResponse])
 async def get_league_standings(
-    league_id: int,
-    season: int = Path(..., description="The season year"),
+    league_id: int = Path(..., gt=0),
+    season: int = Path(..., gt=0, description="The season year"),
     db: AsyncSession = Depends(get_db)
 ):
     """Get league standings, ensuring fresh data."""
@@ -130,8 +130,8 @@ async def sync_all_leagues(
 
 @router.post("/sync/standings/{league_id}", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
 async def sync_league_standings(
-    league_id: int,
-    season: int = Query(2023, description="The season year"),
+    league_id: int = Path(..., gt=0),
+    season: int = Query(2023, gt=0, description="The season year"),
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
     """Explicitly sync standings for a league and season from API-Sports"""

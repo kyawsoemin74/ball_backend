@@ -9,5 +9,5 @@ class StandingProvider:
     def __init__(self, client: FootballAPIClient) -> None:
         self.client = client
 
-    async def get_league_standings(self, league_id: int, season: int) -> Optional[dict]:
-        return await self.client.get("/standings", params={"league": league_id, "season": season})
+    async def get_league_standings(self, provider_league_id: int, season: int) -> Optional[dict]:
+        return await self.client.get("/standings", params={"league": provider_league_id, "season": season})

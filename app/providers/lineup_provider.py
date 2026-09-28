@@ -9,5 +9,5 @@ class LineupProvider:
     def __init__(self, client: FootballAPIClient) -> None:
         self.client = client
 
-    async def get_match_lineup(self, match_id: int) -> Optional[dict]:
-        return await self.client.get("/fixtures/lineups", params={"fixture": match_id})
+    async def get_match_lineup(self, provider_fixture_id: int) -> Optional[dict]:
+        return await self.client.get("/fixtures/lineups", params={"fixture": provider_fixture_id})

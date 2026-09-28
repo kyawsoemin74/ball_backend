@@ -8,8 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 _RESOURCE_PREFIX = "fover:sync"
-_ADVISORY_LOCK_SQL = "SELECT pg_try_advisory_lock(hashtextextended(:lock_identity, 0))"
-_ADVISORY_UNLOCK_SQL = "SELECT pg_advisory_unlock(hashtextextended(:lock_identity, 0))"
+_ADVISORY_LOCK_SQL = "SELECT pg_try_advisory_xact_lock(hashtextextended(:lock_identity, 0))"
 
 
 @dataclass(frozen=True)
@@ -61,16 +60,7 @@ async def acquire_resource_lock(
 async def release_resource_lock(handle: ResourceLockHandle | None) -> None:
     if handle is None:
         return
-    if handle.db is None:
-        return
-    try:
-        await handle.db.execute(
-            text(_ADVISORY_UNLOCK_SQL),
-            {"lock_identity": handle.lock_key},
-        )
-        logger.info("RESOURCE_LOCK_RELEASED lock_identity=%s", handle.lock_key)
-    except Exception:
-        logger.exception("RESOURCE_LOCK_RELEASE_FAILED lock_identity=%s", handle.lock_key)
+    logger.info("RESOURCE_LOCK_RELEASED lock_identity=%s", handle.lock_key)
 
 
 async def run_with_resource_lock(

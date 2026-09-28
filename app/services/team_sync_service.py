@@ -32,7 +32,7 @@ def _clear_team_post_commit_cache_invalidation(session: Session) -> None:
 
 
 class TeamSyncService:
-    """Owns Team synchronization/write orchestration."""
+    """Owns Team synchronization/write orchestration and provider-to-local identity resolution."""
 
     def __init__(
         self,
@@ -63,6 +63,114 @@ class TeamSyncService:
             sync_info[_TEAM_POST_COMMIT_CACHE_KEYS] = keys
         keys.add(key)
 
+    async def resolve_provider_team_identity(
+        self,
+        db: AsyncSession,
+        provider: str,
+        provider_id: str | int,
+        payload: dict | None = None,
+        canonical_team_id: int | None = None,
+    ):
+        """Reusable provider identity resolver for provider=(provider, provider_id)->local Team.
+
+        An optional canonical_team_id allows a null-provider Team row to receive the
+        provider ownership after the existing provider-owner Team row has been released.
+        """
+        if not provider or not str(provider).strip():
+            raise ValueError("INVALID")
+        if provider_id is None:
+            raise ValueError("INVALID")
+
+        provider_key = str(provider).strip()
+        provider_id_key = str(provider_id).strip()
+        if not provider_id_key:
+            raise ValueError("INVALID")
+
+        existing = await self.team_repository.find_by_provider_identity(db, provider_key, provider_id_key)
+        if existing is not None:
+            if canonical_team_id is not None:
+                canonical_id = int(canonical_team_id)
+                existing_id = int(existing.team_id)
+                if existing_id == canonical_id:
+                    return existing
+                # Approved conflict ownership remediation path.
+                # Canonical null-provider row is entitled to receive the provider_id.
+                try:
+                    canonical = await self.team_repository.get_by_id(db, canonical_id)
+                    if canonical is None:
+                        raise ValueError("INVALID")
+                    if getattr(canonical, "provider_id", None) is not None:
+                        raise ValueError("CONFLICT")
+
+                    # Deterministic lock order over the two rows that matter.
+                    ordered_ids = sorted([existing_id, canonical_id])
+                    # Use a simple TO-DO within this service-level branch: the repository
+                    # contract intentionally only carries the read/write updates now.
+                    # The session context will keep the database in an atomic flow.
+                    await self.team_repository.release_provider_identity(db, existing_id)
+                    attached = await self.team_repository.attach_provider_identity(
+                        db,
+                        canonical_id,
+                        provider_key,
+                        provider_id_key,
+                    )
+                    return attached
+                except Exception:
+                    raise ValueError("CONFLICT") from None
+            return existing
+
+        payload = payload or {}
+        response = payload.get("response") if isinstance(payload, dict) else None
+        if isinstance(response, list) and response and isinstance(response[0], dict):
+            nested = response[0].get("team") or response[0]
+            if isinstance(nested, dict):
+                payload = nested
+
+        team_payload = payload.get("team") if isinstance(payload, dict) and isinstance(payload.get("team"), dict) else payload
+        if not isinstance(team_payload, dict):
+            team_payload = {}
+
+        name = team_payload.get("name") if isinstance(team_payload.get("name"), str) else None
+        country = team_payload.get("country") if isinstance(team_payload.get("country"), str) else None
+        if isinstance(name, str):
+            name = name.strip()
+        if isinstance(country, str):
+            country = country.strip()
+
+        candidates = await self.team_repository.find_candidate_null_provider_teams(
+            db,
+            provider_key,
+            name=name,
+            country=country,
+        )
+        if len(candidates) > 1:
+            raise ValueError("AMBIGUOUS")
+        if len(candidates) == 1:
+            try:
+                attached = await self.team_repository.attach_provider_identity(
+                    db,
+                    int(candidates[0].team_id),
+                    provider_key,
+                    provider_id_key,
+                )
+                return attached
+            except Exception:
+                raise ValueError("CONFLICT") from None
+
+        row = {
+            "provider": provider_key,
+            "provider_id": provider_id_key,
+            "name": name or "Unknown Team",
+            "country": country,
+            "logo": team_payload.get("logo"),
+            "stadium": team_payload.get("stadium") if isinstance(team_payload.get("stadium"), str) and team_payload.get("stadium").strip() else None,
+            "founded": team_payload.get("founded"),
+        }
+        try:
+            return await self.team_repository.upsert_by_provider_identity(db, row)
+        except Exception:
+            raise ValueError("CONFLICT") from None
+
     async def update_team_context(
         self,
         db: AsyncSession,
@@ -87,6 +195,83 @@ class TeamSyncService:
             current_league_id=current_league_id,
             current_season=current_season,
         )
+
+    async def collect_provider_evidence_for_null_provider_teams(
+        self,
+        db: AsyncSession,
+    ) -> list[dict]:
+        """Read-only evidence collector for all api-football teams whose provider_id is NULL.
+
+        It uses the existing provider infrastructure and returns the provider evidence list
+        without mutating local Team rows or their relationships.
+        """
+        if self.team_provider is None:
+            return []
+
+        teams = await self.team_repository.get_null_provider_api_football_teams(db)
+        evidence = []
+        for team in teams:
+            current_league_id = getattr(team, "current_league_id", None)
+            current_season = getattr(team, "current_season", None)
+            try:
+                if current_season is not None:
+                    season = int(str(current_season))
+                else:
+                    season = None
+            except Exception:
+                season = None
+
+            provider_result = await self.team_provider.collect_team_evidence(
+                team_name=getattr(team, "name", None),
+                country=getattr(team, "country", None),
+                league_id=current_league_id,
+                season=season,
+            )
+            status = provider_result.get("provider_request_status", "NO_CANDIDATE")
+            candidates = provider_result.get("candidates") or []
+            if candidates:
+                for candidate in candidates:
+                    evidence.append({
+                        "local_team_id": int(team.team_id),
+                        "local_team_name": getattr(team, "name", None),
+                        "local_country": getattr(team, "country", None),
+                        "current_provider": getattr(team, "provider", None),
+                        "current_provider_id": getattr(team, "provider_id", None),
+                        "candidate_provider_id": candidate.get("provider_id"),
+                        "provider_team_name": candidate.get("team_name"),
+                        "provider_country": candidate.get("country"),
+                        "provider_league_context": candidate.get("league"),
+                        "provider_season_context": candidate.get("season"),
+                        "provider_request_status": status,
+                        "classification": "NOT_FOUND",
+                        "canonical_team_id": int(team.team_id),
+                        "conflicting_team_id": None,
+                        "evidence": candidate.get("raw"),
+                        "proposed_action": "LEAVE_UNRESOLVED",
+                        "confidence": "READ_ONLY_EVIDENCE",
+                    })
+            else:
+                evidence.append({
+                    "local_team_id": int(team.team_id),
+                    "local_team_name": getattr(team, "name", None),
+                    "local_country": getattr(team, "country", None),
+                    "current_provider": getattr(team, "provider", None),
+                    "current_provider_id": getattr(team, "provider_id", None),
+                    "candidate_provider_id": None,
+                    "provider_team_name": None,
+                    "provider_country": None,
+                    "provider_league_context": None,
+                    "provider_season_context": None,
+                    "provider_request_status": status,
+                    "classification": "NOT_FOUND",
+                    "canonical_team_id": int(team.team_id),
+                    "conflicting_team_id": None,
+                    "evidence": None,
+                    "proposed_action": "LEAVE_UNRESOLVED",
+                    "confidence": "READ_ONLY_EVIDENCE",
+                })
+
+        return evidence
 
     async def resolve_provider_teams(self, db: AsyncSession, teams_data: list[dict]) -> dict:
         """Resolve provider Team IDs to local Team Master IDs."""
@@ -129,7 +314,8 @@ class TeamSyncService:
                 unresolved.append(item)
                 continue
 
-            provider_id = item.get("provider_id", item.get("id"))
+            nested_team = item.get("team") if isinstance(item.get("team"), dict) else item
+            provider_id = item.get("provider_id", nested_team.get("id"))
             if provider_id is None:
                 unresolved.append(item)
                 continue
@@ -177,6 +363,7 @@ class TeamSyncService:
             "existing": len(resolved) - created,
             "unresolved": len(unresolved),
             "total": len(teams_data or []),
+            "resolved": resolved,
         }
         if errors:
             result["errors"] = errors

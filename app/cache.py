@@ -131,9 +131,11 @@ async def cache_set_json(
         logger.warning("CACHE_SET_FAILURE", extra={"cache_key": key, "ttl": ttl, "source": "async"})
 
 
-async def cache_delete(key: str) -> None:
+async def cache_delete(key: str) -> bool:
     try:
         await async_redis.delete(key)
+        return True
     except Exception:
         CACHE_DELETE_FAILURES.inc()
         logger.warning("CACHE_DELETE_FAILURE", extra={"cache_key": key, "source": "async"})
+        return False

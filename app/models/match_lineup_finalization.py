@@ -18,7 +18,7 @@ class MatchLineupFinalization(Base):
         ),
         CheckConstraint(
             "failure_category IS NULL OR failure_category IN "
-            "('PROVIDER_FAILURE', 'INVALID_RESPONSE', 'MASTER_RESOLUTION_FAILURE', "
+            "('PROVIDER_FAILURE', 'INVALID_RESPONSE', 'LINEUP_PARTIAL', 'MASTER_RESOLUTION_FAILURE', "
             "'ANALYTICS_FAILURE', 'DB_FAILURE', 'FLUSH_FAILURE', 'COMMIT_FAILURE', "
             "'LOCK_CONFLICT', 'SYNC_UNAVAILABLE', 'IDENTITY_BOUNDARY_VIOLATION', 'MAX_RETRY_ATTEMPTS_EXCEEDED')",
             name="ck_match_lineup_finalization_failure_category",

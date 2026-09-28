@@ -58,7 +58,7 @@ spec:
             - name: APP_ENV
               value: "production"
             - name: ENABLE_API_DOCS
-              value: "false"
+              value: "true"
             - name: ENABLE_API_METRICS
               value: "false"
           readinessProbe:

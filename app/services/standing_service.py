@@ -7,11 +7,13 @@ from app.cache import make_cache_key
 from app.core.config import settings
 from app.models.team import Team
 from app.providers.standing_provider import StandingProvider
+from app.repositories.league_season_repository import LeagueSeasonRepository
 from app.repositories.standing_repository import StandingRepository
 from app.repositories.team_repository import TeamRepository
 from app.schemas.standing import StandingResponse
 from app.services.base.football_client import FootballAPIClient
 from app.services.cache_service import CacheService
+from app.services.season_identity import normalize_season
 from app.services.standing_sync_service import StandingSyncService
 from app.services.team_service import TeamService
 
@@ -29,7 +31,8 @@ class StandingService:
         self.standing_provider = standing_provider or StandingProvider(client)
         self.team_service = team_service
         self.cache_service = cache_service or CacheService()
-        self._standing_repository = StandingRepository()
+        self.league_season_repository = LeagueSeasonRepository()
+        self._standing_repository = StandingRepository(self.league_season_repository)
         self._allowed_league_repository = None
         self.standing_sync_service = StandingSyncService(
             standing_provider=self.standing_provider,
@@ -41,10 +44,23 @@ class StandingService:
         self.standing_repository = self._standing_repository
         self.allowed_league_repository = self.standing_sync_service.allowed_league_repository
 
-    async def _upsert_standings_bridge(self, db: AsyncSession, standings_data: list, league_id: int, season: str):
+    async def _upsert_standings_bridge(
+        self,
+        db: AsyncSession,
+        standings_data: list,
+        league_id: int,
+        season: str,
+        league_season_id: int | None = None,
+    ):
         # Preserve pre-refactor compatibility: sync path calls through StandingService.upsert_standings
         # so subclasses overriding upsert_standings still intercept writes.
-        return await self.upsert_standings(db, standings_data, league_id, season)
+        return await self.upsert_standings(
+            db,
+            standings_data,
+            league_id,
+            season,
+            league_season_id=league_season_id,
+        )
 
     @property
     def standing_repository(self):
@@ -64,8 +80,8 @@ class StandingService:
         self._allowed_league_repository = value
         self.standing_sync_service.allowed_league_repository = value
 
-    async def get_league_standings(self, league_id: int, season: int) -> Optional[dict]:
-        return await self.standing_provider.get_league_standings(league_id, season)
+    async def get_league_standings(self, provider_league_id: int, season: int) -> Optional[dict]:
+        return await self.standing_provider.get_league_standings(provider_league_id, season)
 
     def _flatten_standings_groups(self, api_result: dict) -> list:
         return self.standing_sync_service._flatten_standings_groups(api_result)
@@ -73,21 +89,46 @@ class StandingService:
     def _prepare_standings_rows(self, standings_data: list) -> list[dict]:
         return self.standing_sync_service._prepare_standings_rows(standings_data)
 
-    async def upsert_standings(self, db: AsyncSession, standings_data: list, league_id: int, season: str):
+    async def upsert_standings(
+        self,
+        db: AsyncSession,
+        standings_data: list,
+        league_id: int,
+        season: str,
+        league_season_id: int | None = None,
+    ):
         self.standing_sync_service._defer_standings_cache_invalidation = getattr(self, "_defer_standings_cache_invalidation", False)
-        return await self._standing_sync_upsert_impl(db, standings_data, league_id, season)
+        return await self._standing_sync_upsert_impl(
+            db,
+            standings_data,
+            league_id,
+            season,
+            league_season_id=league_season_id,
+        )
 
     async def sync_standings(self, db: AsyncSession, league_id: int, season: int) -> dict:
         self.standing_sync_service._defer_standings_cache_invalidation = getattr(self, "_defer_standings_cache_invalidation", False)
         return await self.standing_sync_service.sync_standings(db, league_id, season)
 
     async def get_cached_standings(self, db: AsyncSession, league_id: int, season: int | str) -> Optional[list]:
-        cache_key = make_cache_key("standings", league_id, season)
+        try:
+            season_text = normalize_season(season)
+        except ValueError:
+            return None
+        league_season = await self.league_season_repository.get_by_league_and_season(
+            db,
+            league_id,
+            season_text,
+        )
+        if league_season is None:
+            return None
+
+        cache_key = make_cache_key("standings", league_season.id)
         cached = await self.cache_service.get_json(cache_key)
         if cached is not None:
             return cached
 
-        standings_rows = await self.standing_repository.get_for_league_season(db, league_id, season)
+        standings_rows = await self.standing_repository.get_for_league_season_id(db, league_season.id)
         if standings_rows:
             payload = [StandingResponse.model_validate(row).model_dump(mode="json") for row in standings_rows]
             await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_STANDINGS)
@@ -106,12 +147,24 @@ class StandingService:
         if current_league_id is None or current_season is None:
             return None
 
-        cache_key = make_cache_key("standings", current_league_id, current_season)
+        try:
+            season_text = normalize_season(current_season)
+        except ValueError:
+            return None
+        league_season = await self.league_season_repository.get_by_league_and_season(
+            db,
+            current_league_id,
+            season_text,
+        )
+        if league_season is None:
+            return None
+
+        cache_key = make_cache_key("standings", league_season.id)
         cached = await self.cache_service.get_json(cache_key)
         if cached is not None:
             return cached
 
-        standings_rows = await self.standing_repository.get_for_league_season(db, current_league_id, current_season)
+        standings_rows = await self.standing_repository.get_for_league_season_id(db, league_season.id)
         if not standings_rows:
             return None
 

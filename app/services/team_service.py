@@ -269,6 +269,22 @@ class TeamService:
     async def resolve_provider_teams(self, db: AsyncSession, teams_data: list[dict]) -> dict:
         return await self.team_sync_service.resolve_provider_teams(db, teams_data)
 
+    async def resolve_provider_team_identity(
+        self,
+        db: AsyncSession,
+        provider: str,
+        provider_id: str | int,
+        payload: dict | None = None,
+        canonical_team_id: int | None = None,
+    ):
+        return await self.team_sync_service.resolve_provider_team_identity(
+            db,
+            provider,
+            provider_id,
+            payload,
+            canonical_team_id,
+        )
+
     async def upsert_team(
         self,
         db: AsyncSession,

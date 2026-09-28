@@ -15,7 +15,7 @@ services:
       - PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc_dir
       - SCHEDULER_ENABLED=false
       - APP_ENV=production
-      - ENABLE_API_DOCS=false
+      - ENABLE_API_DOCS=true
       - ENABLE_API_METRICS=false
     volumes:
       - prometheus_multiproc:/tmp/prometheus_multiproc_dir
@@ -52,7 +52,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/metrics').read()\""]
+      test: ["CMD-SHELL", "python -c \"import sys, urllib.request; metrics = urllib.request.urlopen('http://127.0.0.1:8001/metrics').read().decode(); sys.exit(0 if 'fover_scheduler_up 1.0' in metrics else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 5

@@ -121,11 +121,38 @@ class MatchRepository:
             ),
         )
 
-    async def get_live_stale(self, db: AsyncSession, live_ids: set[int], stale_threshold) -> list[Match]:
+    async def get_live_stale(self, db: AsyncSession, provider_fixture_ids: set[int], stale_threshold) -> list[Match]:
         from app.services.football import LIVE_STATUSES
 
         query = select(Match).where(Match.status.in_(LIVE_STATUSES), Match.match_time >= stale_threshold)
-        if live_ids:
-            query = query.where(Match.match_id.not_in(list(live_ids)))
+        if provider_fixture_ids:
+            query = query.where(Match.provider_fixture_id.not_in(list(provider_fixture_ids)))
+        result = await db.execute(query)
+        return list(result.scalars().all())
+
+    async def get_recent_non_terminal(
+        self,
+        db: AsyncSession,
+        allowed_ids: set[int] | None,
+        start_dt: datetime,
+        end_dt: datetime,
+        non_terminal_statuses: set[str],
+        limit: int = 200,
+    ) -> list[Match]:
+        if allowed_ids is not None and not allowed_ids:
+            return []
+
+        query = (
+            select(Match)
+            .where(Match.status.in_(non_terminal_statuses))
+            .where(Match.match_time >= start_dt)
+            .where(Match.match_time <= end_dt)
+            .where(Match.provider_fixture_id.is_not(None))
+            .order_by(Match.match_time.asc(), Match.local_match_id.asc())
+            .limit(limit)
+        )
+        if allowed_ids is not None:
+            query = query.where(Match.league_id.in_(allowed_ids))
+
         result = await db.execute(query)
         return list(result.scalars().all())
