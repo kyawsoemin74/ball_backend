@@ -84,22 +84,89 @@ class EventSyncService:
         assist_id, provider_assist_id = await self._resolve_provider_player(db, assist_payload)
         return player_id, provider_player_id, assist_id, provider_assist_id
 
+    @staticmethod
+    def _validate_event_response(result: Any) -> tuple[list[dict] | None, str | None]:
+        if not isinstance(result, dict):
+            return None, "invalid_response"
+
+        errors = result.get("errors")
+        if errors not in (None, {}, [], "", False):
+            return None, "provider_error"
+
+        events = result.get("response")
+        if not isinstance(events, list):
+            return None, "invalid_response"
+        if not events:
+            return None, "empty_response"
+
+        for event in events:
+            if not isinstance(event, dict):
+                return None, "malformed_event"
+
+            event_time = event.get("time")
+            team = event.get("team")
+            event_type = event.get("type")
+            if not isinstance(event_time, dict) or not isinstance(team, dict):
+                return None, "malformed_event"
+
+            elapsed = event_time.get("elapsed")
+            team_id = team.get("id")
+            if isinstance(elapsed, bool) or not isinstance(elapsed, int):
+                return None, "malformed_event"
+            if isinstance(team_id, bool) or not isinstance(team_id, int):
+                return None, "malformed_event"
+            if not isinstance(event_type, str) or not event_type.strip():
+                return None, "malformed_event"
+
+            extra = event_time.get("extra")
+            if extra is not None and (isinstance(extra, bool) or not isinstance(extra, int)):
+                return None, "malformed_event"
+            if team.get("name") is not None and not isinstance(team.get("name"), str):
+                return None, "malformed_event"
+
+            for identity_key in ("player", "assist"):
+                identity = event.get(identity_key)
+                if identity is None:
+                    continue
+                if not isinstance(identity, dict):
+                    return None, "malformed_event"
+                identity_id = identity.get("id")
+                if identity_id is not None and (
+                    isinstance(identity_id, bool)
+                    or not isinstance(identity_id, (int, str))
+                    or (isinstance(identity_id, str) and not identity_id.strip())
+                ):
+                    return None, "malformed_event"
+                if identity.get("name") is not None and not isinstance(identity.get("name"), str):
+                    return None, "malformed_event"
+
+            for optional_string in ("detail", "comments"):
+                if event.get(optional_string) is not None and not isinstance(event.get(optional_string), str):
+                    return None, "malformed_event"
+
+        return events, None
+
     @observe_sync("events")
-    async def refresh_match_events(self, db: AsyncSession, match_id: int) -> Dict[str, Any]:
+    async def refresh_match_events(
+        self,
+        db: AsyncSession,
+        match_id: int,
+        provider_fixture_id: int | None = None,
+    ) -> Dict[str, Any]:
         logger.info("FINAL_EVENT_SYNC_START", extra={"match_id": match_id})
 
-        result = await self.event_provider.get_match_events(match_id)
-        if not result or "response" not in result:
-            logger.warning("EVENT_SYNC_FAILED", extra={"match_id": match_id, "reason": "api_error"})
-            return {"success": False, "message": "API error"}
+        provider_fixture_id = match_id if provider_fixture_id is None else provider_fixture_id
+        result = await self.event_provider.get_match_events(provider_fixture_id)
+        api_events, validation_error = self._validate_event_response(result)
+        if validation_error is not None:
+            logger.warning(
+                "EVENT_SYNC_FAILED",
+                extra={"match_id": match_id, "reason": validation_error},
+            )
+            return {"success": False, "message": validation_error}
 
-        api_events = result["response"]
         resolved_events: list[dict] = []
-        for event in api_events:
-            if not isinstance(event, dict):
-                resolved_events.append(event)
-                continue
-
+        for event in api_events or []:
             resolved_player_id, provider_player_id, resolved_assist_id, provider_assist_id = (
                 await self._resolve_event_identities(db, event)
             )

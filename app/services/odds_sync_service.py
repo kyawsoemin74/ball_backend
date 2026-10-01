@@ -6,12 +6,22 @@ from app.providers.odds_provider import OddsProvider
 from app.repositories.odds_repository import OddsRepository
 from app.services.cache_service import CacheService
 from app.services.analytics_projection_service import AnalyticsProjectionService, log_projection_failure
+from app.services.base.football_client import FootballAPIResponse
 from app.monitoring import observe_sync
 
 if TYPE_CHECKING:
     from app.services.odds_service import OddsService
 
 logger = logging.getLogger(__name__)
+
+COMMIT_UNKNOWN = "COMMIT_UNKNOWN"
+COMMIT_CONFIRMED = "COMMIT_CONFIRMED"
+CACHE_INVALIDATION_FAILED = "CACHE_INVALIDATION_FAILED"
+SUCCESS = "SUCCESS"
+
+
+class OddsTransactionFailure(RuntimeError):
+    """Failure that must be rolled back by the existing outer session owner."""
 
 
 class OddsSyncService:
@@ -32,11 +42,35 @@ class OddsSyncService:
         self.analytics_projection_service = analytics_projection_service or AnalyticsProjectionService()
 
     @observe_sync("odds")
-    async def refresh_odds(self, db, fixture_id: int, cache_key: str, pre_match_ttl: int) -> dict:
+    async def refresh_odds(
+        self,
+        db,
+        fixture_id: int,
+        cache_key: str,
+        pre_match_ttl: int,
+        *,
+        local_match_id: int | None = None,
+    ) -> dict:
+        local_match_id = fixture_id if local_match_id is None else local_match_id
         result = await self.odds_provider.get_match_odds(fixture_id)
-        if not result or "response" not in result:
-            log_projection_failure("odds", {"match_id": fixture_id}, "provider_failure")
-            return {"error": "API error"}
+        if isinstance(result, FootballAPIResponse):
+            if result.exception_type or (result.status_code is None and result.payload is None):
+                log_projection_failure("odds", {"match_id": fixture_id}, "provider_request_failure")
+                return {"error": "API error", "reason": "provider_request_failure"}
+            payload = result.payload
+            if (
+                (result.status_code is not None and result.status_code >= 400)
+                or result.error_code
+                or result.error_message
+                or (isinstance(payload, dict) and payload.get("errors"))
+            ):
+                log_projection_failure("odds", {"match_id": fixture_id}, "provider_api_error")
+                return {"error": "API error", "reason": "provider_api_error"}
+            result = payload
+
+        if not isinstance(result, dict) or "response" not in result:
+            log_projection_failure("odds", {"match_id": fixture_id}, "provider_request_failure")
+            return {"error": "API error", "reason": "provider_request_failure"}
 
         responses = result.get("response", [])
         if not responses:
@@ -52,7 +86,7 @@ class OddsSyncService:
                 continue
             one_xbet_missing = False
             for record in self.odds_service._filter_main_lines(bookmaker):
-                record["fixture_id"] = fixture_id
+                record["fixture_id"] = local_match_id
                 odds_to_upsert.append(record)
 
         now_utc = datetime.now(timezone.utc)
@@ -72,14 +106,14 @@ class OddsSyncService:
                         "last_updated": record["last_updated"],
                     }
                 )
-            await self.odds_repository.replace_fixture_odds(db, fixture_id, persistence_rows)
+            await self.odds_repository.replace_fixture_odds(db, local_match_id, persistence_rows)
             await db.flush()
-            projection = await self.analytics_projection_service.project_odds(db, fixture_id, persistence_rows)
+            projection = await self.analytics_projection_service.project_odds(db, local_match_id, persistence_rows)
             if not projection["success"]:
                 raise ValueError(f"Odds analytics projection rejected: {projection.get('reason', 'reconciliation failure')}")
         else:
             await db.flush()
-            projection = await self.analytics_projection_service.project_odds(db, fixture_id, [])
+            projection = await self.analytics_projection_service.project_odds(db, local_match_id, [])
 
         if not odds_to_upsert:
             reason = "1xbet_data_not_found" if one_xbet_missing else "filtered_no_odds"
@@ -96,6 +130,6 @@ class OddsSyncService:
             }
             for r in odds_to_upsert
         ]
-        refresh_result = {"source": "api", "odds": odds_data, "cached": False, "match_started": False, "updated": len(odds_to_upsert), "analytics": projection}
+        refresh_result = {"status": SUCCESS, "source": "api", "odds": odds_data, "cached": False, "match_started": False, "updated": len(odds_to_upsert), "analytics": projection}
         # The scheduler invalidates this key after its outer transaction commits.
         return refresh_result

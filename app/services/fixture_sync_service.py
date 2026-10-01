@@ -380,7 +380,11 @@ class FixtureSyncService:
                 logger.warning("FINAL_LIVE_SYNC_RETRYABLE", extra={**metrics, "final_status": final_status})
                 return metrics
 
-            sync_result, _ = await self._process_sync_with_candidates(db, [final_fixture])
+            sync_result, _ = await self._process_sync_with_candidates(
+                db,
+                [final_fixture],
+                allow_terminal_transition=False,
+            )
             if (
                 not sync_result.get("success")
                 or sync_result.get("failed", 0)
@@ -424,14 +428,14 @@ class FixtureSyncService:
         previous_status: str | None,
         normalized_status: str,
         result: dict,
-    ) -> None:
+    ) -> bool:
         allow_terminal_transition = getattr(self, "_allow_terminal_transition", None)
         if allow_terminal_transition is False:
-            return
+            return False
         if previous_status not in NON_TERMINAL_STATUSES:
-            return
+            return False
         if normalized_status not in FINAL_LINEUP_TERMINAL_STATUSES:
-            return
+            return False
 
         final_sync = await self.final_live_sync(
             db,
@@ -443,6 +447,35 @@ class FixtureSyncService:
         if not final_sync.get("success"):
             result["success"] = False
             raise RuntimeError(f"FINAL_LIVE_SYNC_FAILED: {final_sync.get('reason', 'unknown')}")
+
+        from app.services.football import football_service
+
+        event_locked, event_result = await run_with_resource_lock(
+            db,
+            "events",
+            local_match_id,
+            lambda: football_service.sync_match_events(db, local_match_id),
+        )
+        if not event_locked:
+            raise RuntimeError("FINAL_EVENT_SYNC_FAILED: event resource lock not acquired")
+        if not event_result or not event_result.get("success"):
+            reason = event_result.get("message", "event_sync_failed") if event_result else "event_sync_failed"
+            raise RuntimeError(f"FINAL_EVENT_SYNC_FAILED: {reason}")
+
+        try:
+            statistics_locked, statistics_result = await run_with_resource_lock(
+                db,
+                "statistics",
+                local_match_id,
+                lambda: football_service.sync_match_statistics(db, local_match_id),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"FINAL_STATISTICS_SYNC_FAILED: {exc}") from exc
+        if not statistics_locked:
+            raise RuntimeError("FINAL_STATISTICS_SYNC_FAILED: statistics resource lock not acquired")
+        if not statistics_result or not statistics_result.get("success"):
+            reason = statistics_result.get("message", "statistics_sync_failed") if statistics_result else "statistics_sync_failed"
+            raise RuntimeError(f"FINAL_STATISTICS_SYNC_FAILED: {reason}")
 
         finalization = await self.final_lineup_finalization_repository.create_required(
             db,
@@ -456,6 +489,7 @@ class FixtureSyncService:
                 normalized_status,
             )
             result["final_lineup_candidates"].append(local_match_id)
+        return True
 
     async def reconcile_recent_non_terminal(self, db: AsyncSession) -> dict:
         """Re-check bounded recent local non-terminal fixtures by provider ID."""
@@ -514,7 +548,13 @@ class FixtureSyncService:
             self._defer_live_cache_invalidation = False
         return result
 
-    async def _process_sync_with_candidates(self, db: AsyncSession, fixtures: list) -> tuple[dict, set[tuple[int, int]]]:
+    async def _process_sync_with_candidates(
+        self,
+        db: AsyncSession,
+        fixtures: list,
+        *,
+        allow_terminal_transition: bool | None = None,
+    ) -> tuple[dict, set[tuple[int, int]]]:
         allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
         if not allowed_ids:
             logger.info("Allowed league list is empty; skipping all fixture synchronization.")
@@ -571,11 +611,14 @@ class FixtureSyncService:
             "standings_prewarm_candidates": 0,
             "final_lineup_candidates": [],
             "active_match_updates": {},
+            "final_event_sync_matches": [],
+            "final_statistics_sync_matches": [],
         }
         prewarm_candidates: set[tuple[int, int]] = set()
         for fixture_raw, master_league_id in filtered_fixtures:
             fixture_id = fixture_raw.get("fixture", {}).get("id")
             fixture_savepoint = None
+            final_event_sync_succeeded = False
             try:
                 match = self.parse_fixture_to_match(fixture_raw, league_id=master_league_id)
                 if match is None:
@@ -749,8 +792,13 @@ class FixtureSyncService:
 
                 normalized_status = str(match.status or "").upper()
 
-                if getattr(self, "_allow_terminal_transition", False):
-                    await self.handle_terminal_transition(
+                terminal_transition_enabled = (
+                    getattr(self, "_allow_terminal_transition", False)
+                    if allow_terminal_transition is None
+                    else allow_terminal_transition
+                )
+                if terminal_transition_enabled:
+                    final_event_sync_succeeded = await self.handle_terminal_transition(
                         db,
                         local_match_id,
                         match.provider_fixture_id,
@@ -767,6 +815,9 @@ class FixtureSyncService:
                 result["inserted"] += inserted
                 result["updated"] += updated
                 await self._release_fixture_savepoint(fixture_savepoint)
+                if final_event_sync_succeeded:
+                    result["final_event_sync_matches"].append(local_match_id)
+                    result["final_statistics_sync_matches"].append(local_match_id)
             except SQLAlchemyError as exc:
                 await self._rollback_fixture_savepoint(fixture_savepoint, exc)
                 logger.exception("Fixture ID %s failed due to database error", fixture_id)
@@ -774,7 +825,7 @@ class FixtureSyncService:
             except Exception as exc:
                 await self._rollback_fixture_savepoint(fixture_savepoint, exc)
                 result["failed"] += 1
-                if str(exc).startswith("FINAL_LIVE_SYNC_FAILED:"):
+                if str(exc).startswith(("FINAL_LIVE_SYNC_FAILED:", "FINAL_STATISTICS_SYNC_FAILED:")):
                     result["success"] = False
                 logger.warning("Fixture ID %s failed during sync: %s", fixture_id, exc)
                 continue

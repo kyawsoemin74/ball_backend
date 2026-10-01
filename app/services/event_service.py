@@ -101,7 +101,17 @@ class EventService:
     async def sync_match_events(self, db: AsyncSession, match_id: int) -> dict:
         # Delegate sync orchestration to EventSyncService. Cache invalidation
         # and commit/rollback are the responsibility of the caller (scheduler/admin).
-        return await self.event_sync_service.refresh_match_events(db, match_id)
+        match = (
+            await db.execute(select(Match).where(Match.local_match_id == match_id))
+        ).scalar_one_or_none()
+        if match is None:
+            return {"success": False, "message": "Match not found"}
+
+        return await self.event_sync_service.refresh_match_events(
+            db,
+            match_id,
+            provider_fixture_id=match.provider_fixture_id,
+        )
 
     async def get_cached_match_events(self, db: AsyncSession, match_id: int) -> List[Dict[str, Any]]:
         cache_key = make_cache_key("match", match_id, "events")

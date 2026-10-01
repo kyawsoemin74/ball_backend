@@ -181,7 +181,21 @@ class StatisticsService:
         return await self.statistics_provider.get_match_statistics(match_id)
 
     async def sync_match_statistics(self, db: AsyncSession, match_id: int) -> dict:
-        return await self.statistics_sync_service.sync_match_statistics(db, match_id)
+        match = (
+            await db.execute(select(Match).where(Match.local_match_id == match_id))
+        ).scalar_one_or_none()
+        if match is None:
+            return {"success": False, "message": "Match not found"}
+
+        provider_fixture_id = match.provider_fixture_id
+        if provider_fixture_id is None:
+            return {"success": False, "message": "Provider fixture ID not found"}
+
+        return await self.statistics_sync_service.sync_match_statistics(
+            db,
+            match_id,
+            provider_fixture_id=provider_fixture_id,
+        )
 
     async def get_cached_statistics(self, db: AsyncSession, match_id: int) -> dict:
         from app.cache import make_cache_key

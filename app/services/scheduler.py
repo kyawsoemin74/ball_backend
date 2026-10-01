@@ -7,7 +7,7 @@ from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import select, func, text, or_
 from app.cache import make_cache_key
 from app.core.config import settings
-from app.db import async_session
+from app.db import async_session, engine
 from app.models.allowed_league import AllowedLeague
 from app.models.match import Match
 from app.models.league_season import LeagueSeason
@@ -51,6 +51,7 @@ DAILY_FIXTURE_SYNC_LOCK_KEY = 9342003
 REPAIR_DAILY_MATCHES_LOCK_KEY = 9342004
 STANDINGS_REFRESH_LOCK_KEY = 9342001
 RECENT_RECONCILIATION_LOCK_KEY = 9342005
+_SCHEDULER_ADVISORY_LOCK_CONNECTIONS = "_scheduler_advisory_lock_connections"
 
 
 async def commit_odds_refresh(db, odds_sync_service: OddsSyncService, local_match_id: int, refresh_result: dict) -> dict:
@@ -340,6 +341,32 @@ class LiveUpdateScheduler:
                             result = await football_service.sync_live_matches(db)
                             if result.get("success"):
                                 await db.commit()
+                                for match_id in result.get("final_event_sync_matches", []):
+                                    event_cache_key = make_cache_key("match", match_id, "events")
+                                    try:
+                                        if not await self.cache_service.delete(event_cache_key):
+                                            logger.warning(
+                                                "FINAL_EVENT_CACHE_INVALIDATION_FAILED match_id=%s",
+                                                match_id,
+                                            )
+                                    except Exception:
+                                        logger.exception(
+                                            "FINAL_EVENT_CACHE_INVALIDATION_FAILED match_id=%s",
+                                            match_id,
+                                        )
+                                for match_id in result.get("final_statistics_sync_matches", []):
+                                    statistics_cache_key = make_cache_key("match", match_id, "statistics")
+                                    try:
+                                        if not await self.cache_service.delete(statistics_cache_key):
+                                            logger.warning(
+                                                "FINAL_STATISTICS_CACHE_INVALIDATION_FAILED match_id=%s",
+                                                match_id,
+                                            )
+                                    except Exception:
+                                        logger.exception(
+                                            "FINAL_STATISTICS_CACHE_INVALIDATION_FAILED match_id=%s",
+                                            match_id,
+                                        )
                                 try:
                                     await football_service.apply_active_match_updates(result.get("active_match_updates"))
                                 except Exception:
@@ -581,7 +608,7 @@ class LiveUpdateScheduler:
                 refreshed_cache_keys = []
                 committed_projections = []
                 result = await db.execute(
-                    select(Match.match_id, Match.status, Match.match_time)
+                    select(Match.match_id, Match.provider_fixture_id, Match.status, Match.match_time)
                     .where(Match.status.in_(ODDS_REFRESH_ELIGIBLE_STATUSES))
                     .where(Match.match_time >= now_utc)
                     .where(Match.match_time <= window_end)
@@ -589,7 +616,7 @@ class LiveUpdateScheduler:
                 )
                 eligible_matches = result.all()
 
-                for match_id, status, match_time in eligible_matches:
+                for match_id, provider_fixture_id, status, match_time in eligible_matches:
                     status_upper = str(status or "").upper()
                     if status_upper in ODDS_REFRESH_STOP_STATUSES:
                         metrics["skipped_matches"] += 1
@@ -637,9 +664,10 @@ class LiveUpdateScheduler:
 
                         refresh_result = await football_service.odds_sync_service.refresh_odds(
                             db,
-                            match_id,
+                            provider_fixture_id,
                             cache_key,
                             1800,
+                            local_match_id=match_id,
                         )
                         if "error" in refresh_result:
                             await db.rollback()
@@ -804,20 +832,69 @@ class LiveUpdateScheduler:
             return metrics
 
     async def _acquire_advisory_lock(self, db, lock_key: int) -> bool:
-        """Acquire a PostgreSQL advisory lock for cross-instance single-run guarantees."""
+        """Acquire a session lock on a connection pinned for the job lifetime."""
         if not hasattr(db, "execute"):
             return True
-        result = await db.execute(text("SELECT pg_try_advisory_lock(:lock_key)"), {"lock_key": lock_key})
-        return bool(result.scalar_one())
+        connection = None
+        try:
+            connection = await engine.connect()
+            result = await connection.execute(
+                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                {"lock_key": lock_key},
+            )
+            if not bool(result.scalar_one()):
+                await connection.close()
+                return False
+
+            await connection.commit()
+            lock_connections = db.info.setdefault(_SCHEDULER_ADVISORY_LOCK_CONNECTIONS, {})
+            lock_connections[lock_key] = connection
+            logger.info("SCHEDULER_ADVISORY_LOCK_ACQUIRED lock_key=%s", lock_key)
+            return True
+        except Exception:
+            logger.exception("SCHEDULER_ADVISORY_LOCK_ACQUIRE_FAILED lock_key=%s", lock_key)
+            if connection is not None:
+                try:
+                    await connection.invalidate()
+                except Exception:
+                    logger.exception("SCHEDULER_ADVISORY_LOCK_INVALIDATE_FAILED lock_key=%s", lock_key)
+            raise
 
     async def _release_advisory_lock(self, db, lock_key: int) -> None:
-        """Release a PostgreSQL advisory lock acquired in this session."""
+        """Verify unlock on the same pinned connection that acquired the lock."""
         if not hasattr(db, "execute"):
             return
+        lock_connections = db.info.get(_SCHEDULER_ADVISORY_LOCK_CONNECTIONS, {})
+        connection = lock_connections.pop(lock_key, None)
+        if connection is None:
+            raise RuntimeError(f"Scheduler advisory lock connection missing for lock_key={lock_key}")
+
         try:
-            await db.execute(text("SELECT pg_advisory_unlock(:lock_key)"), {"lock_key": lock_key})
+            result = await connection.execute(
+                text("SELECT pg_advisory_unlock(:lock_key)"),
+                {"lock_key": lock_key},
+            )
+            if not bool(result.scalar_one()):
+                raise RuntimeError(f"PostgreSQL did not release advisory lock lock_key={lock_key}")
+            await connection.commit()
+            logger.info("SCHEDULER_ADVISORY_LOCK_RELEASED lock_key=%s", lock_key)
         except Exception:
-            logger.exception("Failed to release advisory lock lock_key=%s", lock_key)
+            logger.exception("SCHEDULER_ADVISORY_LOCK_RELEASE_FAILED lock_key=%s", lock_key)
+            try:
+                await connection.invalidate()
+            except Exception:
+                logger.exception("SCHEDULER_ADVISORY_LOCK_INVALIDATE_FAILED lock_key=%s", lock_key)
+            raise
+        finally:
+            try:
+                await connection.close()
+            except Exception:
+                logger.exception("SCHEDULER_ADVISORY_LOCK_CONNECTION_CLOSE_FAILED lock_key=%s", lock_key)
+                try:
+                    await connection.invalidate()
+                except Exception:
+                    logger.exception("SCHEDULER_ADVISORY_LOCK_INVALIDATE_FAILED lock_key=%s", lock_key)
+                raise
 
     async def _acquire_live_match_sync_lock(self, db) -> bool:
         return await self._acquire_advisory_lock(db, LIVE_MATCH_SYNC_LOCK_KEY)

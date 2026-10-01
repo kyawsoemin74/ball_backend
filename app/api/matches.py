@@ -383,16 +383,18 @@ async def sync_match_odds_route(
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
     """Synchronize the current Odds snapshot for a canonical local Match."""
-    await _assert_match_allowed(match_id, db)
+    match = await _assert_match_allowed(match_id, db)
+    provider_fixture_id = match.provider_fixture_id
     cache_key = make_cache_key("match", match_id, "odds")
 
     async def sync() -> Dict[str, Any]:
         try:
             result = await football_service.odds_sync_service.refresh_odds(
                 db,
-                match_id,
+                provider_fixture_id,
                 cache_key,
                 1800,
+                local_match_id=match_id,
             )
             if result.get("status") != SUCCESS:
                 await db.rollback()
