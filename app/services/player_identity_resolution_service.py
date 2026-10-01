@@ -77,6 +77,16 @@ class PlayerIdentityResolutionService:
     def _normalize_name(name: Any) -> str:
         return str(name or "").strip().casefold()
 
+    @staticmethod
+    def _provider_player_id(player_data: Any) -> str | None:
+        if not isinstance(player_data, dict):
+            return None
+        for key in ("id", "provider_id"):
+            value = player_data.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return None
+
     async def resolve_provider_player_identity(
         self,
         db,
@@ -193,10 +203,9 @@ class PlayerIdentityResolutionService:
         )
 
     def _failure(self, status: str, player_data: Any, team_id: Any, reason: str, *, retryable: bool, terminal: bool) -> PlayerReadiness:
-        provider_player_id = None
+        provider_player_id = self._provider_player_id(player_data)
         player_name = None
         if isinstance(player_data, dict):
-            provider_player_id = player_data.get("id")
             player_name = player_data.get("name")
         return PlayerReadiness(
             status=status,
@@ -231,13 +240,9 @@ class PlayerIdentityResolutionService:
         if payload_team_id is not None and str(payload_team_id) != str(team_id):
             result = self._failure("TEAM_CONFLICT", player_data, team_id, "provider player team conflicts with lineup team", retryable=False, terminal=True)
             return PlayerReadiness(**{**result.as_dict(), "lineup_side": lineup_side, "lineup_position": lineup_position, "roster_role": roster_role})
-        if "id" not in player_data or player_data.get("id") is None:
-            result = self._failure("MISSING", player_data, team_id, "provider player id is missing", retryable=False, terminal=True)
-            return PlayerReadiness(**{**result.as_dict(), "lineup_side": lineup_side, "lineup_position": lineup_position, "roster_role": roster_role})
-
-        provider_player_id = str(player_data["id"]).strip()
-        if not provider_player_id:
-            result = self._failure("INVALID", player_data, team_id, "provider player id is empty", retryable=False, terminal=True)
+        provider_player_id = self._provider_player_id(player_data)
+        if provider_player_id is None:
+            result = self._failure("MISSING", player_data, team_id, "provider player id is missing", retryable=True, terminal=False)
             return PlayerReadiness(**{**result.as_dict(), "lineup_side": lineup_side, "lineup_position": lineup_position, "roster_role": roster_role})
 
         try:
@@ -276,9 +281,7 @@ class PlayerIdentityResolutionService:
                 canonical_entries = []
                 for position, entry in enumerate(lineup.get(section, []), start=1):
                     player_data = entry.get("player") if isinstance(entry, dict) else None
-                    provider_player_id = None
-                    if isinstance(player_data, dict):
-                        provider_player_id = player_data.get("id") or player_data.get("provider_id")
+                    provider_player_id = self._provider_player_id(player_data)
 
                     resolution = await self.resolve_provider_player_identity(
                         db,

@@ -289,7 +289,10 @@ class LineupSyncService:
 
             readiness, canonical_lineup_data = await self.player_identity_resolution_service.resolve_lineup(db, lineup_data)
             unresolved = [item.as_dict() for item in readiness if item.status != "READY"]
-            terminal_unresolved = [item for item in unresolved if item["status"] != "MISSING"]
+            terminal_unresolved = [
+                item for item in unresolved
+                if item["status"] != "MISSING" or item.get("provider_player_id")
+            ]
             if terminal_unresolved:
                 failure = terminal_unresolved[0]
                 metrics = {
@@ -313,6 +316,10 @@ class LineupSyncService:
                 return metrics
             partial = bool(unresolved)
             if partial:
+                local_team_by_provider = {
+                    str((lineup.get("team") or {}).get("id")): lineup.get("local_team_id")
+                    for lineup in lineup_data
+                }
                 partial_diagnostics = [
                     {
                         **item,
@@ -327,7 +334,7 @@ class LineupSyncService:
                             db,
                             match_id=match_id,
                             provider_fixture_id=str(getattr(match, "provider_fixture_id", match_id)),
-                            local_team_id=None,
+                            local_team_id=local_team_by_provider.get(str(item.get("team_id"))),
                             provider_team_id=str(item.get("team_id")),
                             provider="api-football",
                             player_name=item.get("player_name"),
@@ -339,6 +346,11 @@ class LineupSyncService:
                             missing_reason=item.get("failure_reason") or "provider player id is missing",
                             raw_identity_state="missing",
                         )
+                    await self.missing_identity_repository.resolve_for_match(
+                        db,
+                        match_id,
+                        [item.as_dict() for item in readiness if item.status == "READY"],
+                    )
                 canonical_lineup_data = [
                     {
                         **lineup,
@@ -355,24 +367,29 @@ class LineupSyncService:
                     for lineup in canonical_lineup_data
                 )
                 existing_partial = await self.lineup_repository.get_by_match_id(db, match_id)
+                created = False
+                updated = False
                 if valid_entries:
                     if existing_partial:
                         await self.lineup_repository.update_one(db, existing_partial, canonical_lineup_data)
+                        updated = True
                     else:
                         await self.lineup_repository.create_one(db, match_id, canonical_lineup_data)
+                        created = True
                     if hasattr(db, "flush"):
                         await db.flush()
                 metrics = {
-                    "success": False,
+                    "success": True,
                     "partial": True,
                     "match_id": match_id,
-                    "created": False,
-                    "updated": False,
+                    "created": created,
+                    "updated": updated,
                     "failure_classification": "PARTIAL",
                     "reason": "missing_player_identity",
                     "diagnostics": partial_diagnostics,
                 }
                 logger.warning("LINEUP_SYNC_PARTIAL", extra=_safe_lineup_log_extra(metrics))
+                logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
                 return metrics
 
             validation_failure = self._validate_canonical_lineup_payload(lineup_data)
@@ -388,6 +405,13 @@ class LineupSyncService:
                 logger.warning("LINEUP_SYNC_FAILED", extra=_safe_lineup_log_extra(metrics))
                 logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
                 return metrics
+
+            if hasattr(db, "execute"):
+                await self.missing_identity_repository.resolve_for_match(
+                    db,
+                    match_id,
+                    [item.as_dict() for item in readiness if item.status == "READY"],
+                )
 
             existing = await self.lineup_repository.get_by_match_id(db, match_id)
 

@@ -169,7 +169,7 @@ class LiveUpdateScheduler:
             result = getattr(event, "retval", None)
             summary = {}
             if isinstance(result, dict):
-                for key in ("success", "updated", "synced_matches", "failed_matches", "processed_matches"):
+                for key in ("success", "updated", "synced_matches", "partial_matches", "failed_matches", "processed_matches"):
                     if key in result:
                         summary[key] = result[key]
             logger.info("SCHEDULER_JOB_COMPLETED job=%s result=%s", job_id, summary)
@@ -946,6 +946,7 @@ class LiveUpdateScheduler:
             "candidate_matches": 0,
             "processed_matches": 0,
             "synced_matches": 0,
+            "partial_matches": 0,
             "skipped_matches": 0,
             "failed_matches": 0,
         }
@@ -1002,8 +1003,12 @@ class LiveUpdateScheduler:
                             continue
 
                         if result.get("success") and not result.get("skipped"):
-                            metrics["synced_matches"] += 1
-                            logger.info("LINEUP_REFRESH_SYNCED match_id=%s", match_id)
+                            if result.get("partial"):
+                                metrics["partial_matches"] += 1
+                                logger.info("LINEUP_REFRESH_PARTIAL_SYNCED match_id=%s", match_id)
+                            else:
+                                metrics["synced_matches"] += 1
+                                logger.info("LINEUP_REFRESH_SYNCED match_id=%s", match_id)
                         elif result.get("success"):
                             metrics["skipped_matches"] += 1
                             logger.info(

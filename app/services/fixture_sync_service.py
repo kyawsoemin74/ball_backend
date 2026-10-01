@@ -841,7 +841,7 @@ class FixtureSyncService:
 
     async def finalize_pending_lineups(self, match_ids: list[int] | None = None) -> dict[str, int]:
         candidate_ids = sorted({int(match_id) for match_id in (match_ids or [])})
-        metrics = {"attempted": 0, "succeeded": 0, "failed": 0, "skipped": 0}
+        metrics = {"attempted": 0, "succeeded": 0, "partial": 0, "failed": 0, "skipped": 0}
 
         if not candidate_ids:
             try:
@@ -874,8 +874,8 @@ class FixtureSyncService:
                 FINALIZATION_TOTAL.labels("success", "none").inc()
             elif state == "partial":
                 metrics["attempted"] += 1
-                metrics["failed"] += 1
-                FINALIZATION_TOTAL.labels("failure", "LINEUP_PARTIAL").inc()
+                metrics["partial"] += 1
+                FINALIZATION_TOTAL.labels("partial", "LINEUP_PARTIAL").inc()
             elif state == "skipped":
                 metrics["skipped"] += 1
                 FINALIZATION_TOTAL.labels("skipped", "already_complete").inc()
@@ -928,6 +928,34 @@ class FixtureSyncService:
                 allow_terminal_status=True,
                 invalidate_cache=False,
             )
+            if result.get("success") and result.get("partial"):
+                if record.attempt_count >= FINAL_LINEUP_MAX_ATTEMPTS:
+                    await self.final_lineup_finalization_repository.mark_terminal(
+                        db,
+                        record,
+                        "MAX_RETRY_ATTEMPTS_EXCEEDED",
+                        "maximum automatic lineup attempts exceeded",
+                        attempted_at,
+                        failure_diagnostics=result.get("diagnostics", []),
+                    )
+                else:
+                    await self.final_lineup_finalization_repository.mark_retryable(
+                        db,
+                        record,
+                        "LINEUP_PARTIAL",
+                        result.get("reason", "missing player identity"),
+                        attempted_at,
+                        failure_diagnostics=result.get("diagnostics", []),
+                    )
+                commit_started = True
+                await db.commit()
+                try:
+                    await self.cache_service.delete(make_cache_key("lineup", match_id))
+                except Exception:
+                    logger.exception("FINAL_LINEUP_CACHE_INVALIDATION_FAILED match_id=%s", match_id)
+                logger.info("FINAL_LINEUP_PARTIAL match_id=%s status=%s", match_id, record.status)
+                return {"state": "partial", "terminal": record.status == "TERMINAL"}
+
             if not result.get("success"):
                 await db.rollback()
                 return {
@@ -938,18 +966,6 @@ class FixtureSyncService:
                     "attempted_at": attempted_at,
                     "provider_attempted": provider_attempted,
                 }
-
-            if result.get("partial"):
-                await self.final_lineup_finalization_repository.mark_retryable(
-                    db,
-                    record,
-                    "LINEUP_PARTIAL",
-                    result.get("reason", "missing player identity"),
-                    attempted_at,
-                    failure_diagnostics=result.get("diagnostics", []),
-                )
-                await db.commit()
-                return {"state": "partial"}
 
             completed_at = datetime.now(timezone.utc)
             await self.final_lineup_finalization_repository.mark_success(db, record, completed_at)
