@@ -1,4 +1,8 @@
 import logging
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import event
 from sqlalchemy.exc import SQLAlchemyError
@@ -15,6 +19,25 @@ from app.services.country_sync_service import CountrySyncService
 logger = logging.getLogger(__name__)
 
 _TEAM_POST_COMMIT_CACHE_KEYS = "_team_post_commit_cache_keys"
+COACH_TTL = timedelta(hours=24)
+_COACH_SYNC_BATCH: ContextVar[dict[tuple[int, str], dict] | None] = ContextVar(
+    "coach_sync_batch",
+    default=None,
+)
+
+
+@contextmanager
+def coach_sync_batch_scope() -> Iterator[None]:
+    """Share Coach decisions across one fixture-sync execution and nested work."""
+    if _COACH_SYNC_BATCH.get() is not None:
+        yield
+        return
+
+    token = _COACH_SYNC_BATCH.set({})
+    try:
+        yield
+    finally:
+        _COACH_SYNC_BATCH.reset(token)
 
 
 @event.listens_for(Session, "after_commit")
@@ -40,12 +63,14 @@ class TeamSyncService:
         team_repository: TeamRepository | None = None,
         coach_sync_service: CoachSyncService | None = None,
         team_provider: TeamProvider | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.cache_service = cache_service
         self.team_repository = team_repository or TeamRepository()
         self.coach_sync_service = coach_sync_service or CoachSyncService()
         self.team_provider = team_provider
         self.country_sync_service = CountrySyncService()
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     @staticmethod
     def _queue_team_cache_invalidation(db: AsyncSession, team_id: int) -> None:
@@ -467,38 +492,245 @@ class TeamSyncService:
         if team is None or getattr(team, "provider_id", None) is None:
             return {"success": True, "team_id": team_id, "coach_id": None, "updated": False, "reason": "unresolved_team"}
 
-        selection_method = getattr(self.coach_sync_service.provider, "get_team_coach_selection", None)
-        if selection_method is None:
-            return {"success": True, "team_id": team_id, "coach_id": None, "updated": False, "reason": "invalid_selection_contract"}
+        provider_team_id = str(team.provider_id)
+        batch = _COACH_SYNC_BATCH.get()
+        batch_key = (int(team.team_id), provider_team_id)
+        if batch is not None and batch_key in batch:
+            previous = batch[batch_key]
+            result = {
+                "success": True,
+                "team_id": int(team_id),
+                "coach_id": previous.get("coach_id"),
+                "updated": False,
+                "reason": "COACH_SKIP_BATCH_DUPLICATE",
+            }
+            logger.info(
+                "COACH_SKIP_BATCH_DUPLICATE local_team_id=%s provider_team_id=%s "
+                "local_coach_id=%s original_decision=%s",
+                team.team_id,
+                provider_team_id,
+                previous.get("coach_id"),
+                previous.get("decision"),
+            )
+            return result
 
-        selection = await selection_method(int(team.provider_id))
+        coach = None
+        team_coach_id = getattr(team, "coach_id", None)
+        coach_repository = getattr(self.coach_sync_service, "repository", None)
+        get_coach_by_id = getattr(coach_repository, "get_by_id", None)
+        if team_coach_id is not None and get_coach_by_id is not None:
+            coach = await get_coach_by_id(db, int(team_coach_id))
+
+        now = self.clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        now = now.astimezone(timezone.utc)
+        updated_at = getattr(coach, "updated_at", None) if coach is not None else None
+        if isinstance(coach, dict):
+            updated_at = coach.get("updated_at")
+        if isinstance(updated_at, datetime):
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            age = now - updated_at.astimezone(timezone.utc)
+        else:
+            age = None
+
+        if coach is not None and age is not None and age <= COACH_TTL:
+            coach_id = getattr(coach, "coach_id", None)
+            if coach_id is None and isinstance(coach, dict):
+                coach_id = coach.get("coach_id")
+            decision = {
+                "coach_id": coach_id,
+                "decision": "COACH_SKIP_FRESH",
+            }
+            if batch is not None:
+                batch[batch_key] = decision
+            logger.info(
+                "COACH_SKIP_FRESH local_team_id=%s provider_team_id=%s "
+                "local_coach_id=%s age_seconds=%s ttl_seconds=%s",
+                team.team_id,
+                provider_team_id,
+                coach_id,
+                age.total_seconds(),
+                COACH_TTL.total_seconds(),
+            )
+            return {
+                "success": True,
+                "team_id": int(team_id),
+                "coach_id": coach_id,
+                "updated": False,
+                "reason": "COACH_SKIP_FRESH",
+            }
+
+        existing_coach_id = team_coach_id
+        if coach is not None:
+            existing_coach_id = getattr(coach, "coach_id", None)
+        if isinstance(coach, dict):
+            existing_coach_id = coach.get("coach_id")
+        decision_name = "COACH_REFRESH" if coach is not None else "COACH_FETCH"
+        freshness_reason = (
+            "timestamp_missing"
+            if coach is not None and age is None
+            else "ttl_expired" if coach is not None else "coach_missing"
+        )
+        logger.info(
+            "%s local_team_id=%s provider_team_id=%s local_coach_id=%s "
+            "freshness_reason=%s age_seconds=%s ttl_seconds=%s",
+            decision_name,
+            team.team_id,
+            provider_team_id,
+            existing_coach_id,
+            freshness_reason,
+            age.total_seconds() if age is not None else None,
+            COACH_TTL.total_seconds(),
+        )
+        if batch is not None:
+            batch[batch_key] = {
+                "coach_id": existing_coach_id,
+                "decision": decision_name,
+            }
+
+        response_method = getattr(
+            self.coach_sync_service.provider,
+            "get_team_coach_response",
+            None,
+        )
+        select_method = getattr(self.coach_sync_service, "select_team_coach", None)
+        if response_method is None or select_method is None:
+            logger.error(
+                "COACH_FETCH_FAILED local_team_id=%s provider_team_id=%s "
+                "local_coach_id=%s reason=invalid_selection_contract",
+                team.team_id,
+                provider_team_id,
+                existing_coach_id,
+            )
+            result = {
+                "success": True,
+                "team_id": int(team_id),
+                "coach_id": existing_coach_id,
+                "updated": False,
+                "reason": "COACH_FETCH_FAILED",
+            }
+            if batch is not None:
+                batch[batch_key] = {
+                    "coach_id": existing_coach_id,
+                    "decision": "COACH_FETCH_FAILED",
+                }
+            return result
+
+        try:
+            provider_response = await response_method(int(team.provider_id))
+            selection = select_method(provider_response)
+        except Exception:
+            logger.exception(
+                "COACH_FETCH_FAILED local_team_id=%s provider_team_id=%s "
+                "local_coach_id=%s reason=provider_exception",
+                team.team_id,
+                provider_team_id,
+                existing_coach_id,
+            )
+            result = {
+                "success": True,
+                "team_id": int(team_id),
+                "coach_id": existing_coach_id,
+                "updated": False,
+                "reason": "COACH_FETCH_FAILED",
+            }
+            if batch is not None:
+                batch[batch_key] = {
+                    "coach_id": existing_coach_id,
+                    "decision": "COACH_FETCH_FAILED",
+                }
+            return result
+
         if not isinstance(selection, dict):
-            return {"success": True, "team_id": team_id, "coach_id": None, "updated": False, "reason": "invalid_selection"}
+            selection = {"status": "INVALID", "coach": None}
 
         selection_status = selection.get("status")
         payload = selection.get("coach")
         if selection_status != "VERIFIED":
-            if isinstance(payload, dict):
-                await self.coach_sync_service.sync_team_coach(db, payload)
-            reason = "coach_unavailable" if selection_status == "NO_DATA" else str(selection_status or "invalid_selection").lower()
-            return {
+            logger.warning(
+                "COACH_FETCH_FAILED local_team_id=%s provider_team_id=%s "
+                "local_coach_id=%s selection_status=%s",
+                team.team_id,
+                provider_team_id,
+                existing_coach_id,
+                selection_status,
+            )
+            result = {
                 "success": True,
-                "team_id": team_id,
-                "coach_id": getattr(team, "coach_id", None),
+                "team_id": int(team_id),
+                "coach_id": existing_coach_id,
                 "updated": False,
-                "reason": reason,
+                "reason": "COACH_FETCH_FAILED",
             }
+            if batch is not None:
+                batch[batch_key] = {
+                    "coach_id": existing_coach_id,
+                    "decision": "COACH_FETCH_FAILED",
+                }
+            return result
 
         if not isinstance(payload, dict):
-            return {"success": True, "team_id": team_id, "coach_id": None, "updated": False, "reason": "coach_unavailable"}
+            logger.warning(
+                "COACH_FETCH_FAILED local_team_id=%s provider_team_id=%s "
+                "local_coach_id=%s reason=missing_verified_payload",
+                team.team_id,
+                provider_team_id,
+                existing_coach_id,
+            )
+            result = {
+                "success": True,
+                "team_id": int(team_id),
+                "coach_id": existing_coach_id,
+                "updated": False,
+                "reason": "COACH_FETCH_FAILED",
+            }
+            if batch is not None:
+                batch[batch_key] = {
+                    "coach_id": existing_coach_id,
+                    "decision": "COACH_FETCH_FAILED",
+                }
+            return result
 
         coach_record = await self.coach_sync_service.sync_team_coach(db, payload)
         coach_id = coach_record.get("coach_id")
         if coach_id is None:
-            return {"success": True, "team_id": team_id, "coach_id": None, "updated": False, "reason": "coach_unresolved"}
+            logger.warning(
+                "COACH_FETCH_FAILED local_team_id=%s provider_team_id=%s "
+                "local_coach_id=%s provider_coach_id=%s reason=coach_unresolved",
+                team.team_id,
+                provider_team_id,
+                existing_coach_id,
+                payload.get("id"),
+            )
+            result = {
+                "success": True,
+                "team_id": int(team_id),
+                "coach_id": existing_coach_id,
+                "updated": False,
+                "reason": "COACH_FETCH_FAILED",
+            }
+            if batch is not None:
+                batch[batch_key] = {
+                    "coach_id": existing_coach_id,
+                    "decision": "COACH_FETCH_FAILED",
+                }
+            return result
 
         if getattr(team, "coach_id", None) != coach_id:
             await self.team_repository.update_current_coach(db, team_id, coach_id)
             self._queue_team_cache_invalidation(db, team_id)
 
+        logger.info(
+            "%s local_team_id=%s provider_team_id=%s local_coach_id=%s "
+            "provider_coach_id=%s outcome=success",
+            decision_name,
+            team.team_id,
+            provider_team_id,
+            coach_id,
+            payload.get("id"),
+        )
+        if batch is not None:
+            batch[batch_key] = {"coach_id": coach_id, "decision": decision_name}
         return {"success": True, "team_id": team_id, "coach_id": coach_id, "updated": True}

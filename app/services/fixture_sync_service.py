@@ -25,7 +25,7 @@ from app.services.cache_service import CacheService
 from app.services.league_season_sync_service import LeagueSeasonSyncService
 from app.services.standing_service import StandingService
 from app.services.team_service import TeamService
-from app.services.team_sync_service import TeamSyncService
+from app.services.team_sync_service import TeamSyncService, coach_sync_batch_scope
 from app.services.venue_sync_service import VenueSyncService
 from app.services.referee_sync_service import RefereeSyncService
 from app.services.resource_lock import run_with_resource_lock
@@ -536,19 +536,40 @@ class FixtureSyncService:
 
         try:
             self._defer_live_cache_invalidation = True
-            for fixture in provider_fixtures:
-                sync_result = await self.process_fixture(db, fixture)
-                for key in ("inserted", "updated", "failed"):
-                    result[key] += sync_result.get(key, 0)
-                result["final_lineup_candidates"].extend(sync_result.get("final_lineup_candidates", []))
-                result["active_match_updates"].update(sync_result.get("active_match_updates", {}))
-                result["success"] = result["success"] and sync_result.get("success", False)
+            with coach_sync_batch_scope():
+                for fixture in provider_fixtures:
+                    sync_result = await self.process_fixture(db, fixture)
+                    for key in ("inserted", "updated", "failed"):
+                        result[key] += sync_result.get(key, 0)
+                    result["final_lineup_candidates"].extend(
+                        sync_result.get("final_lineup_candidates", [])
+                    )
+                    result["active_match_updates"].update(
+                        sync_result.get("active_match_updates", {})
+                    )
+                    result["success"] = (
+                        result["success"] and sync_result.get("success", False)
+                    )
             result["final_lineup_candidates"] = sorted(set(result["final_lineup_candidates"]))
         finally:
             self._defer_live_cache_invalidation = False
         return result
 
     async def _process_sync_with_candidates(
+        self,
+        db: AsyncSession,
+        fixtures: list,
+        *,
+        allow_terminal_transition: bool | None = None,
+    ) -> tuple[dict, set[tuple[int, int]]]:
+        with coach_sync_batch_scope():
+            return await self._process_sync_with_candidates_in_batch(
+                db,
+                fixtures,
+                allow_terminal_transition=allow_terminal_transition,
+            )
+
+    async def _process_sync_with_candidates_in_batch(
         self,
         db: AsyncSession,
         fixtures: list,

@@ -50,6 +50,29 @@ class CoachSyncService:
             "photo": None,
         }
 
+    @staticmethod
+    def select_team_coach(response: Any) -> dict:
+        """Validate and select the sole unambiguous coach from a provider response."""
+        if not isinstance(response, dict) or "response" not in response:
+            return {"status": "NO_DATA", "coach": None}
+
+        coaches = response.get("response", [])
+        if not isinstance(coaches, list) or not coaches:
+            return {"status": "NO_DATA", "coach": None}
+
+        valid_coaches = [coach for coach in coaches if isinstance(coach, dict)]
+        if len(valid_coaches) != 1:
+            return {
+                "status": "AMBIGUOUS",
+                "coach": valid_coaches[0] if valid_coaches else None,
+            }
+
+        coach = valid_coaches[0]
+        if not coach.get("id") or not coach.get("name"):
+            return {"status": "INVALID", "coach": None}
+
+        return {"status": "VERIFIED", "coach": coach}
+
     async def sync_team_coach(self, db: AsyncSession | None, payload: dict | None) -> dict:
         if not isinstance(payload, dict):
             raise ValueError("coach payload is required")

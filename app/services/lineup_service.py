@@ -14,6 +14,7 @@ from app.services.base.football_client import FootballAPIClient
 from app.services.cache_service import CacheService
 from app.services.lineup_sync_service import LineupSyncService
 from app.services.player_identity_resolution_service import PlayerIdentityResolutionService
+from app.services.player_service import PlayerService
 from app.services.team_service import TeamService
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ class LineupService:
         lineup_sync_service: LineupSyncService | None = None,
         team_service: TeamService | None = None,
         player_identity_resolution_service: PlayerIdentityResolutionService | None = None,
+        player_service: PlayerService | None = None,
     ) -> None:
         self.client = client
         self.cache_service = cache_service or CacheService()
@@ -41,6 +43,7 @@ class LineupService:
             player_identity_resolution_service=player_identity_resolution_service,
         )
         self.team_service = team_service or TeamService(client=client, cache_service=self.cache_service)
+        self.player_service = player_service or PlayerService()
 
     @staticmethod
     def _cache_payload_and_timestamp(cached: Any) -> tuple[Any, datetime | None]:
@@ -167,6 +170,94 @@ class LineupService:
             response.append(item)
         return response
 
+    @staticmethod
+    def _same_local_player_id(left: Any, right: Any) -> bool:
+        try:
+            return int(left) == int(right)
+        except (TypeError, ValueError):
+            return str(left).strip() == str(right).strip()
+
+    async def _enrich_player_photos(self, db: AsyncSession, payload: Any, match_id: int) -> Any:
+        if not isinstance(payload, list):
+            return payload
+
+        provider_ids = list(dict.fromkeys(
+            str(player["provider_player_id"]).strip()
+            for lineup in payload
+            for section in ("startXI", "substitutes")
+            for entry in lineup.get(section, [])
+            if isinstance(entry, dict)
+            and isinstance((player := entry.get("player")), dict)
+            and player.get("provider_player_id") is not None
+            and str(player["provider_player_id"]).strip()
+        ))
+        players_by_provider_id = {}
+        if provider_ids:
+            try:
+                players = await self.player_service.get_players_by_provider_ids(db, provider_ids)
+                players_by_provider_id = {
+                    str(player.provider_id): player
+                    for player in players
+                }
+            except Exception:
+                logger.exception(
+                    "LINEUP_PLAYER_PHOTO_BATCH_LOOKUP_FAILED",
+                    extra={"match_id": match_id},
+                )
+                for provider_id in provider_ids:
+                    try:
+                        player = await self.player_service.get_player_by_provider_id(db, provider_id)
+                        if player is not None:
+                            players_by_provider_id[provider_id] = player
+                    except Exception:
+                        logger.exception(
+                            "LINEUP_PLAYER_PHOTO_LOOKUP_FAILED",
+                            extra={"match_id": match_id, "provider_player_id": provider_id},
+                        )
+
+        players_by_local_id = {}
+        for lineup in payload:
+            for section in ("startXI", "substitutes"):
+                for entry in lineup.get(section, []):
+                    if not isinstance(entry, dict):
+                        continue
+                    player_data = entry.get("player")
+                    if not isinstance(player_data, dict):
+                        continue
+
+                    provider_id = player_data.get("provider_player_id")
+                    local_id = player_data.get("local_player_id")
+                    player = None
+                    if provider_id is not None and str(provider_id).strip():
+                        player = players_by_provider_id.get(str(provider_id).strip())
+                        if player is not None and local_id is not None and not self._same_local_player_id(
+                            local_id, player.player_id
+                        ):
+                            continue
+                    elif local_id is not None:
+                        local_key = str(local_id).strip()
+                        if local_key not in players_by_local_id:
+                            try:
+                                players_by_local_id[local_key] = await self.player_service.get_player(db, local_id)
+                            except Exception:
+                                logger.exception(
+                                    "LINEUP_PLAYER_PHOTO_LOOKUP_FAILED",
+                                    extra={"match_id": match_id, "local_player_id": local_key},
+                                )
+                                players_by_local_id[local_key] = None
+                        player = players_by_local_id[local_key]
+
+                    if player is None:
+                        continue
+
+                    photo = getattr(player, "photo", None)
+                    if photo:
+                        player_data["photo"] = photo
+                    else:
+                        player_data.pop("photo", None)
+
+        return payload
+
     async def get_match_lineup(self, match_id: int, db: AsyncSession | None = None) -> Optional[List[Dict[str, Any]]]:
         """Compatibility read path: cache first, then DB fallback, never provider fetch."""
         cache_key = make_lineup_cache_key(match_id)
@@ -243,7 +334,8 @@ class LineupService:
                 cached = None
             else:
                 logger.debug("LINEUP_CACHE_HIT", extra={"match_id": match_id})
-                return self._canonical_response(match_id, payload)
+                canonical = self._canonical_response(match_id, payload)
+                return await self._enrich_player_photos(db, canonical, match_id)
 
         logger.debug("LINEUP_CACHE_MISS", extra={"match_id": match_id})
         db_record = (await db.execute(select(MatchLineup).where(MatchLineup.match_id == match_id))).scalar_one_or_none()
@@ -253,6 +345,7 @@ class LineupService:
             except Exception:
                 logger.exception("LINEUP_CACHE_WRITE_FAILED", extra={"match_id": match_id})
             logger.debug("LINEUP_CACHE_SET", extra={"match_id": match_id})
-            return self._canonical_response(match_id, db_record.data)
+            canonical = self._canonical_response(match_id, db_record.data)
+            return await self._enrich_player_photos(db, canonical, match_id)
 
         return None
