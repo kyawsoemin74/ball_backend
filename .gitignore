@@ -9,3 +9,6 @@ __pycache__/
 venv/
 env/
 tests/
+!tests/
+tests/*
+!tests/test_live_sync_match_only.py

@@ -40,10 +40,6 @@ ACTIVE_MATCH_TERMINAL_STATUSES = FINISHED_STATUSES | {"PST"}
 FINALIZATION_TERMINAL_STATUSES = ACTIVE_MATCH_TERMINAL_STATUSES
 FINAL_LINEUP_TERMINAL_STATUSES = {"FT", "AET", "PEN"}
 NON_TERMINAL_STATUSES = {"NS", "TBD", "1H", "2H", "HT", "ET", "LIVE", "BT", "P"}
-RECENT_RECONCILIATION_LOOKBACK = timedelta(hours=24)
-RECENT_RECONCILIATION_LOOKAHEAD = timedelta(hours=24)
-RECENT_RECONCILIATION_BATCH_SIZE = 20
-RECENT_RECONCILIATION_LIMIT = 200
 
 
 class FixtureSyncService:
@@ -490,70 +486,6 @@ class FixtureSyncService:
             )
             result["final_lineup_candidates"].append(local_match_id)
         return True
-
-    async def reconcile_recent_non_terminal(self, db: AsyncSession) -> dict:
-        """Re-check bounded recent local non-terminal fixtures by provider ID."""
-        allowed_ids = await self.allowed_league_repository.get_allowed_ids(db)
-        now_utc = datetime.now(timezone.utc)
-        candidates = await self.match_repository.get_recent_non_terminal(
-            db,
-            allowed_ids,
-            now_utc - RECENT_RECONCILIATION_LOOKBACK,
-            now_utc + RECENT_RECONCILIATION_LOOKAHEAD,
-            NON_TERMINAL_STATUSES,
-            limit=RECENT_RECONCILIATION_LIMIT,
-        )
-        provider_ids = [str(match.provider_fixture_id) for match in candidates if match.provider_fixture_id is not None]
-        result = {
-            "success": True,
-            "selected": len(provider_ids),
-            "fetched": 0,
-            "inserted": 0,
-            "updated": 0,
-            "failed": 0,
-            "final_lineup_candidates": [],
-            "active_match_updates": {},
-        }
-        if not provider_ids:
-            return result
-
-        provider_fixtures = []
-        try:
-            for offset in range(0, len(provider_ids), RECENT_RECONCILIATION_BATCH_SIZE):
-                response = await self.fixture_provider.get_fixtures_by_ids(
-                    provider_ids[offset : offset + RECENT_RECONCILIATION_BATCH_SIZE]
-                )
-                if not isinstance(response, dict) or not isinstance(response.get("response"), list):
-                    return {**result, "success": False, "message": "Invalid provider response"}
-                provider_fixtures.extend(response["response"])
-        except Exception as exc:
-            logger.warning("RECENT_FIXTURE_RECONCILIATION_PROVIDER_FAILED error=%s", exc)
-            return {**result, "success": False, "message": "Provider request failed"}
-
-        result["fetched"] = len(provider_fixtures)
-        if not provider_fixtures:
-            return result
-
-        try:
-            self._defer_live_cache_invalidation = True
-            with coach_sync_batch_scope():
-                for fixture in provider_fixtures:
-                    sync_result = await self.process_fixture(db, fixture)
-                    for key in ("inserted", "updated", "failed"):
-                        result[key] += sync_result.get(key, 0)
-                    result["final_lineup_candidates"].extend(
-                        sync_result.get("final_lineup_candidates", [])
-                    )
-                    result["active_match_updates"].update(
-                        sync_result.get("active_match_updates", {})
-                    )
-                    result["success"] = (
-                        result["success"] and sync_result.get("success", False)
-                    )
-            result["final_lineup_candidates"] = sorted(set(result["final_lineup_candidates"]))
-        finally:
-            self._defer_live_cache_invalidation = False
-        return result
 
     async def _process_sync_with_candidates(
         self,
@@ -1267,74 +1199,84 @@ class FixtureSyncService:
     @observe_sync("fixture")
     async def sync_live_matches(self, db: AsyncSession) -> dict:
         result = await self.fixture_provider.get_live_fixtures()
-        if not result or "response" not in result:
-            return {"success": False, "message": "API error", "final_lineup_candidates": []}
+        if not isinstance(result, dict) or not isinstance(result.get("response"), list):
+            logger.error("LIVE_SYNC_PROVIDER_RESPONSE_INVALID")
+            return {
+                "success": False,
+                "message": "Invalid live fixtures response",
+                "updated": 0,
+                "skipped": 0,
+                "failed": 0,
+                "provider_fixture_count": 0,
+            }
 
-        fixtures = result.get("response", [])
-        api_live_provider_ids = {
-            item["fixture"]["id"]
-            for item in fixtures
-            if item.get("fixture") and item["fixture"].get("id")
+        fixtures = result["response"]
+        sync_result = {
+            "success": True,
+            "message": "No live matches" if not fixtures else "Live Match state synchronized",
+            "provider_fixture_count": len(fixtures),
+            "total": len(fixtures),
+            "updated": 0,
+            "skipped": 0,
+            "failed": 0,
         }
-        stale_threshold = datetime.now(timezone.utc) - timedelta(hours=24)
-        stale_matches = await self.match_repository.get_live_stale(
-            db,
-            api_live_provider_ids,
-            stale_threshold,
-        )
-        logger.debug("get_live_stale returned %d stale matches", len(stale_matches))
-        for match in stale_matches[:20]:
-            logger.debug("fixture_id=%s status=%s match_time=%s", match.match_id, getattr(match, "status", None), getattr(match, "match_time", None))
+        logger.info("LIVE_SYNC_PROVIDER_FIXTURES_RECEIVED count=%s", len(fixtures))
 
-        if stale_matches:
-            stale_provider_ids = [
-                str(match.provider_fixture_id)
-                for match in stale_matches
-                if match.provider_fixture_id is not None
-            ]
-            logger.debug(
-                "Syncing %d stale matches that are no longer in live feed",
-                len(stale_provider_ids),
-            )
+        for fixture_payload in fixtures:
+            fixture = fixture_payload.get("fixture") if isinstance(fixture_payload, dict) else None
+            status_payload = fixture.get("status") if isinstance(fixture, dict) else None
+            goals = fixture_payload.get("goals") if isinstance(fixture_payload, dict) else None
+
             try:
-                stale_chunks = [
-                    stale_provider_ids[i : i + 20]
-                    for i in range(0, len(stale_provider_ids), 20)
-                ]
-                total_chunks = len(stale_chunks)
-                stale_api_fixtures = []
+                if not isinstance(fixture, dict) or not isinstance(status_payload, dict) or not isinstance(goals, dict):
+                    raise ValueError("fixture state fields are missing")
 
-                for chunk_index, chunk in enumerate(stale_chunks, start=1):
-                    logger.debug("Fetching stale chunk %s/%s (%s ids)", chunk_index, total_chunks, len(chunk))
-                    stale_resp = await self.fixture_provider.get_fixtures_by_ids(chunk)
-                    chunk_response = stale_resp.get("response", []) if isinstance(stale_resp, dict) else []
-                    logger.debug("Chunk returned %s fixtures", len(chunk_response))
+                provider_fixture_id = int(fixture["id"])
+                live_state = {
+                    "status": str(status_payload.get("short") or "NS"),
+                    "elapsed": int(status_payload.get("elapsed") or 0),
+                    "home_score": int(goals.get("home") or 0),
+                    "away_score": int(goals.get("away") or 0),
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                sync_result["failed"] += 1
+                logger.warning("LIVE_SYNC_FIXTURE_INVALID error=%s", exc)
+                continue
 
-                    stale_api_fixtures.extend(chunk_response)
+            existing_match = await self.match_repository.get_by_provider_fixture_id(
+                db,
+                "api-football",
+                provider_fixture_id,
+            )
+            if existing_match is None:
+                sync_result["skipped"] += 1
+                logger.warning(
+                    "LIVE_SYNC_MATCH_NOT_FOUND provider_fixture_id=%s",
+                    provider_fixture_id,
+                )
+                continue
 
-                if stale_api_fixtures:
-                    logger.debug("total_stale_api_fixtures=%d", len(stale_api_fixtures))
-                    for fixture in stale_api_fixtures:
-                        fixture_info = fixture.get("fixture", {})
-                        status_info = fixture_info.get("status", {})
-                        logger.debug(
-                            "fixture_id=%s api_status=%s elapsed=%s",
-                            fixture_info.get("id"),
-                            status_info.get("short"),
-                            status_info.get("elapsed"),
-                        )
-                    fixtures.extend(stale_api_fixtures)
-            except Exception as exc:
-                logger.error("Failed to fetch updates for stale matches: %s", exc)
+            updated = await self.match_repository.update_live_state(
+                db,
+                existing_match.local_match_id,
+                **live_state,
+            )
+            if not updated:
+                sync_result["skipped"] += 1
+                logger.warning(
+                    "LIVE_SYNC_MATCH_DISAPPEARED provider_fixture_id=%s local_match_id=%s",
+                    provider_fixture_id,
+                    existing_match.local_match_id,
+                )
+                continue
 
-        if not fixtures:
-            return {"success": True, "message": "No live matches", "updated": 0, "final_lineup_candidates": []}
+            sync_result["updated"] += 1
 
-        previous_terminal_mode = getattr(self, "_allow_terminal_transition", False)
-        self._allow_terminal_transition = True
-        try:
-            self._defer_live_cache_invalidation = True
-            return await self._process_sync(db, fixtures)
-        finally:
-            self._allow_terminal_transition = previous_terminal_mode
-            self._defer_live_cache_invalidation = False
+        logger.info(
+            "LIVE_SYNC_MATCH_STATE_PROCESSED provider_fixture_count=%s updated=%s skipped=%s failed=%s",
+            sync_result["provider_fixture_count"],
+            sync_result["updated"],
+            sync_result["skipped"],
+            sync_result["failed"],
+        )
+        return sync_result

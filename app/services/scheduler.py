@@ -50,7 +50,6 @@ LIVE_MATCH_SYNC_LOCK_KEY = 9342002
 DAILY_FIXTURE_SYNC_LOCK_KEY = 9342003
 REPAIR_DAILY_MATCHES_LOCK_KEY = 9342004
 STANDINGS_REFRESH_LOCK_KEY = 9342001
-RECENT_RECONCILIATION_LOCK_KEY = 9342005
 _SCHEDULER_ADVISORY_LOCK_CONNECTIONS = "_scheduler_advisory_lock_connections"
 
 
@@ -137,7 +136,6 @@ async def invalidate_odds_cache_after_commit(
 class LiveUpdateScheduler:
     EXPECTED_JOB_IDS = (
         "sync_live_matches",
-        "reconcile_recent_non_terminal",
         "recover_league_identities",
         "sync_daily_fixtures",
         "repair_daily_matches",
@@ -196,14 +194,6 @@ class LiveUpdateScheduler:
             id="sync_live_matches",
             name="Sync Live Matches",
             max_instances=1  # Prevent overlapping jobs
-        )
-
-        self.scheduler.add_job(
-            self._reconcile_recent_non_terminal_job,
-            trigger=IntervalTrigger(minutes=5),
-            id="reconcile_recent_non_terminal",
-            name="Reconcile Recent Fixtures",
-            max_instances=1,
         )
 
         self.scheduler.add_job(
@@ -341,44 +331,14 @@ class LiveUpdateScheduler:
                             result = await football_service.sync_live_matches(db)
                             if result.get("success"):
                                 await db.commit()
-                                for match_id in result.get("final_event_sync_matches", []):
-                                    event_cache_key = make_cache_key("match", match_id, "events")
-                                    try:
-                                        if not await self.cache_service.delete(event_cache_key):
-                                            logger.warning(
-                                                "FINAL_EVENT_CACHE_INVALIDATION_FAILED match_id=%s",
-                                                match_id,
-                                            )
-                                    except Exception:
-                                        logger.exception(
-                                            "FINAL_EVENT_CACHE_INVALIDATION_FAILED match_id=%s",
-                                            match_id,
-                                        )
-                                for match_id in result.get("final_statistics_sync_matches", []):
-                                    statistics_cache_key = make_cache_key("match", match_id, "statistics")
-                                    try:
-                                        if not await self.cache_service.delete(statistics_cache_key):
-                                            logger.warning(
-                                                "FINAL_STATISTICS_CACHE_INVALIDATION_FAILED match_id=%s",
-                                                match_id,
-                                            )
-                                    except Exception:
-                                        logger.exception(
-                                            "FINAL_STATISTICS_CACHE_INVALIDATION_FAILED match_id=%s",
-                                            match_id,
-                                        )
                                 try:
-                                    await football_service.apply_active_match_updates(result.get("active_match_updates"))
-                                except Exception:
-                                    logger.exception("LIVE_SYNC_ACTIVE_REGISTRY_UPDATE_FAILED")
-                                try:
-                                    await self.cache_service.delete(make_cache_key("live_matches"))
-                                except Exception:
-                                    logger.exception("LIVE_SYNC_CACHE_INVALIDATION_FAILED")
-                                if "final_lineup_candidates" in result:
-                                    await football_service.finalize_pending_lineups(
-                                        result.get("final_lineup_candidates", [])
+                                    cache_invalidated = await self.cache_service.delete(
+                                        make_cache_key("live_matches")
                                     )
+                                    if not cache_invalidated:
+                                        logger.warning("LIVE_SYNC_CACHE_INVALIDATION_FAILED key=live_matches")
+                                except Exception:
+                                    logger.exception("LIVE_SYNC_CACHE_INVALIDATION_FAILED key=live_matches")
                             else:
                                 await db.rollback()
                             return result
@@ -484,46 +444,6 @@ class LiveUpdateScheduler:
         except Exception as e:
             SCHEDULER_JOB_ERRORS.labels(job="sync_daily_fixtures").inc()
             logger.error(f"Error in daily sync job: {e}")
-
-    async def _reconcile_recent_non_terminal_job(self):
-        try:
-            async with async_session() as db:
-                if not await self._acquire_advisory_lock(db, RECENT_RECONCILIATION_LOCK_KEY):
-                    logger.info("RECENT_RECONCILIATION_SKIPPED reason=lock_not_acquired")
-                    return
-                try:
-                    async def reconcile() -> dict:
-                        try:
-                            result = await football_service.reconcile_recent_non_terminal(db)
-                            if result.get("success"):
-                                await db.commit()
-                                await football_service.apply_active_match_updates(result.get("active_match_updates"))
-                                try:
-                                    await self.cache_service.delete(make_cache_key("live_matches"))
-                                except Exception:
-                                    logger.exception("RECENT_RECONCILIATION_CACHE_INVALIDATION_FAILED")
-                                if result.get("final_lineup_candidates"):
-                                    await football_service.finalize_pending_lineups(
-                                        result["final_lineup_candidates"]
-                                    )
-                            else:
-                                await db.rollback()
-                            return result
-                        except Exception:
-                            await db.rollback()
-                            raise
-
-                    resource_locked, result = await run_with_resource_lock(
-                        db, "fixture_query", "recent_reconciliation", reconcile
-                    )
-                    if resource_locked:
-                        SCHEDULER_JOB_RUNS.labels(job="reconcile_recent_non_terminal").inc()
-                        logger.info("RECENT_RECONCILIATION_COMPLETE result=%s", result)
-                finally:
-                    await self._release_advisory_lock(db, RECENT_RECONCILIATION_LOCK_KEY)
-        except Exception:
-            SCHEDULER_JOB_ERRORS.labels(job="reconcile_recent_non_terminal").inc()
-            logger.exception("Error in recent fixture reconciliation job")
 
     async def _repair_daily_matches_job(self):
         """Job function to repair live/stuck matches by re-syncing yesterday and today."""
