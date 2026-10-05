@@ -18,6 +18,7 @@ from app.repositories.league_repository import LeagueRepository
 from app.repositories.match_repository import MatchRepository
 from app.repositories.final_lineup_finalization_repository import FinalLineupFinalizationRepository
 from app.repositories.final_lineup_finalization_repository import FINAL_LINEUP_MAX_ATTEMPTS
+from app.repositories.match_finalization_repository import MatchFinalizationRepository
 from app.schemas.match import MatchCreate
 from app.services.active_match_service import active_match_service
 from app.services.base.football_client import FootballAPIClient
@@ -29,6 +30,7 @@ from app.services.team_sync_service import TeamSyncService, coach_sync_batch_sco
 from app.services.venue_sync_service import VenueSyncService
 from app.services.referee_sync_service import RefereeSyncService
 from app.services.resource_lock import run_with_resource_lock
+from app.services.final_match_sync_service import FINAL_MATCH_TERMINAL_STATUSES
 from app.monitoring import FINALIZATION_TOTAL, observe_sync
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,7 @@ class FixtureSyncService:
         self.cache_service = cache_service or CacheService()
         self.match_repository = MatchRepository()
         self.final_lineup_finalization_repository = FinalLineupFinalizationRepository()
+        self.match_finalization_repository = MatchFinalizationRepository()
         self.league_repository = LeagueRepository()
         self.allowed_league_repository = AllowedLeagueRepository()
         self.standing_service = standing_service or StandingService(self.client, self.team_service, self.cache_service)
@@ -1219,8 +1222,23 @@ class FixtureSyncService:
             "updated": 0,
             "skipped": 0,
             "failed": 0,
+            "final_match_sync_candidates": [],
+            "active_match_updates": {},
         }
         logger.info("LIVE_SYNC_PROVIDER_FIXTURES_RECEIVED count=%s", len(fixtures))
+
+        provider_fixture_ids: set[int] = set()
+        for fixture_payload in fixtures:
+            fixture = fixture_payload.get("fixture") if isinstance(fixture_payload, dict) else None
+            raw_fixture_id = fixture.get("id") if isinstance(fixture, dict) else None
+            try:
+                if isinstance(raw_fixture_id, bool):
+                    continue
+                provider_fixture_id = int(raw_fixture_id)
+                if provider_fixture_id > 0:
+                    provider_fixture_ids.add(provider_fixture_id)
+            except (TypeError, ValueError):
+                continue
 
         for fixture_payload in fixtures:
             fixture = fixture_payload.get("fixture") if isinstance(fixture_payload, dict) else None
@@ -1256,6 +1274,7 @@ class FixtureSyncService:
                 )
                 continue
 
+            previous_status = str(getattr(existing_match, "status", "") or "").strip().upper()
             updated = await self.match_repository.update_live_state(
                 db,
                 existing_match.local_match_id,
@@ -1271,6 +1290,47 @@ class FixtureSyncService:
                 continue
 
             sync_result["updated"] += 1
+            sync_result["active_match_updates"][int(existing_match.local_match_id)] = live_state["status"]
+            if (
+                previous_status in NON_TERMINAL_STATUSES
+                and live_state["status"].upper() in FINAL_MATCH_TERMINAL_STATUSES
+            ):
+                finalization = await self.match_finalization_repository.ensure_pending(
+                    db, int(existing_match.local_match_id)
+                )
+                if finalization.state not in {"SUCCESS", "EXHAUSTED"}:
+                    sync_result["final_match_sync_candidates"].append(
+                        int(existing_match.local_match_id)
+                    )
+
+        for live_match in await self.match_repository.get_live_matches(db):
+            if str(getattr(live_match, "provider", "")).casefold() != "api-football":
+                continue
+            provider_fixture_id = getattr(live_match, "provider_fixture_id", None)
+            if (
+                isinstance(provider_fixture_id, bool)
+                or not isinstance(provider_fixture_id, int)
+                or provider_fixture_id <= 0
+                or provider_fixture_id in provider_fixture_ids
+            ):
+                continue
+
+            local_match_id = int(live_match.local_match_id)
+            finalization = await self.match_finalization_repository.ensure_pending(
+                db, local_match_id
+            )
+            if finalization.state not in {"SUCCESS", "EXHAUSTED"}:
+                sync_result["final_match_sync_candidates"].append(local_match_id)
+            logger.info(
+                "LIVE_SYNC_MISSING_MATCH_CANDIDATE local_match_id=%s provider_fixture_id=%s state=%s",
+                local_match_id,
+                provider_fixture_id,
+                finalization.state,
+            )
+
+        sync_result["final_match_sync_candidates"] = sorted(
+            set(sync_result["final_match_sync_candidates"])
+        )
 
         logger.info(
             "LIVE_SYNC_MATCH_STATE_PROCESSED provider_fixture_count=%s updated=%s skipped=%s failed=%s",

@@ -18,6 +18,12 @@ from app.models.league_identity_recovery import LeagueIdentityRecovery
 from app.monitoring import SCHEDULER_JOB_ERRORS, SCHEDULER_JOB_RUNS
 from app.repositories.lineup_refresh_state_repository import LineupRefreshStateRepository
 from app.repositories.league_identity_recovery_repository import LeagueIdentityRecoveryRepository
+from app.repositories.match_finalization_repository import (
+    FINALIZATION_MAX_ATTEMPTS,
+    FINALIZATION_RETRY_DELAYS,
+    FINALIZATION_RUNNING_STALE_AFTER,
+    MatchFinalizationRepository,
+)
 from app.services.active_match_service import active_match_service
 from app.services.analytics_projection_service import log_projection_transaction
 from app.services.cache_service import CacheService
@@ -51,6 +57,10 @@ DAILY_FIXTURE_SYNC_LOCK_KEY = 9342003
 REPAIR_DAILY_MATCHES_LOCK_KEY = 9342004
 STANDINGS_REFRESH_LOCK_KEY = 9342001
 _SCHEDULER_ADVISORY_LOCK_CONNECTIONS = "_scheduler_advisory_lock_connections"
+PRE_LIVE_WINDOW = timedelta(minutes=10)
+API_FOOTBALL_PROVIDER = "api-football"
+NS_STATUS = "NS"
+LIVE_SYNC_STOP_STATUSES = FINISHED_STATUSES | {"PST"}
 
 
 async def commit_odds_refresh(db, odds_sync_service: OddsSyncService, local_match_id: int, refresh_result: dict) -> dict:
@@ -155,6 +165,7 @@ class LiveUpdateScheduler:
         )
         self.is_running = False
         self.lineup_refresh_state_repository = LineupRefreshStateRepository()
+        self.match_finalization_repository = MatchFinalizationRepository()
         self.cache_service = CacheService()
         self.pending_odds_cache_invalidations: set[int] = set()
 
@@ -285,28 +296,262 @@ class LiveUpdateScheduler:
             self.scheduler.shutdown(wait=True)
             self.is_running = False
             logger.info("SCHEDULER_STOPPED")
+
+    async def _read_finalization_state(self, match_id: int) -> str | None:
+        async with async_session() as verification_db:
+            record = await self.match_finalization_repository.get_by_match_id(
+                verification_db, match_id
+            )
+            return record.state if record is not None else None
+
+    async def _invalidate_final_match_caches(self, match_id: int) -> None:
+        try:
+            invalidated = await self.cache_service.delete(make_cache_key("live_matches"))
+            if not invalidated:
+                logger.error("FINAL_MATCH_SYNC_CACHE_INVALIDATION_FAILED key=live_matches")
+        except Exception:
+            logger.exception("FINAL_MATCH_SYNC_CACHE_INVALIDATION_FAILED key=live_matches")
+        try:
+            await active_match_service.remove_match_active(match_id)
+        except Exception:
+            logger.exception(
+                "FINAL_MATCH_SYNC_ACTIVE_MATCH_INVALIDATION_FAILED match_id=%s",
+                match_id,
+            )
+
+    async def _finalize_match_sync_candidates(
+        self,
+        db,
+        match_ids: list[int],
+        *,
+        live_lock_held: bool = False,
+    ) -> dict[str, int]:
+        candidates = sorted({int(match_id) for match_id in (match_ids or [])})
+        metrics = {"attempted": 0, "succeeded": 0, "skipped": 0, "failed": 0}
+        if not candidates:
+            return metrics
+
+        if not live_lock_held:
+            if not await self._acquire_live_match_sync_lock(db):
+                logger.info("FINAL_MATCH_SYNC_SKIPPED reason=live_scheduler_lock_not_acquired")
+                metrics["skipped"] += len(candidates)
+                return metrics
+
+        try:
+            for match_id in candidates:
+                record = await self.match_finalization_repository.get_by_match_id(
+                    db, match_id, for_update=True
+                )
+                if record is None or record.state in {"SUCCESS", "EXHAUSTED"}:
+                    metrics["skipped"] += 1
+                    continue
+
+                now = datetime.now(timezone.utc)
+                if record.state == "RUNNING":
+                    last_attempted_at = record.last_attempted_at
+                    stale_before = now - FINALIZATION_RUNNING_STALE_AFTER
+                    if (
+                        last_attempted_at is not None
+                        and last_attempted_at > stale_before
+                    ):
+                        metrics["skipped"] += 1
+                        continue
+                    await self.match_finalization_repository.mark_failure(
+                        db,
+                        record,
+                        now=now,
+                        category="WORKER_RESTART_RECOVERY",
+                        message="Recovered an expired RUNNING finalization attempt.",
+                        retryable=True,
+                    )
+                    await db.commit()
+                    metrics["failed"] += 1
+                    continue
+
+                if record.state in {"PENDING", "FAILED"} and (
+                    record.next_retry_at is not None and record.next_retry_at > now
+                ):
+                    metrics["skipped"] += 1
+                    continue
+                if record.state not in {"PENDING", "FAILED"}:
+                    metrics["skipped"] += 1
+                    continue
+
+                await self.match_finalization_repository.mark_running(db, record, now)
+                try:
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+                    persisted_state = await self._read_finalization_state(match_id)
+                    if persisted_state != "RUNNING":
+                        logger.exception(
+                            "FINAL_MATCH_SYNC_ATTEMPT_CLAIM_FAILED match_id=%s",
+                            match_id,
+                        )
+                        metrics["failed"] += 1
+                        continue
+
+                metrics["attempted"] += 1
+
+                async def sync_final_state() -> dict:
+                    outcome = await football_service.sync_final_match_state(db, match_id)
+                    if outcome.get("state") == "SUCCESS":
+                        try:
+                            await db.commit()
+                        except Exception:
+                            await db.rollback()
+                            persisted_state = await self._read_finalization_state(match_id)
+                            if persisted_state == "SUCCESS":
+                                outcome["commit_confirmed_by_reread"] = True
+                            else:
+                                logger.exception(
+                                    "FINAL_MATCH_SYNC_COMMIT_UNKNOWN match_id=%s",
+                                    match_id,
+                                )
+                                outcome["state"] = "RUNNING"
+                                return outcome
+                        return outcome
+
+                    current = await self.match_finalization_repository.get_by_match_id(
+                        db, match_id, for_update=True
+                    )
+                    if current is not None and current.state == "RUNNING":
+                        if outcome.get("state") == "WAITING":
+                            await self.match_finalization_repository.mark_waiting(
+                                db,
+                                current,
+                                now=datetime.now(timezone.utc),
+                            )
+                            waiting_state = current.state
+                            next_retry_at = current.next_retry_at
+                            try:
+                                await db.commit()
+                            except Exception:
+                                await db.rollback()
+                                persisted_state = await self._read_finalization_state(
+                                    match_id
+                                )
+                                if persisted_state != waiting_state:
+                                    logger.exception(
+                                        "FINAL_MATCH_SYNC_WAIT_COMMIT_UNKNOWN match_id=%s",
+                                        match_id,
+                                    )
+                                    return {
+                                        **outcome,
+                                        "state": "RUNNING",
+                                    }
+                                outcome["commit_confirmed_by_reread"] = True
+                            if waiting_state == "EXHAUSTED":
+                                return {
+                                    **outcome,
+                                    "state": "EXHAUSTED",
+                                    "category": "NON_TERMINAL_ATTEMPTS_EXHAUSTED",
+                                }
+                            return {
+                                **outcome,
+                                "state": "WAITING",
+                                "next_retry_at": next_retry_at,
+                            }
+
+                        await self.match_finalization_repository.mark_failure(
+                            db,
+                            current,
+                            now=datetime.now(timezone.utc),
+                            category=outcome.get("category", "FINAL_MATCH_SYNC_FAILURE"),
+                            message=outcome.get("message", "Final Match verification failed."),
+                            retryable=bool(outcome.get("retryable")),
+                        )
+                        await db.commit()
+                    return outcome
+
+                try:
+                    resource_locked, outcome = await run_with_resource_lock(
+                        db,
+                        "live_sync",
+                        "global",
+                        sync_final_state,
+                    )
+                except Exception:
+                    await db.rollback()
+                    logger.exception("FINAL_MATCH_SYNC_ATTEMPT_FAILED match_id=%s", match_id)
+                    metrics["failed"] += 1
+                    continue
+
+                if not resource_locked:
+                    await db.rollback()
+                    current = await self.match_finalization_repository.get_by_match_id(
+                        db, match_id, for_update=True
+                    )
+                    if current is not None and current.state == "RUNNING":
+                        await self.match_finalization_repository.mark_failure(
+                            db,
+                            current,
+                            now=datetime.now(timezone.utc),
+                            category="LOCK_CONFLICT",
+                            message="LIVE_SYNC resource lock was unavailable.",
+                            retryable=True,
+                        )
+                        await db.commit()
+                    metrics["skipped"] += 1
+                    continue
+
+                if isinstance(outcome, dict) and outcome.get("state") == "SUCCESS":
+                    metrics["succeeded"] += 1
+                    await self._invalidate_final_match_caches(match_id)
+                elif isinstance(outcome, dict) and outcome.get("state") == "EXHAUSTED":
+                    metrics["failed"] += 1
+                elif isinstance(outcome, dict) and outcome.get("state") == "FAILED":
+                    metrics["failed"] += 1
+                else:
+                    metrics["skipped"] += 1
+        finally:
+            if not live_lock_held:
+                await self._release_live_match_sync_lock(db)
+
+        return metrics
             
     async def _should_sync_live_matches(self, db) -> bool:
         now = datetime.now(timezone.utc)
-        past_threshold = now - timedelta(hours=24)
-        discovery_horizon_end = now + timedelta(hours=24)
+        post_kickoff_window = timedelta(
+            minutes=settings.get_post_kickoff_max_window_minutes()
+        )
 
         candidate_result = await db.execute(
-            select(func.count())
-            .select_from(Match)
-            .where(Match.match_time >= past_threshold)
-            .where(Match.match_time <= discovery_horizon_end)
+            select(Match.status, Match.match_time)
+            .where(Match.provider == API_FOOTBALL_PROVIDER)
         )
-        candidate_match_count = candidate_result.scalar_one()
+        candidates = candidate_result.all()
 
-        should_sync = candidate_match_count > 0
+        eligible_matches = 0
+        for status, match_time in candidates:
+            normalized_status = str(status or "").strip().upper()
+            if normalized_status in LIVE_STATUSES:
+                eligible_matches += 1
+                continue
+            if normalized_status in LIVE_SYNC_STOP_STATUSES or normalized_status != NS_STATUS:
+                continue
 
+            if match_time.tzinfo is None or match_time.utcoffset() is None:
+                raise ValueError(
+                    "LIVE_SYNC Gate requires timezone-aware Match.match_time values."
+                )
+            kickoff_utc = match_time.astimezone(timezone.utc)
+            if (
+                now >= kickoff_utc - PRE_LIVE_WINDOW
+                and now < kickoff_utc + post_kickoff_window
+            ):
+                eligible_matches += 1
+
+        should_sync = eligible_matches > 0
         logger.debug(
-            "Live sync gate evaluated",
+            "LIVE_SYNC_RUN_DECISION_GATE",
             extra={
-                "candidate_match_count": candidate_match_count,
-                "discovery_horizon_start": past_threshold.isoformat(),
-                "discovery_horizon_end": discovery_horizon_end.isoformat(),
+                "provider": API_FOOTBALL_PROVIDER,
+                "candidate_match_count": len(candidates),
+                "eligible_match_count": eligible_matches,
+                "now_utc": now.isoformat(),
+                "pre_live_window_minutes": PRE_LIVE_WINDOW.total_seconds() / 60,
+                "post_kickoff_max_window_minutes": post_kickoff_window.total_seconds() / 60,
                 "should_sync": should_sync,
             },
         )
@@ -322,6 +567,19 @@ class LiveUpdateScheduler:
                     return
 
                 try:
+                    due_finalizations = (
+                        await self.match_finalization_repository.get_due_match_ids(
+                            db, datetime.now(timezone.utc)
+                        )
+                        if hasattr(db, "info")
+                        else []
+                    )
+                    await self._finalize_match_sync_candidates(
+                        db,
+                        due_finalizations,
+                        live_lock_held=True,
+                    )
+
                     if not await self._should_sync_live_matches(db):
                         logger.debug("No near-start or active non-FT matches found; skipping live sync")
                         return
@@ -331,6 +589,15 @@ class LiveUpdateScheduler:
                             result = await football_service.sync_live_matches(db)
                             if result.get("success"):
                                 await db.commit()
+                                active_match_updates = result.get("active_match_updates") or {}
+                                if active_match_updates:
+                                    try:
+                                        await football_service.apply_active_match_updates(active_match_updates)
+                                    except Exception:
+                                        logger.exception(
+                                            "LIVE_SYNC_ACTIVE_MATCH_REGISTRATION_FAILED updates=%s",
+                                            active_match_updates,
+                                        )
                                 try:
                                     cache_invalidated = await self.cache_service.delete(
                                         make_cache_key("live_matches")
@@ -352,6 +619,11 @@ class LiveUpdateScheduler:
                     if not resource_locked:
                         logger.info("LIVE_SYNC_SKIPPED reason=resource_lock_not_acquired")
                         return
+                    await self._finalize_match_sync_candidates(
+                        db,
+                        result.get("final_match_sync_candidates", []),
+                        live_lock_held=True,
+                    )
                     SCHEDULER_JOB_RUNS.labels(job="sync_live_matches").inc()
                     if result.get("success"):
                         if result.get("updated", 0) > 0:

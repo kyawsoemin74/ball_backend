@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     REDIS_TTL_NEWS: int = 120
     LINEUP_REFRESH_COOLDOWN_SECONDS: int = 900
     ACTIVE_MATCH_TTL_SECONDS: int = 300
+    POST_KICKOFF_MAX_WINDOW_MINUTES: int = 60
     GOOGLE_CLIENT_ID: str
     SCHEDULER_ENABLED: bool = True
 
@@ -58,6 +59,15 @@ class Settings(BaseSettings):
         }
         if not self.JWT_SECRET_KEY or self.JWT_SECRET_KEY.lower() in weak_values or len(self.JWT_SECRET_KEY) < 32:
             raise ValueError("JWT_SECRET_KEY must be a strong production secret.")
+
+    def get_post_kickoff_max_window_minutes(self) -> int:
+        window = self.POST_KICKOFF_MAX_WINDOW_MINUTES
+        if window != 60:
+            raise ValueError(
+                "POST_KICKOFF_MAX_WINDOW_MINUTES must equal the approved "
+                "60-minute policy."
+            )
+        return window
 
 settings = Settings()
 settings.validate_production_secrets()

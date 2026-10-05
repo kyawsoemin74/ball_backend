@@ -39,6 +39,7 @@ from app.models import (
     MatchStatistics,
     LineupRefreshState,
     MatchLineupFinalization,
+    MatchFinalization,
     AllowedLeague,
     LeagueIdentityRecovery,
 )

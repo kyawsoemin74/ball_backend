@@ -17,6 +17,7 @@ from app.services.cache_service import CacheService
 from app.services.event_service import EventService
 from app.services.event_sync_service import EventSyncService
 from app.services.fixture_sync_service import FixtureSyncService
+from app.services.final_match_sync_service import FinalMatchSyncService
 from app.services.h2h_service import H2HService
 from app.services.h2h_sync_service import H2HSyncService
 from app.services.league_service import LeagueService
@@ -100,6 +101,13 @@ class FootballAPIService:
             fixture_provider=self.fixture_provider,
             league_service=self.league_service,
         )
+        self.final_match_sync_service = FinalMatchSyncService(
+            self.fixture_provider,
+            match_repository=getattr(self.fixture_sync_service, "match_repository", None),
+            finalization_repository=getattr(
+                self.fixture_sync_service, "match_finalization_repository", None
+            ),
+        )
         self.match_service = match_service or MatchService(
             self.client,
             self.team_service,
@@ -170,6 +178,9 @@ class FootballAPIService:
 
     async def sync_live_matches(self, db: AsyncSession) -> dict:
         return await self.fixture_sync_service.sync_live_matches(db)
+
+    async def sync_final_match_state(self, db: AsyncSession, match_id: int) -> dict:
+        return await self.final_match_sync_service.sync_final_match(db, match_id)
 
     async def apply_active_match_updates(self, updates: dict[int, str | None] | None) -> None:
         await self.fixture_sync_service.apply_active_match_updates(updates)

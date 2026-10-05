@@ -16,6 +16,7 @@ from app.models.match_event import MatchEvent
 from app.models.match_statistics import MatchStatistics
 from app.models.lineup_refresh_state import LineupRefreshState
 from app.models.match_lineup_finalization import MatchLineupFinalization
+from app.models.match_finalization import MatchFinalization
 from app.models.missing_lineup_identity import MissingLineupIdentity
 from app.models.analytics import (
 	AnalyticsH2HSnapshot,
