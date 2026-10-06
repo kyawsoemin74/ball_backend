@@ -1,6 +1,9 @@
+import hashlib
 import logging
 import secrets
 import string
+import uuid
+from datetime import datetime, timedelta, timezone
 
 import bcrypt
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,8 +11,9 @@ from fastapi import HTTPException, status
 from sqlalchemy import or_, select
 
 from app.core.config import settings
+from app.models.auth_session import AuthSession
 from app.models.user import AvatarSource, User
-from app.schemas.token import GoogleAuthResponse, GoogleAuthUser
+from app.schemas.token import GoogleAuthResponse, GoogleAuthUser, LogoutResponse
 from app.schemas.user import UserCreate
 from app.services.token import TokenService
 
@@ -160,15 +164,54 @@ class AuthService:
 
         return user
 
-    def create_token_pair(self, user: User) -> dict:
+    def create_sid(self) -> str:
+        return str(uuid.uuid4())
+
+    def hash_refresh_token(self, token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    async def create_auth_session(
+        self,
+        db: AsyncSession,
+        user: User,
+        sid: str | None = None,
+        refresh_token: str | None = None,
+    ) -> AuthSession:
+        session_sid = sid or self.create_sid()
+        session = AuthSession(
+            sid=session_sid,
+            user_id=user.id,
+            refresh_token_identity=self.hash_refresh_token(refresh_token) if refresh_token else None,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES),
+            revoked_at=None,
+        )
+        db.add(session)
+        await db.flush()
+        return session
+
+    async def get_session_by_sid(self, db: AsyncSession, sid: str) -> AuthSession | None:
+        result = await db.execute(select(AuthSession).where(AuthSession.sid == sid))
+        return result.scalar_one_or_none()
+
+    async def get_active_session(self, db: AsyncSession, sid: str) -> AuthSession | None:
+        session = await self.get_session_by_sid(db, sid)
+        if not session:
+            return None
+        if session.revoked_at is not None:
+            return None
+        if session.expires_at <= datetime.now(timezone.utc):
+            return None
+        return session
+
+    def create_token_pair(self, user: User, sid: str | None = None) -> dict:
         return {
-            "access_token": self.token_service.create_access_token(user.username, user.role),
-            "refresh_token": self.token_service.create_refresh_token(user.username, user.role),
+            "access_token": self.token_service.create_access_token(user.username, user.role, sid=sid),
+            "refresh_token": self.token_service.create_refresh_token(user.username, user.role, sid=sid),
             "token_type": "bearer",
         }
 
-    def create_google_auth_response(self, user: User) -> GoogleAuthResponse:
-        token_pair = self.create_token_pair(user)
+    def create_google_auth_response(self, user: User, sid: str | None = None) -> GoogleAuthResponse:
+        token_pair = self.create_token_pair(user, sid=sid)
 
         return GoogleAuthResponse(
             access_token=token_pair["access_token"],
@@ -182,6 +225,9 @@ class AuthService:
                 provider="google",
             ),
         )
+
+    def create_logout_response(self) -> LogoutResponse:
+        return LogoutResponse(status="success", message="Logged out")
 
 
 auth_service = AuthService()

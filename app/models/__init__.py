@@ -31,3 +31,4 @@ from app.models.allowed_league import AllowedLeague
 from app.models.league_identity_recovery import LeagueIdentityRecovery
 from app.models.news import News
 from app.models.user import User
+from app.models.auth_session import AuthSession

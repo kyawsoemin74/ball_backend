@@ -15,7 +15,14 @@ class TokenService:
         self.access_token_expire_minutes = settings.ACCESS_TOKEN_EXPIRE_MINUTES
         self.refresh_token_expire_minutes = settings.REFRESH_TOKEN_EXPIRE_MINUTES
 
-    def _create_token(self, subject: str, role: str, expires_delta: timedelta, token_type: str) -> str:
+    def _create_token(
+        self,
+        subject: str,
+        role: str,
+        expires_delta: timedelta,
+        token_type: str,
+        sid: str | None = None,
+    ) -> str:
         expire = datetime.utcnow() + expires_delta
         payload: Dict[str, Any] = {
             "sub": subject,
@@ -23,22 +30,26 @@ class TokenService:
             "type": token_type,
             "exp": expire,
         }
+        if sid is not None:
+            payload["sid"] = sid
         return jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
 
-    def create_access_token(self, subject: str, role: str) -> str:
+    def create_access_token(self, subject: str, role: str, sid: str | None = None) -> str:
         return self._create_token(
             subject=subject,
             role=role,
             expires_delta=timedelta(minutes=self.access_token_expire_minutes),
             token_type="access",
+            sid=sid,
         )
 
-    def create_refresh_token(self, subject: str, role: str) -> str:
+    def create_refresh_token(self, subject: str, role: str, sid: str | None = None) -> str:
         return self._create_token(
             subject=subject,
             role=role,
             expires_delta=timedelta(minutes=self.refresh_token_expire_minutes),
             token_type="refresh",
+            sid=sid,
         )
 
     def decode_token(self, token: str, expected_type: str = "access") -> Dict[str, Any]:

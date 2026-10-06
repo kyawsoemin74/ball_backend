@@ -1,6 +1,7 @@
 import enum
 
 from sqlalchemy import Boolean, Column, DateTime, Enum, Integer, String, UniqueConstraint, func, text
+from sqlalchemy.orm import relationship
 
 from app.db import Base
 
@@ -37,3 +38,5 @@ class User(Base):
     )
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now(), nullable=True)
+
+    auth_sessions = relationship("AuthSession", back_populates="user", cascade="all, delete-orphan")

@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from google.oauth2 import id_token
@@ -6,11 +8,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.security import get_current_user, oauth2_scheme
 from app.db import get_db
+from app.models.auth_session import AuthSession
 from app.models.user import User
 from app.schemas.auth import GoogleLoginRequest
 from app.schemas.user import UserCreate, UserRead
-from app.schemas.token import GoogleAuthResponse, Token
+from app.schemas.token import GoogleAuthResponse, LogoutResponse, Token
 from app.services.auth import auth_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -34,13 +38,24 @@ async def login(
         username=form_data.username,
         password=form_data.password,
     )
-    return auth_service.create_token_pair(user)
+    session = await auth_service.create_auth_session(db=db, user=user)
+    token_pair = auth_service.create_token_pair(user, sid=session.sid)
+    session.refresh_token_identity = auth_service.hash_refresh_token(token_pair["refresh_token"])
+    await db.commit()
+    return token_pair
 
 
 @router.post("/refresh", response_model=Token)
 async def refresh_token(refresh_token: str, db: AsyncSession = Depends(get_db)):
     """Exchange a refresh token for a new access token."""
     payload = auth_service.token_service.decode_token(refresh_token, expected_type="refresh")
+    sid = payload.get("sid")
+    if not sid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate refresh token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     username = payload["sub"]
     result = await db.execute(select(User).where(User.username == username))
     user = result.scalar_one_or_none()
@@ -50,7 +65,57 @@ async def refresh_token(refresh_token: str, db: AsyncSession = Depends(get_db)):
             detail="Could not validate refresh token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return auth_service.create_token_pair(user)
+
+    session = await auth_service.get_session_by_sid(db, sid)
+    if not session or session.user_id != user.id or session.revoked_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate refresh token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if session.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate refresh token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if session.refresh_token_identity != auth_service.hash_refresh_token(refresh_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate refresh token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token_pair = auth_service.create_token_pair(user, sid=sid)
+    session.refresh_token_identity = auth_service.hash_refresh_token(token_pair["refresh_token"])
+    session.expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.REFRESH_TOKEN_EXPIRE_MINUTES)
+    await db.commit()
+    return token_pair
+
+
+@router.post("/logout", response_model=LogoutResponse)
+async def logout(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Revoke the current session without invalidating other sessions."""
+    payload = auth_service.token_service.decode_token(token, expected_type="access")
+    sid = payload.get("sid")
+    if not sid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    session = await auth_service.get_session_by_sid(db, sid)
+    if session and session.user_id == current_user.id:
+        if session.revoked_at is None:
+            session.revoked_at = datetime.now(timezone.utc)
+            await db.commit()
+    return auth_service.create_logout_response()
+
 
 @router.post("/google", response_model=GoogleAuthResponse)
 async def google_login(
@@ -89,4 +154,8 @@ async def google_login(
         username=name,
         picture=picture,
     )
-    return auth_service.create_google_auth_response(user)
+    session = await auth_service.create_auth_session(db=db, user=user)
+    token_pair = auth_service.create_token_pair(user, sid=session.sid)
+    session.refresh_token_identity = auth_service.hash_refresh_token(token_pair["refresh_token"])
+    await db.commit()
+    return auth_service.create_google_auth_response(user, sid=session.sid)

@@ -27,3 +27,9 @@ class TokenPayload(BaseModel):
     role: str
     exp: int
     type: str
+    sid: str | None = None
+
+
+class LogoutResponse(BaseModel):
+    status: str = "success"
+    message: str = "Logged out"
