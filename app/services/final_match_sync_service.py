@@ -6,6 +6,7 @@ import httpx
 
 from app.repositories.match_repository import MatchRepository
 from app.repositories.match_finalization_repository import MatchFinalizationRepository
+from app.services.resource_lock import run_with_resource_lock
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +32,14 @@ class FinalMatchSyncService:
         *,
         match_repository: MatchRepository | None = None,
         finalization_repository: MatchFinalizationRepository | None = None,
+        event_sync_service,
     ) -> None:
         self.fixture_provider = fixture_provider
         self.match_repository = match_repository or MatchRepository()
         self.finalization_repository = (
             finalization_repository or MatchFinalizationRepository()
         )
+        self.event_sync_service = event_sync_service
 
     async def sync_final_match(self, db, match_id: int) -> dict:
         record = await self.finalization_repository.get_by_match_id(
@@ -184,6 +187,52 @@ class FinalMatchSyncService:
                 "category": "MATCH_NOT_FOUND",
                 "message": "Canonical Match disappeared before final state persistence.",
                 "retryable": False,
+            }
+
+        try:
+            event_locked, event_result = await run_with_resource_lock(
+                db,
+                "events",
+                int(match_id),
+                lambda: self.event_sync_service.sync_match_events(db, int(match_id)),
+            )
+        except Exception as exc:
+            logger.exception(
+                "FINAL_EVENT_SYNC_FAILED match_id=%s status=%s",
+                match_id,
+                final_state.status,
+            )
+            return {
+                "state": "FAILED",
+                "category": "FINAL_EVENT_SYNC_FAILURE",
+                "message": str(exc),
+                "retryable": True,
+            }
+
+        if not event_locked:
+            return {
+                "state": "FAILED",
+                "category": "FINAL_EVENT_SYNC_LOCK_CONFLICT",
+                "message": "Event resource lock was not acquired.",
+                "retryable": True,
+            }
+        if not isinstance(event_result, dict) or not event_result.get("success"):
+            reason = (
+                event_result.get("message", "Event sync failed.")
+                if isinstance(event_result, dict)
+                else "Event sync returned an invalid result."
+            )
+            logger.warning(
+                "FINAL_EVENT_SYNC_FAILED match_id=%s status=%s reason=%s",
+                match_id,
+                final_state.status,
+                reason,
+            )
+            return {
+                "state": "FAILED",
+                "category": "FINAL_EVENT_SYNC_FAILURE",
+                "message": reason,
+                "retryable": True,
             }
 
         await self.finalization_repository.mark_success(

@@ -39,7 +39,6 @@ FINISHED_STATUSES = {"FT", "AET", "PEN", "CANC", "ABD", "AWD", "WO"}
 LIVE_STATUSES = {"1H", "2H", "HT", "ET", "LIVE", "BT", "P"}
 ACTIVE_MATCH_REGISTER_STATUSES = {"1H", "2H", "HT", "ET", "BT", "P", "LIVE"}
 ACTIVE_MATCH_TERMINAL_STATUSES = FINISHED_STATUSES | {"PST"}
-FINALIZATION_TERMINAL_STATUSES = ACTIVE_MATCH_TERMINAL_STATUSES
 FINAL_LINEUP_TERMINAL_STATUSES = {"FT", "AET", "PEN"}
 NON_TERMINAL_STATUSES = {"NS", "TBD", "1H", "2H", "HT", "ET", "LIVE", "BT", "P"}
 
@@ -152,49 +151,7 @@ class FixtureSyncService:
         for match_id, status in (updates or {}).items():
             await self._sync_active_match_registration(int(match_id), status)
 
-    async def _finalize_terminal_match_events(self, db: AsyncSession, match_id: int, status: str | None) -> bool:
-        normalized_status = str(status or "").upper()
-        if normalized_status not in FINALIZATION_TERMINAL_STATUSES:
-            return False
 
-        match_row = await db.execute(select(Match).where(Match.match_id == match_id))
-        if match_row is None or not hasattr(match_row, "scalar_one_or_none"):
-            return True
-
-        current_match = match_row.scalar_one_or_none()
-        if current_match is None:
-            return True
-
-        current_state = str(getattr(current_match, "status", "") or "").upper()
-        if current_state in {"FINALIZED"}:
-            logger.info("FINAL_EVENT_SYNC_SKIPPED match_id=%s reason=already_finalized", match_id)
-            return False
-
-        try:
-            from app.services.football import football_service
-
-            resource_locked, result = await run_with_resource_lock(
-                db,
-                "events",
-                match_id,
-                lambda: football_service.sync_match_events(db, match_id),
-            )
-            if not resource_locked:
-                logger.info("FINAL_EVENT_SYNC_SKIPPED match_id=%s reason=resource_lock_not_acquired", match_id)
-                return False
-            if not result.get("success"):
-                logger.warning(
-                    "FINAL_EVENT_SYNC_FAILED match_id=%s status=%s reason=%s",
-                    match_id,
-                    normalized_status,
-                    result.get("message", "event_sync_failed"),
-                )
-                return False
-
-            return True
-        except Exception as exc:
-            logger.warning("FINAL_EVENT_SYNC_FAILED match_id=%s status=%s error=%s", match_id, normalized_status, exc)
-            return False
 
     async def _prewarm_missing_standings(self, db: AsyncSession, candidates: set[tuple[int, int]]) -> dict[str, int]:
         total_pairs = len(candidates)
@@ -449,18 +406,6 @@ class FixtureSyncService:
 
         from app.services.football import football_service
 
-        event_locked, event_result = await run_with_resource_lock(
-            db,
-            "events",
-            local_match_id,
-            lambda: football_service.sync_match_events(db, local_match_id),
-        )
-        if not event_locked:
-            raise RuntimeError("FINAL_EVENT_SYNC_FAILED: event resource lock not acquired")
-        if not event_result or not event_result.get("success"):
-            reason = event_result.get("message", "event_sync_failed") if event_result else "event_sync_failed"
-            raise RuntimeError(f"FINAL_EVENT_SYNC_FAILED: {reason}")
-
         try:
             statistics_locked, statistics_result = await run_with_resource_lock(
                 db,
@@ -567,14 +512,14 @@ class FixtureSyncService:
             "standings_prewarm_candidates": 0,
             "final_lineup_candidates": [],
             "active_match_updates": {},
-            "final_event_sync_matches": [],
             "final_statistics_sync_matches": [],
+            "final_match_sync_candidates": [],
         }
         prewarm_candidates: set[tuple[int, int]] = set()
         for fixture_raw, master_league_id in filtered_fixtures:
             fixture_id = fixture_raw.get("fixture", {}).get("id")
             fixture_savepoint = None
-            final_event_sync_succeeded = False
+            final_transition_sync_succeeded = False
             try:
                 match = self.parse_fixture_to_match(fixture_raw, league_id=master_league_id)
                 if match is None:
@@ -747,6 +692,16 @@ class FixtureSyncService:
                 await db.flush()
 
                 normalized_status = str(match.status or "").upper()
+                if (
+                    previous_status in LIVE_STATUSES
+                    and normalized_status in FINAL_MATCH_TERMINAL_STATUSES
+                ):
+                    finalization = await self.match_finalization_repository.ensure_pending(
+                        db,
+                        local_match_id,
+                    )
+                    if finalization.state not in {"SUCCESS", "EXHAUSTED"}:
+                        result["final_match_sync_candidates"].append(local_match_id)
 
                 terminal_transition_enabled = (
                     getattr(self, "_allow_terminal_transition", False)
@@ -754,7 +709,7 @@ class FixtureSyncService:
                     else allow_terminal_transition
                 )
                 if terminal_transition_enabled:
-                    final_event_sync_succeeded = await self.handle_terminal_transition(
+                    final_transition_sync_succeeded = await self.handle_terminal_transition(
                         db,
                         local_match_id,
                         match.provider_fixture_id,
@@ -771,8 +726,7 @@ class FixtureSyncService:
                 result["inserted"] += inserted
                 result["updated"] += updated
                 await self._release_fixture_savepoint(fixture_savepoint)
-                if final_event_sync_succeeded:
-                    result["final_event_sync_matches"].append(local_match_id)
+                if final_transition_sync_succeeded:
                     result["final_statistics_sync_matches"].append(local_match_id)
             except SQLAlchemyError as exc:
                 await self._rollback_fixture_savepoint(fixture_savepoint, exc)
@@ -787,6 +741,9 @@ class FixtureSyncService:
                 continue
 
         result["standings_prewarm_candidates"] = len(prewarm_candidates)
+        result["final_match_sync_candidates"] = sorted(
+            set(result["final_match_sync_candidates"])
+        )
         try:
             retry_candidates = await self.final_lineup_finalization_repository.get_retry_candidates(db, 100)
             result["final_lineup_candidates"].extend(record.match_id for record in retry_candidates)
@@ -1292,7 +1249,7 @@ class FixtureSyncService:
             sync_result["updated"] += 1
             sync_result["active_match_updates"][int(existing_match.local_match_id)] = live_state["status"]
             if (
-                previous_status in NON_TERMINAL_STATUSES
+                previous_status in LIVE_STATUSES
                 and live_state["status"].upper() in FINAL_MATCH_TERMINAL_STATUSES
             ):
                 finalization = await self.match_finalization_repository.ensure_pending(

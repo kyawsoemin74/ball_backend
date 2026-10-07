@@ -40,8 +40,6 @@ from app.services.season_identity import normalize_season
 logger = logging.getLogger(__name__)
 
 EVENT_REFRESH_ALLOWED_STATUSES = {"1H", "HT", "2H", "LIVE"}
-EVENT_REFRESH_BLOCKED_STATUSES = {"NS", "FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"}
-EVENT_FINALIZATION_RECOVERY_STATUSES = {"FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"}
 EVENT_REFRESH_INTERVAL_SECONDS = 300
 STATISTICS_REFRESH_ALLOWED_STATUSES = {"1H", "HT", "2H", "LIVE"}
 STATISTICS_REFRESH_BLOCKED_STATUSES = {"NS", "FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"}
@@ -305,12 +303,24 @@ class LiveUpdateScheduler:
             return record.state if record is not None else None
 
     async def _invalidate_final_match_caches(self, match_id: int) -> None:
-        try:
-            invalidated = await self.cache_service.delete(make_cache_key("live_matches"))
-            if not invalidated:
-                logger.error("FINAL_MATCH_SYNC_CACHE_INVALIDATION_FAILED key=live_matches")
-        except Exception:
-            logger.exception("FINAL_MATCH_SYNC_CACHE_INVALIDATION_FAILED key=live_matches")
+        for cache_key in (
+            make_cache_key("live_matches"),
+            make_cache_key("match", match_id, "events"),
+        ):
+            try:
+                invalidated = await self.cache_service.delete(cache_key)
+                if not invalidated:
+                    logger.error(
+                        "FINAL_MATCH_SYNC_CACHE_INVALIDATION_FAILED match_id=%s key=%s",
+                        match_id,
+                        cache_key,
+                    )
+            except Exception:
+                logger.exception(
+                    "FINAL_MATCH_SYNC_CACHE_INVALIDATION_FAILED match_id=%s key=%s",
+                    match_id,
+                    cache_key,
+                )
         try:
             await active_match_service.remove_match_active(match_id)
         except Exception:
@@ -1293,11 +1303,7 @@ class LiveUpdateScheduler:
                     status = await self._get_match_status_for_event_refresh(db, match_id)
                     status_upper = str(status or "").upper() if status is not None else None
 
-                    if not status_upper or (
-                        status_upper in EVENT_REFRESH_BLOCKED_STATUSES
-                        and status_upper not in EVENT_FINALIZATION_RECOVERY_STATUSES
-                        and status_upper not in EVENT_REFRESH_ALLOWED_STATUSES
-                    ):
+                    if status_upper not in EVENT_REFRESH_ALLOWED_STATUSES:
                         metrics["skipped_matches"] += 1
                         logger.info(
                             "EVENT_REFRESH_SKIPPED match_id=%s reason=status_blocked status=%s",
@@ -1309,7 +1315,7 @@ class LiveUpdateScheduler:
                     metrics["processed_matches"] += 1
 
                     try:
-                        should_refresh = status_upper in EVENT_FINALIZATION_RECOVERY_STATUSES or await self._should_refresh_match_events(db, match_id)
+                        should_refresh = await self._should_refresh_match_events(db, match_id)
                         if not should_refresh:
                             metrics["skipped_matches"] += 1
                             logger.info(

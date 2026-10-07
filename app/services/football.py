@@ -101,13 +101,6 @@ class FootballAPIService:
             fixture_provider=self.fixture_provider,
             league_service=self.league_service,
         )
-        self.final_match_sync_service = FinalMatchSyncService(
-            self.fixture_provider,
-            match_repository=getattr(self.fixture_sync_service, "match_repository", None),
-            finalization_repository=getattr(
-                self.fixture_sync_service, "match_finalization_repository", None
-            ),
-        )
         self.match_service = match_service or MatchService(
             self.client,
             self.team_service,
@@ -143,6 +136,14 @@ class FootballAPIService:
             self.cache_service,
             event_provider=self.event_provider,
             event_sync_service=self.event_sync_service,
+        )
+        self.final_match_sync_service = FinalMatchSyncService(
+            self.fixture_provider,
+            match_repository=getattr(self.fixture_sync_service, "match_repository", None),
+            finalization_repository=getattr(
+                self.fixture_sync_service, "match_finalization_repository", None
+            ),
+            event_sync_service=self.event_service,
         )
         self.statistics_sync_service = StatisticsSyncService(statistics_provider=self.statistics_provider)
         self.statistics_service = StatisticsService(

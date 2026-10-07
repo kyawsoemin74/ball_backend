@@ -3,8 +3,8 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, status, Path, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List, Optional, Dict, Any
-from datetime import date
+from typing import List, Optional, Dict, Any, Literal
+from datetime import date, datetime, timezone
 
 from app.api.deps import current_active_admin
 from app.cache import cache_get_json, cache_set_json, make_cache_key
@@ -472,26 +472,63 @@ async def sync_match_lineup_route(
 @router.post("/sync/{match_id}/events", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
 async def sync_match_events(
     match_id: int = Path(..., gt=0),
+    operation: Literal["HISTORICAL_BACKFILL"] = Query(...),
     db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
     """
-    Finalized ဖြစ်သွားသော ပွဲစဉ်အတွက် Events များကို API မှ ဆွဲယူပြီး Database တွင် သိမ်းဆည်းရန်။
+    Backfill the first Event snapshot for a finished historical Match.
+
+    Existing Event snapshots are never replaced by this workflow. Historical
+    repair is intentionally unsupported.
     """
     async def sync() -> Dict[str, Any]:
+        match_result = await db.execute(
+            select(Match).where(Match.local_match_id == match_id)
+        )
+        match = match_result.scalar_one_or_none()
+        if match is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Match not found")
+        if str(match.status or "").strip().upper() not in {"FT", "AET", "PEN"}:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Historical Event backfill requires a finished Match (FT, AET, or PEN).",
+            )
+        if match.match_time.tzinfo is None or match.match_time.utcoffset() is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Historical Event backfill requires a timezone-aware Match time.",
+            )
+        if match.match_time.astimezone(timezone.utc) >= datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Historical Event backfill is only available after the scheduled Match time.",
+            )
+        existing_events = await football_service.event_service.event_repository.get_by_match_id(
+            db,
+            match_id,
+        )
+        if existing_events:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Historical Event repair is not supported by this endpoint; Event rows already exist.",
+            )
+
         try:
             result = await football_service.sync_match_events(db=db, match_id=match_id)
             if not result.get("success"):
                 await db.rollback()
-                return result
+                return {**result, "operation": operation}
             await db.commit()
         except Exception:
             await db.rollback()
             raise
         try:
-            await CacheService().delete(make_cache_key("match", match_id, "events"))
+            invalidated = await CacheService().delete(make_cache_key("match", match_id, "events"))
+            if not invalidated:
+                logger.error("HISTORICAL_EVENT_BACKFILL_CACHE_INVALIDATION_FAILED match_id=%s", match_id)
         except Exception:
-            pass
-        return result
+            logger.exception("HISTORICAL_EVENT_BACKFILL_CACHE_INVALIDATION_FAILED match_id=%s", match_id)
+        return {**result, "operation": operation}
 
     locked, result = await run_with_resource_lock(db, "events", match_id, sync)
     if not locked:

@@ -1,11 +1,14 @@
 import logging
 from typing import Any, Dict
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.match import Match
 from app.providers.event_provider import EventProvider
 from app.repositories.event_repository import EventRepository
 from app.repositories.player_repository import PlayerRepository
+from app.repositories.team_repository import TeamRepository
 from app.services.player_identity_resolution_service import PlayerIdentityResolutionService
 from app.services.player_sync_service import PlayerSyncService
 from app.monitoring import observe_sync
@@ -23,10 +26,12 @@ class EventSyncService:
         player_repository: PlayerRepository | None = None,
         player_sync_service: PlayerSyncService | None = None,
         player_identity_resolution_service: PlayerIdentityResolutionService | None = None,
+        team_repository: TeamRepository | None = None,
     ) -> None:
         self.event_provider = event_provider
         self.event_repository = event_repository or EventRepository()
         self.player_repository = player_repository or PlayerRepository()
+        self.team_repository = team_repository or TeamRepository()
         self.player_identity_resolution_service = player_identity_resolution_service or PlayerIdentityResolutionService(
             player_repository=self.player_repository,
         )
@@ -146,6 +151,20 @@ class EventSyncService:
 
         return events, None
 
+    async def _get_match_team_ids(
+        self,
+        db: AsyncSession,
+        match_id: int,
+    ) -> tuple[int | None, int | None] | None:
+        result = await db.execute(
+            select(Match).where(Match.local_match_id == match_id)
+        )
+        match = result.scalar_one_or_none()
+        if match is None:
+            return None
+
+        return match.home_team_id, match.away_team_id
+
     @observe_sync("events")
     async def refresh_match_events(
         self,
@@ -165,12 +184,53 @@ class EventSyncService:
             )
             return {"success": False, "message": validation_error}
 
+        match_team_ids = await self._get_match_team_ids(db, match_id)
+        if match_team_ids is None:
+            logger.warning(
+                "EVENT_SYNC_FAILED",
+                extra={"match_id": match_id, "reason": "match_not_found"},
+            )
+            return {"success": False, "message": "Match not found"}
+
+        home_team_id, away_team_id = match_team_ids
         resolved_events: list[dict] = []
         for event in api_events or []:
+            provider_team_id = event["team"]["id"]
+            team = await self.team_repository.find_by_provider_identity(
+                db,
+                "api-football",
+                provider_team_id,
+            )
+            if team is None:
+                logger.warning(
+                    "TEAM_IDENTITY_MISSING",
+                    extra={"match_id": match_id, "provider_team_id": provider_team_id},
+                )
+                return {"success": False, "message": "TEAM_IDENTITY_MISSING"}
+
+            canonical_team_id = int(team.team_id)
+            if canonical_team_id not in (home_team_id, away_team_id):
+                logger.warning(
+                    "EVENT_TEAM_IDENTITY_MISMATCH",
+                    extra={
+                        "match_id": match_id,
+                        "provider_team_id": provider_team_id,
+                        "canonical_team_id": canonical_team_id,
+                        "home_team_id": home_team_id,
+                        "away_team_id": away_team_id,
+                    },
+                )
+                return {"success": False, "message": "EVENT_TEAM_IDENTITY_MISMATCH"}
+
             resolved_player_id, provider_player_id, resolved_assist_id, provider_assist_id = (
                 await self._resolve_event_identities(db, event)
             )
             normalized_event = dict(event)
+            normalized_event["team"] = {
+                **event["team"],
+                "id": canonical_team_id,
+            }
+            normalized_event["canonical_team_id"] = canonical_team_id
             normalized_event["resolved_player_id"] = resolved_player_id
             normalized_event["player_id"] = resolved_player_id
             normalized_event["provider_player_id"] = provider_player_id

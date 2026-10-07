@@ -18,6 +18,15 @@ class EventRepository:
         await db.execute(delete(MatchEvent).where(MatchEvent.match_id == match_id))
 
     async def replace_match_events(self, db: AsyncSession, match_id: int, events: list[dict]) -> None:
+        for event in events:
+            canonical_team_id = event.get("canonical_team_id")
+            if (
+                isinstance(canonical_team_id, bool)
+                or not isinstance(canonical_team_id, int)
+                or canonical_team_id <= 0
+            ):
+                raise ValueError("Event persistence requires a canonical team ID")
+
         await self.delete_by_match_id(db, match_id)
         for event in events:
             resolved_player_id = event.get("resolved_player_id")
@@ -26,7 +35,7 @@ class EventRepository:
                 match_id=match_id,
                 time_elapsed=event.get("time", {}).get("elapsed"),
                 time_extra=event.get("time", {}).get("extra"),
-                team_id=event.get("team", {}).get("id"),
+                team_id=event["canonical_team_id"],
                 team_name=event.get("team", {}).get("name"),
                 player_id=resolved_player_id,
                 provider_player_id=event.get("provider_player_id") or (
