@@ -3,6 +3,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.odds import Odds
+from app.services.odds_value import format_canonical_odd
 
 
 class OddsRepository:
@@ -38,7 +39,11 @@ class OddsRepository:
         if not rows:
             return
 
-        insert_stmt = pg_insert(Odds).values(rows)
+        canonical_rows = [
+            {**row, "odd_value": format_canonical_odd(row["odd_value"])}
+            for row in rows
+        ]
+        insert_stmt = pg_insert(Odds).values(canonical_rows)
         upsert_stmt = insert_stmt.on_conflict_do_update(
             constraint="uq_odds_fixture_bookmaker_market_selection",
             set_={
@@ -51,23 +56,42 @@ class OddsRepository:
 
     async def replace_fixture_odds(self, db: AsyncSession, fixture_id: int, rows: list[dict]) -> None:
         if not rows:
-            await self.delete_fixture_odds(db, fixture_id)
-            return
+            raise ValueError("Refusing to replace an Odds snapshot with an empty candidate")
 
         await self.delete_fixture_odds(db, fixture_id)
         await self.upsert_many(db, rows)
 
     async def snapshot_matches_rows(self, db: AsyncSession, fixture_id: int, rows: list[dict]) -> bool:
-        """Verify a committed snapshot using the canonical Odds natural key."""
-        expected_keys = {
-            (row["bookmaker_name"], row["market_name"], row["selection"])
-            for row in rows
-        }
-        if not expected_keys:
+        """Compare complete persisted Odds content with the expected snapshot."""
+        if not rows:
             return False
         result = await db.execute(select(Odds).where(Odds.fixture_id == fixture_id))
-        actual_keys = {
-            (row.bookmaker_name, row.market_name, row.selection)
-            for row in result.scalars().all()
-        }
-        return actual_keys == expected_keys
+        actual_rows = result.scalars().all()
+
+        def row_key(row: dict | Odds) -> tuple:
+            get = row.get if isinstance(row, dict) else lambda key: getattr(row, key)
+            return (
+                get("fixture_id"),
+                get("bookmaker_name"),
+                get("market_name"),
+                get("selection"),
+            )
+
+        def odd_value(value) -> str | None:
+            try:
+                return format_canonical_odd(value)
+            except ValueError:
+                return None
+
+        def row_content(row: dict | Odds) -> tuple:
+            get = row.get if isinstance(row, dict) else lambda key: getattr(row, key)
+            return (
+                row_key(row),
+                odd_value(get("odd_value")),
+                get("myanmar_odd"),
+                get("last_updated"),
+            )
+
+        expected = {row_content(row) for row in rows}
+        actual = {row_content(row) for row in actual_rows}
+        return len(actual_rows) == len(rows) and actual == expected

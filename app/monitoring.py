@@ -247,11 +247,19 @@ def observe_sync(operation: str):
             failure_category = "exception"
             try:
                 result = await function(*args, **kwargs)
-                if isinstance(result, dict) and (result.get("success") is False or result.get("error")):
-                    failure_category = str(result.get("failure_category") or result.get("reason") or "provider_failure")[:64]
-                else:
+                if isinstance(result, dict) and result.get("status") == "SUCCESS":
                     status = "success"
                     failure_category = "none"
+                elif isinstance(result, dict) and result.get("status") == "CANDIDATE_READY":
+                    status = "pending"
+                    failure_category = "outer_commit_pending"
+                elif isinstance(result, dict):
+                    failure_category = str(
+                        result.get("failure_category")
+                        or result.get("reason")
+                        or result.get("status")
+                        or "provider_failure"
+                    )[:64]
                 return result
             except Exception as exc:
                 failure_category = exc.__class__.__name__
@@ -259,13 +267,11 @@ def observe_sync(operation: str):
             finally:
                 SYNC_TOTAL.labels(operation, status, failure_category).inc()
                 SYNC_DURATION.labels(operation).observe(time.perf_counter() - started)
-                if status == "failure" and failure_category in {"PROVIDER_FAILURE", "INVALID_RESPONSE", "SYNC_UNAVAILABLE", "provider_failure", "no_data"}:
-                    SYNC_RETRIES.labels(operation).inc()
                 logger.log(
-                    logging.INFO if status == "success" else logging.WARNING,
-                    "sync_completed" if status == "success" else "sync_failed",
+                    logging.INFO if status in {"success", "pending"} else logging.WARNING,
+                    "sync_completed" if status == "success" else "sync_pending_commit" if status == "pending" else "sync_failed",
                     extra={
-                        "event": "sync_completed" if status == "success" else "sync_failed",
+                        "event": "sync_completed" if status == "success" else "sync_pending_commit" if status == "pending" else "sync_failed",
                         "component": operation,
                         "status": status,
                         "failure_category": failure_category,

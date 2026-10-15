@@ -11,5 +11,9 @@ class OddsProvider:
 
     async def get_match_odds(self, match_id: int) -> Optional[dict]:
         if hasattr(self.client, "get_with_metadata"):
-            return await self.client.get_with_metadata("/odds", params={"fixture": match_id})
+            return await self.client.get_with_metadata(
+                "/odds",
+                params={"fixture": match_id},
+                retries=0,
+            )
         return await self.client.get("/odds", params={"fixture": match_id})

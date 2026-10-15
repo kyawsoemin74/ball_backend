@@ -3,7 +3,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import JSONResponse
@@ -27,6 +27,7 @@ from app.admin import setup_admin
 from app.monitoring import MonitoringMiddleware, metrics_router, refresh_dependency_health
 from app.services.notification import notification_worker
 from app.services.socket_service import broker as redis_broker
+from app.services.resource_lock import ResourceLockAcquisitionError
 
 log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
 log_level = getattr(logging, log_level_name, logging.INFO)
@@ -60,6 +61,18 @@ app = FastAPI(
     redoc_url="/redoc" if settings.ENABLE_API_DOCS else None,
     openapi_url="/api/openapi.json" if settings.ENABLE_API_DOCS else None
 )
+
+
+@app.exception_handler(ResourceLockAcquisitionError)
+async def resource_lock_acquisition_error_handler(
+    _request: Request,
+    _exc: ResourceLockAcquisitionError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Resource lock unavailable"},
+    )
+
 
 # CORS middleware
 app.add_middleware(

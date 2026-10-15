@@ -11,6 +11,12 @@ _RESOURCE_PREFIX = "fover:sync"
 _ADVISORY_LOCK_SQL = "SELECT pg_try_advisory_xact_lock(hashtextextended(:lock_identity, 0))"
 
 
+class ResourceLockAcquisitionError(RuntimeError):
+    def __init__(self, lock_key: str) -> None:
+        super().__init__("Resource lock acquisition failed")
+        self.lock_key = lock_key
+
+
 @dataclass(frozen=True)
 class ResourceLockHandle:
     db: object
@@ -37,30 +43,34 @@ async def acquire_resource_lock(
     resource_type: str,
     resource_identity: object,
 ) -> ResourceLockHandle | None:
-    """Acquire a non-blocking PostgreSQL advisory lock or return None."""
+    """Acquire a transaction-scoped advisory lock; return None only on contention."""
     lock_key = build_resource_identity(resource_type, resource_identity)
-    if not hasattr(db, "execute"):
-        return ResourceLockHandle(db=None, lock_key=lock_key)
     try:
+        if not callable(getattr(db, "execute", None)):
+            raise TypeError("database session does not provide execute()")
         logger.info("RESOURCE_LOCK_ACQUIRE_ATTEMPT lock_identity=%s", lock_key)
         result = await db.execute(
             text(_ADVISORY_LOCK_SQL),
             {"lock_identity": lock_key},
         )
-        if not bool(result.scalar_one()):
+        acquired = result.scalar_one()
+        if acquired is False:
             logger.info("RESOURCE_LOCK_CONFLICT lock_identity=%s", lock_key)
             return None
+        if acquired is not True:
+            raise TypeError("advisory lock query returned a non-boolean result")
         logger.info("RESOURCE_LOCK_ACQUIRED lock_identity=%s", lock_key)
         return ResourceLockHandle(db=db, lock_key=lock_key)
-    except Exception:
+    except Exception as exc:
         logger.exception("RESOURCE_LOCK_ACQUIRE_FAILED lock_identity=%s", lock_key)
-        return None
+        raise ResourceLockAcquisitionError(lock_key) from exc
 
 
 async def release_resource_lock(handle: ResourceLockHandle | None) -> None:
+    """Log callback-scope exit; the caller's transaction controls actual lock release."""
     if handle is None:
         return
-    logger.info("RESOURCE_LOCK_RELEASED lock_identity=%s", handle.lock_key)
+    logger.info("RESOURCE_LOCK_SCOPE_EXIT lock_identity=%s", handle.lock_key)
 
 
 async def run_with_resource_lock(

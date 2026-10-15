@@ -1,6 +1,7 @@
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status, Path, Query
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional, Dict, Any, Literal
@@ -9,7 +10,7 @@ from datetime import date, datetime, timezone
 from app.api.deps import current_active_admin
 from app.cache import cache_get_json, cache_set_json, make_cache_key
 from app.core.config import settings
-from app.db import get_db
+from app.db import async_session, get_db
 from app.models.league import League
 from app.models.match import Match
 from app.models.match_event import MatchEvent
@@ -24,7 +25,29 @@ from app.services.cache_service import CacheService
 from app.services.league_structure_resolver import LeagueStructureResolver
 from app.services.active_match_service import active_match_service
 from app.services.resource_lock import run_with_resource_lock
-from app.services.odds_sync_service import SUCCESS, OddsTransactionFailure
+from app.services.odds_sync_service import (
+    CACHE_INVALIDATION_FAILED,
+    CANDIDATE_READY,
+    COMMIT_CONFIRMED,
+    COMMIT_NOT_APPLIED,
+    COMMIT_UNKNOWN,
+    IDENTITY_REJECTED,
+    IDENTITY_UNAVAILABLE,
+    NO_DATA,
+    OddsIdentityLookupError,
+    OddsMatchIdentityError,
+    PERSISTENCE_FAILED,
+    PROVIDER_FAILED,
+    RETRY_BLOCKED,
+    RETRY_STATE_UNAVAILABLE,
+    SUCCESS,
+    VALIDATION_FAILED,
+)
+from app.services.odds_reconciliation import (
+    COMMIT_CONFIRMED_CACHE_PENDING,
+    COMMIT_NOT_APPLIED_STATE,
+    MANUAL_REVIEW,
+)
 from app.services.football import football_service, LIVE_STATUSES
 
 router = APIRouter(prefix="/matches", tags=["matches"])
@@ -389,39 +412,264 @@ async def sync_match_odds_route(
 
     async def sync() -> Dict[str, Any]:
         try:
-            result = await football_service.odds_sync_service.refresh_odds(
+            retry_state = football_service.odds_sync_service
+            eligibility = await retry_state.check_retry_eligibility(db, match_id)
+            if eligibility.get("reason") == COMMIT_UNKNOWN:
+                await db.rollback()
+                return {
+                    "status": RETRY_BLOCKED,
+                    "success": False,
+                    "reason": COMMIT_UNKNOWN,
+                }
+            if eligibility.get("cache_invalidation_pending"):
+                try:
+                    async with async_session() as verification_db:
+                        state = await retry_state.retry_state_repository.get_by_match_id(
+                            verification_db,
+                            match_id,
+                        )
+                        if state is None or not state.attempt_id:
+                            raise RuntimeError("Odds cache recovery has no durable attempt evidence")
+                        decision = await retry_state.reconcile_refresh_attempt(
+                            verification_db,
+                            state,
+                        )
+                        now = datetime.now(timezone.utc)
+                        if decision["state"] == COMMIT_CONFIRMED_CACHE_PENDING:
+                            reconciliation_state = COMMIT_CONFIRMED_CACHE_PENDING
+                            classification = None
+                            next_eligible_at = None
+                        elif decision["state"] == COMMIT_NOT_APPLIED_STATE:
+                            reconciliation_state = COMMIT_NOT_APPLIED_STATE
+                            classification = COMMIT_NOT_APPLIED
+                            next_eligible_at = retry_state.next_scheduler_attempt(now)
+                        else:
+                            reconciliation_state = MANUAL_REVIEW
+                            classification = COMMIT_UNKNOWN
+                            next_eligible_at = None
+                        reconciled = await retry_state.retry_state_repository.resolve_reconciliation(
+                            verification_db,
+                            match_id,
+                            attempt_id=state.attempt_id,
+                            reconciliation_state=reconciliation_state,
+                            reconciled_at=now,
+                            next_eligible_at=next_eligible_at,
+                            classification=classification,
+                            error=decision.get("reason")
+                            if reconciliation_state == MANUAL_REVIEW
+                            else None,
+                        )
+                        if not reconciled:
+                            raise RuntimeError("Odds refresh attempt changed during cache recovery")
+                        await verification_db.commit()
+                    if reconciliation_state != COMMIT_CONFIRMED_CACHE_PENDING:
+                        await db.rollback()
+                        return {
+                            "status": RETRY_BLOCKED,
+                            "success": False,
+                            "reason": classification or decision.get("reason"),
+                        }
+                except Exception as exc:
+                    await db.rollback()
+                    logger.exception(
+                        "Odds cache recovery verification failed",
+                        extra={"match_id": match_id, "failure_type": exc.__class__.__name__},
+                    )
+                    retry_state.mark_retry_state_unavailable(match_id, exc)
+                    return {
+                        "status": RETRY_STATE_UNAVAILABLE,
+                        "success": False,
+                        "reason": "CACHE_RECOVERY_VERIFICATION_FAILED",
+                    }
+                try:
+                    cache_invalidated = await CacheService().delete(cache_key)
+                except Exception:
+                    logger.exception("Odds cache recovery failed", extra={"match_id": match_id})
+                    cache_invalidated = False
+                if not cache_invalidated:
+                    await db.rollback()
+                    return {
+                        "status": CACHE_INVALIDATION_FAILED,
+                        "success": False,
+                        "reason": "CACHE_RECOVERY_REQUIRED",
+                    }
+                try:
+                    await retry_state.retry_state_repository.clear_cache_invalidation_pending(db, match_id)
+                    await db.commit()
+                except Exception as exc:
+                    await db.rollback()
+                    retry_state.mark_retry_state_unavailable(match_id, exc)
+                    return {
+                        "status": RETRY_STATE_UNAVAILABLE,
+                        "success": False,
+                        "reason": "CACHE_RECOVERY_STATE_CLEAR_FAILED",
+                    }
+                return {
+                    "status": "CACHE_RECOVERED",
+                    "success": False,
+                    "cache_invalidated": True,
+                }
+
+            if not eligibility.get("eligible"):
+                await db.rollback()
+                return {
+                    "status": eligibility.get("status", RETRY_BLOCKED),
+                    "success": False,
+                    "reason": eligibility.get("reason", "RETRY_BLOCKED"),
+                    "next_eligible_at": eligibility.get("next_eligible_at"),
+                }
+
+            try:
+                async with async_session() as attempt_db:
+                    attempt_id = await retry_state.prepare_refresh_attempt(
+                        attempt_db,
+                        match_id,
+                        provider_fixture_id,
+                    )
+                    await attempt_db.commit()
+            except OddsIdentityLookupError as exc:
+                await db.rollback()
+                logger.exception(
+                    "ODDS_MATCH_IDENTITY_LOOKUP_FAILED",
+                    extra={"local_match_id": match_id, "failure_type": exc.__class__.__name__},
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Odds Match identity unavailable",
+                ) from exc
+            except OddsMatchIdentityError as exc:
+                await db.rollback()
+                logger.warning(
+                    "ODDS_MATCH_IDENTITY_REJECTED",
+                    extra={
+                        "local_match_id": match_id,
+                        "provider_fixture_id": provider_fixture_id,
+                        "reason": exc.reason,
+                    },
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail={"status": IDENTITY_REJECTED, "reason": exc.reason},
+                ) from exc
+            except Exception as exc:
+                logger.exception(
+                    "ODDS_ATTEMPT_EVIDENCE_WRITE_FAILED",
+                    extra={"match_id": match_id, "failure_type": exc.__class__.__name__},
+                )
+                retry_state.mark_retry_state_unavailable(match_id, exc)
+                return {
+                    "status": RETRY_STATE_UNAVAILABLE,
+                    "success": False,
+                    "reason": "ATTEMPT_EVIDENCE_WRITE_FAILED",
+                }
+
+            result = await retry_state.refresh_odds(
                 db,
                 provider_fixture_id,
                 cache_key,
                 1800,
                 local_match_id=match_id,
+                attempt_id=attempt_id,
             )
-            if result.get("status") != SUCCESS:
+            if result.get("status") != CANDIDATE_READY:
                 await db.rollback()
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=result,
-                )
+                try:
+                    async with async_session() as attempt_db:
+                        await retry_state.resolve_attempt_without_candidate(
+                            attempt_db,
+                            match_id,
+                            attempt_id,
+                            str(result.get("status", "REFRESH_FAILED")),
+                        )
+                        await attempt_db.commit()
+                except Exception as exc:
+                    logger.exception(
+                        "ODDS_ATTEMPT_RESOLUTION_FAILED",
+                        extra={"match_id": match_id, "failure_type": exc.__class__.__name__},
+                    )
+                    retry_state.mark_retry_state_unavailable(match_id, exc)
+                    return {
+                        "status": RETRY_STATE_UNAVAILABLE,
+                        "success": False,
+                        "reason": "ATTEMPT_RESOLUTION_FAILED",
+                    }
+                return result
 
-            await db.commit()
+            try:
+                candidate_timestamp = result["_transaction_context"]["persistence_rows"][0]["last_updated"]
+                await retry_state.retry_state_repository.mark_success_pending_cache(
+                    db,
+                    match_id,
+                    candidate_timestamp,
+                )
+            except Exception as exc:
+                await db.rollback()
+                retry_state.mark_retry_state_unavailable(match_id, exc)
+                return {
+                    "status": RETRY_STATE_UNAVAILABLE,
+                    "success": False,
+                    "reason": "RETRY_STATE_SUCCESS_WRITE_FAILED",
+                }
+
+            try:
+                await db.commit()
+            except Exception as exc:
+                try:
+                    await db.rollback()
+                except Exception:
+                    logger.warning("Odds commit session reset failed", extra={"match_id": match_id})
+                context = result.get("_transaction_context", {})
+                try:
+                    async with async_session() as verification_db:
+                        verification = await football_service.odds_sync_service.verify_commit_unknown(
+                            verification_db,
+                            match_id,
+                            provider_fixture_id,
+                            context.get("persistence_rows", []),
+                        )
+                except Exception:
+                    logger.exception(
+                        "Odds commit verification failed",
+                        extra={"match_id": match_id, "failure_type": exc.__class__.__name__},
+                    )
+                    verification = {"state": COMMIT_UNKNOWN}
+
+                if verification.get("state") == COMMIT_CONFIRMED:
+                    result.update({"status": SUCCESS, "success": True, "commit_state": COMMIT_CONFIRMED})
+                elif verification.get("state") == COMMIT_NOT_APPLIED:
+                    result.update({"status": COMMIT_NOT_APPLIED, "success": False, "commit_state": COMMIT_NOT_APPLIED})
+                else:
+                    result.update({"status": COMMIT_UNKNOWN, "success": False, "commit_state": COMMIT_UNKNOWN})
+            else:
+                result.update({"status": SUCCESS, "success": True, "commit_state": COMMIT_CONFIRMED})
+
+            if result.get("status") != SUCCESS:
+                return result
+
             try:
                 cache_invalidated = await CacheService().delete(cache_key)
             except Exception:
                 logger.exception("Odds refresh cache invalidation failed", extra={"match_id": match_id})
                 cache_invalidated = False
             return {
+                "status": SUCCESS,
                 "success": True,
                 "result": result,
                 "cache_invalidated": cache_invalidated,
+                "cache_state": "CACHE_INVALIDATED" if cache_invalidated else CACHE_INVALIDATION_FAILED,
             }
         except HTTPException:
             raise
-        except OddsTransactionFailure:
+        except OddsIdentityLookupError as exc:
             await db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Odds persistence failed",
+            logger.exception(
+                "ODDS_MATCH_IDENTITY_LOOKUP_FAILED",
+                extra={"local_match_id": match_id, "failure_type": exc.__class__.__name__},
             )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Odds Match identity unavailable",
+            ) from exc
         except Exception:
             await db.rollback()
             logger.exception("Odds refresh failed", extra={"match_id": match_id})
@@ -436,7 +684,95 @@ async def sync_match_odds_route(
         raise
     if not locked:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Odds refresh already in progress")
-    return result
+
+    if result.get("status") == SUCCESS:
+        if result.get("cache_invalidated"):
+            async def clear_pending() -> None:
+                await football_service.odds_sync_service.retry_state_repository.clear_cache_invalidation_pending(
+                    db,
+                    match_id,
+                )
+                await db.commit()
+
+            try:
+                clear_locked, _ = await run_with_resource_lock(db, "odds", str(match_id), clear_pending)
+                if not clear_locked:
+                    result["cache_state"] = "CACHE_RECOVERY_PENDING"
+            except Exception as exc:
+                await db.rollback()
+                football_service.odds_sync_service.mark_retry_state_unavailable(match_id, exc)
+                result["cache_state"] = "CACHE_RECOVERY_PENDING"
+        return {
+            "success": True,
+            "result": result,
+            "cache_invalidated": result.get("cache_invalidated", False),
+            "cache_state": result.get("cache_state"),
+        }
+
+    if result.get("status") == "CACHE_RECOVERED":
+        return {
+            "success": True,
+            "refreshed": False,
+            "cache_invalidated": True,
+            "status": "CACHE_RECOVERED",
+        }
+    if result.get("status") == RETRY_BLOCKED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=jsonable_encoder(result),
+        )
+    if result.get("status") == RETRY_STATE_UNAVAILABLE:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=result)
+    if result.get("status") == IDENTITY_REJECTED:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=jsonable_encoder(result),
+        )
+    if result.get("status") == IDENTITY_UNAVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Odds Match identity unavailable",
+        )
+
+    if result.get("status") in {
+        NO_DATA,
+        VALIDATION_FAILED,
+        PROVIDER_FAILED,
+        PERSISTENCE_FAILED,
+        COMMIT_NOT_APPLIED,
+        COMMIT_UNKNOWN,
+    }:
+        state_update = {}
+        try:
+            state_update = football_service.odds_sync_service.retry_state_update(result)
+
+            async def persist_failure() -> None:
+                await football_service.odds_sync_service.retry_state_repository.record_failure(
+                    db,
+                    match_id,
+                    **state_update,
+                )
+                await db.commit()
+
+            persisted, _ = await run_with_resource_lock(db, "odds", str(match_id), persist_failure)
+            if not persisted:
+                raise RuntimeError("Odds retry-state lock unavailable")
+            football_service.odds_sync_service.mark_retry_state_persisted(match_id)
+        except Exception as exc:
+            await db.rollback()
+            football_service.odds_sync_service.mark_retry_state_unavailable(
+                match_id,
+                exc,
+                state_update.get("provider_cooldown_until"),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"status": RETRY_STATE_UNAVAILABLE, "durable_deferral": False},
+            ) from exc
+
+    if result.get("status") == COMMIT_UNKNOWN:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=result)
+    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=result)
 
 @router.post("/sync/{match_id}/lineup", status_code=status.HTTP_200_OK, dependencies=[Depends(current_active_admin)])
 async def sync_match_lineup_route(

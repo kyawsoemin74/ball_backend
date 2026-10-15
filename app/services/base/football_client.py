@@ -41,6 +41,7 @@ class FootballAPIResponse:
     error_code: str | None = None
     error_message: str | None = None
     exception_type: str | None = None
+    retry_after: str | None = None
 
 
 class FootballAPIClient:
@@ -123,6 +124,7 @@ class FootballAPIClient:
                             error_code="malformed_json",
                             error_message=str(exc),
                             exception_type=exc.__class__.__name__,
+                            retry_after=response.headers.get("Retry-After"),
                         )
                     if response.status_code >= 400:
                         if attempt < retries and response.status_code >= 500:
@@ -136,6 +138,7 @@ class FootballAPIClient:
                             status_code=response.status_code,
                             error_code=_provider_error_code(payload),
                             error_message=_provider_error_message(payload),
+                            retry_after=response.headers.get("Retry-After"),
                         )
                     PROVIDER_REQUESTS.labels(method.upper(), metric_path, "success").inc()
                     PROVIDER_DURATION.labels(method.upper(), metric_path).observe(time.perf_counter() - started)
@@ -144,6 +147,7 @@ class FootballAPIClient:
                         status_code=response.status_code,
                         error_code=_provider_error_code(payload),
                         error_message=_provider_error_message(payload),
+                        retry_after=response.headers.get("Retry-After"),
                     )
             except Exception as exc:
                 category = "timeout" if isinstance(exc, httpx.TimeoutException) else "provider_error"
@@ -162,8 +166,9 @@ class FootballAPIClient:
         path: str,
         params: Optional[dict] = None,
         timeout: float = 30.0,
+        retries: int = 2,
     ) -> FootballAPIResponse:
-        return await self.request_with_metadata("GET", path, params=params, timeout=timeout)
+        return await self.request_with_metadata("GET", path, params=params, timeout=timeout, retries=retries)
 
     async def post(self, path: str, params: Optional[dict] = None, timeout: float = 30.0) -> Optional[dict]:
         return await self.request("POST", path, params=params, timeout=timeout)

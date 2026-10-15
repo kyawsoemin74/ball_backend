@@ -29,6 +29,7 @@ from app.models.ad import Ad
 from app.models.ad_config import AdConfig
 from app.models.allowed_league import AllowedLeague
 from app.models.league_identity_recovery import LeagueIdentityRecovery
+from app.models.odds_refresh_state import OddsProviderCooldown, OddsRefreshState
 from app.models.news import News
 from app.models.user import User
 from app.models.auth_session import AuthSession

@@ -20,6 +20,7 @@ from app.repositories.league_season_repository import LeagueSeasonRepository
 from app.repositories.match_repository import MatchRepository
 from app.repositories.player_repository import PlayerRepository
 from app.repositories.team_repository import TeamRepository
+from app.services.odds_value import canonicalize_odd_value
 
 logger = logging.getLogger(__name__)
 
@@ -248,26 +249,38 @@ class AnalyticsProjectionService:
     @_projection_observer("odds", lambda args, kwargs: {"match_id": args[0] if args else kwargs.get("match_id")})
     async def project_odds(self, db, match_id: int, rows: list[dict]) -> dict:
         scope = {"match_id": match_id}
-        approved_bookmakers = {"bet365"}
         approved_markets = {"MATCH_WINNER", "ASIAN_HANDICAP", "GOALS_OVER_UNDER", "CORNERS_OVER_UNDER"}
-        source = [row for row in rows if str(row.get("bookmaker_name", "")).strip().lower() in approved_bookmakers and row.get("market_name") in approved_markets]
+        if not rows:
+            return self._result(scope, 0, 0, [], rejected_count=1, reason="empty_source")
+        source = rows
         projected = []
         seen = set()
         for row in source:
+            if str(row.get("bookmaker_name", "")).strip().casefold() != "1xbet":
+                raise ValueError("unsupported Odds bookmaker")
+            if row.get("market_name") not in approved_markets:
+                raise ValueError("unsupported canonical Odds market")
             try:
-                odd = Decimal(str(row["odd_value"]))
-            except (KeyError, InvalidOperation, ValueError) as exc:
+                odd = canonicalize_odd_value(row["odd_value"])
+            except (KeyError, ValueError) as exc:
                 raise ValueError("invalid odd") from exc
-            if odd <= 0:
-                raise ValueError("invalid odd")
             key = (row.get("bookmaker_name"), row.get("market_name"), row.get("selection"))
             if key in seen:
                 return self._result(scope, len(source), 0, [], duplicate_count=1, reason="duplicate_source_rejected")
             seen.add(key)
-            projected.append({"bookmaker_name": row["bookmaker_name"], "market_name": row["market_name"], "selection": row["selection"], "odd_value": odd, "myanmar_odd": row.get("myanmar_odd"), "source_provider": "api-football"})
+            projected.append(
+                {
+                    "bookmaker_name": row["bookmaker_name"],
+                    "market_name": row["market_name"],
+                    "selection": row["selection"],
+                    "odd_value": odd,
+                    "myanmar_odd": row.get("myanmar_odd"),
+                    "source_provider": "api-football",
+                    "observed_at": row.get("observed_at"),
+                }
+            )
         if not projected:
-            existing = await self.odds_repository.list_by_match(db, match_id)
-            return self._result(scope, 0, 0, existing, reason="filtered_to_zero_preserved")
+            return self._result(scope, len(source), 0, [], rejected_count=len(source), reason="filtered_to_zero")
         await self.odds_repository.replace_by_match(db, match_id, projected)
         result = self._result(scope, len(source), len(projected), projected)
         return await self._persisted_result(
