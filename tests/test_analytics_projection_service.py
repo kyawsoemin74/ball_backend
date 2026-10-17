@@ -1,4 +1,7 @@
 import asyncio
+from datetime import datetime, timezone
+from decimal import Decimal
+
 import pytest
 
 from app.services.analytics_projection_service import AnalyticsProjectionService, log_projection_transaction
@@ -117,6 +120,60 @@ def test_unsupported_odds_source_is_rejected_before_replacement():
             )
         )
     assert projection.odds_repository.rows == [{"old": True}]
+
+
+def test_odds_projection_carries_giving_team_without_recalculation():
+    projection = service()
+    source = [
+        {
+            "bookmaker_name": "1xBet",
+            "market_name": "ASIAN_HANDICAP",
+            "selection": "Home -0.25",
+            "odd_value": "1.9100",
+            "myanmar_odd": "-90",
+            "giving_team": "AWAY",
+        }
+    ]
+
+    result = asyncio.run(projection.project_odds(None, 10, source))
+
+    assert result["success"] is True
+    assert projection.odds_repository.rows[0]["giving_team"] == "AWAY"
+    assert projection.odds_repository.rows[0]["selection"] == "Home -0.25"
+
+
+@pytest.mark.asyncio
+async def test_analytics_odds_repository_persists_giving_team():
+    from app.repositories.analytics_repository import AnalyticsOddsRepository
+
+    class CapturingDB:
+        rows = []
+
+        async def execute(self, _statement):
+            return None
+
+        def add_all(self, rows):
+            self.rows = rows
+
+    db = CapturingDB()
+    await AnalyticsOddsRepository().replace_by_match(
+        db,
+        42,
+        [
+            {
+                "bookmaker_name": "1xBet",
+                "market_name": "ASIAN_HANDICAP",
+                "selection": "Home -0.25",
+                "odd_value": Decimal("1.91"),
+                "myanmar_odd": "-90",
+                "giving_team": "AWAY",
+                "source_provider": "api-football",
+                "observed_at": datetime.now(timezone.utc),
+            }
+        ],
+    )
+    assert db.rows[0].giving_team == "AWAY"
+    assert db.rows[0].giving_team == "AWAY"
 
 
 def test_lineup_unresolved_player_fails_closed():

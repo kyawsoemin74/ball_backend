@@ -1,4 +1,12 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.sql import func
 
 from app.db import Base
@@ -14,9 +22,14 @@ class Odds(Base):
     selection = Column(String(255), nullable=False, index=True)
     odd_value = Column(String(50), nullable=False)
     myanmar_odd = Column(String(20), nullable=True)
+    giving_team = Column(String(4), nullable=True)
     last_updated = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     __table_args__ = (
+        CheckConstraint(
+            "giving_team IS NULL OR giving_team IN ('HOME', 'AWAY')",
+            name="ck_odds_giving_team",
+        ),
         UniqueConstraint(
             "fixture_id",
             "bookmaker_name",

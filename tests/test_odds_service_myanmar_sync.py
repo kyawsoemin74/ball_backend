@@ -130,6 +130,48 @@ def test_candidate_market_ids_normalize_and_null_myanmar_is_allowed_for_ids_1_an
 
 
 @pytest.mark.parametrize(
+    ("home_odd", "away_odd", "expected_giving_team"),
+    [
+        ("1.90", "3.50", "HOME"),
+        ("3.50", "1.90", "AWAY"),
+        ("2.50", "2.50", None),
+    ],
+)
+def test_candidate_derives_giving_team_and_preserves_raw_asian_handicap_values(
+    home_odd,
+    away_odd,
+    expected_giving_team,
+):
+    service = OddsService(client=_DummyClient())
+    bets = _required_market_bets()
+    bets[0] = _candidate_market(
+        1,
+        "Match Winner",
+        ("Home", home_odd),
+        ("Draw", "3.20"),
+        ("Away", away_odd),
+    )
+    bets[1] = _candidate_market(
+        4,
+        "Asian Handicap",
+        (" Home -0.50 ", "1.9100"),
+        ("Away -0.50", "1.950"),
+    )
+
+    candidate, _diagnostics = service.build_candidate(_candidate_bookmaker(*bets))
+
+    handicap_rows = [row for row in candidate if row["market_name"] == "ASIAN_HANDICAP"]
+    assert [row["selection"] for row in handicap_rows] == [" Home -0.50 ", "Away -0.50"]
+    assert [row["odd_value"] for row in handicap_rows] == ["1.9100", "1.950"]
+    assert {row["giving_team"] for row in handicap_rows} == {expected_giving_team}
+    assert all(
+        row["giving_team"] is None
+        for row in candidate
+        if row["market_name"] != "ASIAN_HANDICAP"
+    )
+
+
+@pytest.mark.parametrize(
     ("market_id", "name", "values", "category"),
     [
         (4, "Asian Handicap", (("Home -0.5", "1.91"), ("Away -0.5", "1.95")), "ASIAN_HANDICAP"),
@@ -394,6 +436,16 @@ def test_freshness_snapshot_must_be_complete_and_share_one_timestamp():
     )
     complete[0].last_updated = datetime.now(timezone.utc)
     assert not service.is_valid_snapshot(complete)
+
+
+def test_freshness_validation_normalizes_ah_selection_without_rewriting_it():
+    service = OddsService(client=_DummyClient())
+    snapshot = _complete_snapshot()
+    snapshot[3].selection = " Home -0.50 "
+    original_selection = snapshot[3].selection
+
+    assert service.is_valid_snapshot(snapshot)
+    assert snapshot[3].selection == original_selection
 
 
 @pytest.mark.parametrize(
@@ -927,15 +979,15 @@ def test_date_matches_batch_stored_asian_handicap_odds_by_local_match_id(monkeyp
     assert [match["match_id"] for match in payload] == [1510, 1511, 1512]
     assert payload[0]["home_team"] == "Home A"
     assert payload[0]["asian_handicap_odds"] == [
-        {"selection": "Home -0.25", "myanmar_odd": "  -50 "},
-        {"selection": "Away -0.25", "myanmar_odd": None},
+        {"selection": "Home -0.25", "myanmar_odd": "  -50 ", "giving_team": None},
+        {"selection": "Away -0.25", "myanmar_odd": None, "giving_team": None},
     ]
     assert payload[1]["asian_handicap_odds"] == [
-        {"selection": "Home +0.5", "myanmar_odd": "+25"},
+        {"selection": "Home +0.5", "myanmar_odd": "+25", "giving_team": None},
     ]
     assert payload[2]["asian_handicap_odds"] == []
     assert all(
-        set(odd) == {"selection", "myanmar_odd"}
+        set(odd) == {"selection", "myanmar_odd", "giving_team"}
         for match in payload
         for odd in match["asian_handicap_odds"]
     )
@@ -1046,3 +1098,36 @@ def test_odds_repository_empty_batch_skips_database_query():
 
     assert result == []
     assert db.queries == []
+
+
+def test_cached_odds_legacy_payload_without_giving_team_falls_back_to_database():
+    cached = {
+        "source": "database",
+        "odds": [{"selection": "Home", "odd": "1.80"}],
+        "cached": True,
+        "match_started": False,
+    }
+    db = _FakeDB(
+        status="NS",
+        odds_rows=[
+            SimpleNamespace(
+                bookmaker_name="1xBet",
+                market_name="ASIAN_HANDICAP",
+                selection="Home -0.25",
+                odd_value="1.9100",
+                myanmar_odd="-90",
+                giving_team="HOME",
+                last_updated=datetime.now(timezone.utc),
+            )
+        ],
+    )
+    service = OddsService(
+        client=_FakeClient(),
+        cache_service=_FakeCacheService(cached=cached),
+    )
+
+    result = asyncio.run(service.get_cached_odds(db, 123))
+
+    assert result["source"] == "database"
+    assert result["odds"][0]["giving_team"] == "HOME"
+    assert result["odds"][0]["odd"] == "1.9100"

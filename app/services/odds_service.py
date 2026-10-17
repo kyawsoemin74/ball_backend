@@ -212,11 +212,15 @@ class OddsService:
         for value in values:
             if not isinstance(value, dict):
                 raise OddsCandidateValidationError("SUPPORTED_MARKET_VALUE_INVALID")
-            selection = value.get("value", value.get("selection"))
+            raw_selection = value.get("value", value.get("selection"))
             odd = value.get("odd")
-            if not isinstance(selection, str) or not selection.strip() or odd is None:
+            if (
+                not isinstance(raw_selection, str)
+                or not raw_selection.strip()
+                or odd is None
+            ):
                 raise OddsCandidateValidationError("SUPPORTED_MARKET_VALUE_INVALID")
-            selection = selection.strip()
+            selection = raw_selection.strip()
             normalized_key = selection.casefold()
             if normalized_key in seen_selections:
                 raise OddsCandidateValidationError("DUPLICATE_SELECTION")
@@ -263,6 +267,8 @@ class OddsService:
             normalized.append(
                 {
                     "selection": selection,
+                    "_raw_selection": raw_selection,
+                    "_raw_odd": odd if isinstance(odd, str) else str(odd),
                     "odd": format_canonical_odd(decimal_odd),
                     "odd_float": odd_float,
                     "_selection_key": selection_key,
@@ -322,7 +328,7 @@ class OddsService:
                 ],
             )
 
-        favorite_team = None
+        giving_team = None
         match_winner = parsed_bets.get(1)
         if match_winner:
             outcomes = {item["selection"].casefold(): item for item in match_winner["values"]}
@@ -332,7 +338,7 @@ class OddsService:
             home_odd = outcomes["home"]["odd_float"]
             away_odd = outcomes["away"]["odd_float"]
             if home_odd != away_odd:
-                favorite_team = "HOME" if home_odd < away_odd else "AWAY"
+                giving_team = "HOME" if home_odd < away_odd else "AWAY"
 
         candidate = []
         for market_id, bet in parsed_bets.items():
@@ -351,7 +357,7 @@ class OddsService:
                     market_id,
                     category,
                     values,
-                    favorite_team=favorite_team,
+                    favorite_team=giving_team,
                 )
                 if not selected:
                     raise OddsCandidateValidationError(f"INCOMPLETE_{category}")
@@ -361,7 +367,11 @@ class OddsService:
             for line in selected:
                 if market_id in {4, 5}:
                     label = line.get("myanmar_odd")
-                    if not isinstance(label, str) or not label.strip() or label == "OUT_OF_RANGE":
+                    if (
+                        not isinstance(label, str)
+                        or not label.strip()
+                        or label == "OUT_OF_RANGE"
+                    ):
                         raise OddsCandidateValidationError("MYANMAR_CONVERSION_FAILED")
                 else:
                     line["myanmar_odd"] = None
@@ -369,9 +379,18 @@ class OddsService:
                     {
                         "bookmaker_name": "1xBet",
                         "market_name": category,
-                        "selection": line["selection"],
-                        "odd_value": line["odd"],
+                        "selection": (
+                            line["_raw_selection"]
+                            if market_id == 4
+                            else line["selection"]
+                        ),
+                        "odd_value": (
+                            line["_raw_odd"]
+                            if market_id == 4
+                            else line["odd"]
+                        ),
                         "myanmar_odd": line.get("myanmar_odd"),
+                        "giving_team": giving_team if market_id == 4 else None,
                         "market_id": market_id,
                         "raw_market_name": bet["name"],
                     }
@@ -453,17 +472,29 @@ class OddsService:
                 if not lines_match:
                     return False
             elif market_name == "ASIAN_HANDICAP":
-                if len(selections) != 2 or not any(value.startswith("Home ") for value in selections) or not any(value.startswith("Away ") for value in selections):
+                if len(selections) != 2:
                     return False
                 try:
-                    home_line = Decimal(next(value[5:] for value in selections if value.startswith("Home ")))
-                    away_line = Decimal(next(value[5:] for value in selections if value.startswith("Away ")))
-                    if not home_line.is_finite() or not away_line.is_finite():
+                    normalized_values = OddsService._validated_market_values(
+                        {
+                            "values": [
+                                {"value": row.selection, "odd": row.odd_value}
+                                for row in market_rows.values()
+                            ]
+                        },
+                        4,
+                    )
+                    line_sides: dict[str, set[str]] = {}
+                    for value in normalized_values:
+                        side, line = value["_selection_key"].split(maxsplit=1)
+                        line_sides.setdefault(line, set()).add(side)
+                    if (
+                        len(normalized_values) != 2
+                        or len(line_sides) != 1
+                        or next(iter(line_sides.values())) != {"home", "away"}
+                    ):
                         return False
-                    lines_match = home_line.normalize() == away_line.normalize()
-                except DecimalException:
-                    return False
-                if not lines_match:
+                except (DecimalException, OddsCandidateValidationError):
                     return False
         return True
 
@@ -473,6 +504,12 @@ class OddsService:
     async def get_cached_odds(self, db: AsyncSession, fixture_id: int) -> dict:
         cache_key = make_cache_key("match", fixture_id, "odds")
         cached = await self.cache_service.get_json(cache_key)
+        if isinstance(cached, dict) and isinstance(cached.get("odds"), list):
+            if any(
+                not isinstance(row, dict) or "giving_team" not in row
+                for row in cached["odds"]
+            ):
+                cached = None
         if cached is not None:
             logger.debug("ODDS_CACHE_HIT", extra={"fixture_id": fixture_id, "status": "UNKNOWN", "ttl": None})
             return cached
@@ -492,6 +529,7 @@ class OddsService:
                     "selection": o.selection,
                     "odd": o.odd_value,
                     "myanmar_odd": o.myanmar_odd,
+                    "giving_team": getattr(o, "giving_team", None),
                     "updated_at": o.last_updated.isoformat() if o.last_updated else None,
                 }
                 for o in rows

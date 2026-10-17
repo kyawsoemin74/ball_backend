@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from app.services.odds_service import (
@@ -5,6 +7,7 @@ from app.services.odds_service import (
     OddsService,
 )
 from app.models.odds import Odds
+from app.repositories.odds_repository import OddsRepository
 
 
 class MyanmarOddsProbe:
@@ -158,3 +161,47 @@ def test_persistence_business_identity_excludes_the_mutable_odd_value():
         "selection",
     ]
     assert "odd_value" not in unique_constraint.columns
+
+
+def test_giving_team_columns_are_nullable_and_constrained():
+    from app.models.analytics import AnalyticsMatchOddsSnapshot
+
+    for model, constraint_name in (
+        (Odds, "ck_odds_giving_team"),
+        (AnalyticsMatchOddsSnapshot, "ck_analytics_odds_giving_team"),
+    ):
+        assert model.__table__.c.giving_team.nullable is True
+        constraint = next(
+            constraint
+            for constraint in model.__table__.constraints
+            if getattr(constraint, "name", None) == constraint_name
+        )
+        assert "HOME" in str(constraint.sqltext)
+        assert "AWAY" in str(constraint.sqltext)
+
+
+def test_odds_repository_upsert_includes_giving_team_and_preserves_ah_odd_text():
+    class CapturingDB:
+        statement = None
+
+        async def execute(self, statement):
+            self.statement = statement
+
+    db = CapturingDB()
+    row = {
+        "fixture_id": 42,
+        "bookmaker_name": "1xBet",
+        "market_name": "ASIAN_HANDICAP",
+        "selection": " Home -0.25 ",
+        "odd_value": "1.9100",
+        "myanmar_odd": "-90",
+        "giving_team": "HOME",
+    }
+
+    asyncio.run(OddsRepository().upsert_many(db, [row]))
+
+    compiled = db.statement.compile()
+    assert "giving_team" in str(db.statement)
+    assert "1.9100" in compiled.params.values()
+    assert "HOME" in compiled.params.values()
+    assert " Home -0.25 " in compiled.params.values()

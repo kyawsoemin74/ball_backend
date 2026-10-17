@@ -1,4 +1,17 @@
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Identity, Index, Integer, Numeric, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Identity,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import mapped_column
 from sqlalchemy.sql import func
 
@@ -66,6 +79,10 @@ class AnalyticsMatchOddsSnapshot(Base):
     __tablename__ = "analytics_match_odds_snapshots"
     __table_args__ = (
         UniqueConstraint("match_id", "bookmaker_name", "market_name", "selection", name="uq_analytics_odds_business"),
+        CheckConstraint(
+            "giving_team IS NULL OR giving_team IN ('HOME', 'AWAY')",
+            name="ck_analytics_odds_giving_team",
+        ),
         Index("ix_analytics_odds_match", "match_id"),
         Index("ix_analytics_odds_market", "bookmaker_name", "market_name"),
     )
@@ -76,6 +93,7 @@ class AnalyticsMatchOddsSnapshot(Base):
     selection = mapped_column(Text, nullable=False)
     odd_value = mapped_column(Numeric(12, 6), nullable=False)
     myanmar_odd = mapped_column(Text)
+    giving_team = mapped_column(String(4), nullable=True)
     source_provider = mapped_column(Text, server_default="api-football", nullable=False)
     observed_at = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     created_at = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

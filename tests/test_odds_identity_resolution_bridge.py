@@ -33,10 +33,11 @@ def expected_odds_row():
     return {
         "fixture_id": MATCH_ID,
         "bookmaker_name": "1xBet",
-        "market_name": "MATCH_WINNER",
-        "selection": "Home",
+        "market_name": "ASIAN_HANDICAP",
+        "selection": "Home -0.25",
         "odd_value": "1.800000",
         "myanmar_odd": None,
+        "giving_team": "HOME",
         "last_updated": OBSERVED_AT,
     }
 
@@ -45,10 +46,11 @@ def odds_row(*, value="1.800000", updated_at=OBSERVED_AT):
     return SimpleNamespace(
         fixture_id=MATCH_ID,
         bookmaker_name="1xBet",
-        market_name="MATCH_WINNER",
-        selection="Home",
+        market_name="ASIAN_HANDICAP",
+        selection="Home -0.25",
         odd_value=value,
         myanmar_odd=None,
+        giving_team="HOME",
         last_updated=updated_at,
     )
 
@@ -57,10 +59,11 @@ def analytics_row(*, value="1.800000", observed_at=OBSERVED_AT):
     return SimpleNamespace(
         match_id=MATCH_ID,
         bookmaker_name="1xBet",
-        market_name="MATCH_WINNER",
-        selection="Home",
+        market_name="ASIAN_HANDICAP",
+        selection="Home -0.25",
         odd_value=Decimal(value),
         myanmar_odd=None,
+        giving_team="HOME",
         observed_at=observed_at,
         source_provider="api-football",
     )
@@ -137,6 +140,23 @@ async def test_ambiguous_commit_confirms_only_when_both_snapshots_match():
     )
 
     assert result == {"state": COMMIT_CONFIRMED, "reason": "BOTH_CANDIDATE_SNAPSHOTS_MATCH"}
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_commit_rejects_giving_team_mismatch():
+    odds = odds_row()
+    analytics = analytics_row()
+    analytics.giving_team = "AWAY"
+    service, db = service_for([odds], [analytics])
+
+    result = await service.verify_commit_unknown(
+        db,
+        MATCH_ID,
+        PROVIDER_FIXTURE_ID,
+        [expected_odds_row()],
+    )
+
+    assert result["state"] == COMMIT_UNKNOWN
 
 
 @pytest.mark.parametrize(
@@ -331,6 +351,7 @@ async def test_ambiguous_commit_requires_fresh_verification(
 @pytest.mark.asyncio
 async def test_valid_candidate_writes_odds_and_projects_analytics_once():
     order = []
+    persisted = []
 
     provider = SimpleNamespace(
         get_match_odds=AsyncMock(
@@ -388,13 +409,14 @@ async def test_valid_candidate_writes_odds_and_projects_analytics_once():
                     "selection": selection,
                     "odd_value": value,
                     "myanmar_odd": myanmar_odd,
+                    "giving_team": "HOME" if market_name == "ASIAN_HANDICAP" else None,
                 }
                 for market_name, selection, value, myanmar_odd in (
                     ("MATCH_WINNER", "Home", "1.80", None),
                     ("MATCH_WINNER", "Draw", "3.10", None),
                     ("MATCH_WINNER", "Away", "4.20", None),
                     ("ASIAN_HANDICAP", "Home -0.5", "1.91", "HOME"),
-                    ("ASIAN_HANDICAP", "Away -0.5", "1.95", "AWAY"),
+                    ("ASIAN_HANDICAP", "Away -0.5", "1.95", "HOME"),
                     ("GOALS_OVER_UNDER", "Over 2.5", "1.95", "OVER"),
                     ("GOALS_OVER_UNDER", "Under 2.5", "1.90", "UNDER"),
                 )
@@ -404,8 +426,9 @@ async def test_valid_candidate_writes_odds_and_projects_analytics_once():
         def public_market_name(market_name):
             return market_name
 
-    async def replace_fixture_odds(*_args):
+    async def replace_fixture_odds(_db, _match_id, rows):
         order.append("odds")
+        persisted.extend(rows)
 
     async def set_candidate_fingerprint(*_args, **_kwargs):
         order.append("candidate")
@@ -454,6 +477,16 @@ async def test_valid_candidate_writes_odds_and_projects_analytics_once():
 
     assert result["status"] == "CANDIDATE_READY"
     assert order == ["candidate", "odds", "analytics"]
+    assert {
+        row["giving_team"]
+        for row in persisted
+        if row["market_name"] == "ASIAN_HANDICAP"
+    } == {"HOME"}
+    assert {
+        row["giving_team"]
+        for row in result["odds"]
+        if row["market"] == "ASIAN_HANDICAP"
+    } == {"HOME"}
     provider.get_match_odds.assert_awaited_once_with(PROVIDER_FIXTURE_ID)
 
 

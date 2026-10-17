@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 
@@ -105,6 +105,7 @@ class MatchStatisticsResponse(BaseModel):
 class MatchDateAsianHandicapOdd(BaseModel):
     selection: str
     myanmar_odd: Optional[str] = None
+    giving_team: Optional[Literal["HOME", "AWAY"]] = None
 
 
 class MatchDateResponse(BaseModel):
@@ -223,3 +224,10 @@ class MatchResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class FinishedMatchResponse(MatchResponse):
+    asian_handicap_odds: list[MatchDateAsianHandicapOdd] = Field(
+        default_factory=list,
+        description="Persisted Asian Handicap odds for this match",
+    )

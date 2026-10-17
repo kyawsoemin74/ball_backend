@@ -7,7 +7,7 @@ from app.cache import cache_get_json, cache_set_json, make_cache_key
 from app.core.config import settings
 from app.db import get_db
 from app.models.team import Team
-from app.schemas.match import MatchResponse
+from app.schemas.match import FinishedMatchResponse, MatchResponse
 from app.schemas.standing import StandingResponse
 from app.schemas.team import Team as TeamSchema, TeamFixturesResponse, TeamSquadResponse, TeamStatisticsResponse
 from app.services.football import football_service
@@ -48,7 +48,7 @@ async def get_team_matches(team_id: int = Path(..., gt=0), db: AsyncSession = De
     return result
 
 
-@router.get("/{team_id}/finished-matches", response_model=list[MatchResponse])
+@router.get("/{team_id}/finished-matches", response_model=list[FinishedMatchResponse])
 async def get_team_finished_matches(team_id: int = Path(..., gt=0), db: AsyncSession = Depends(get_db)):
     """Get finished matches for a team."""
     team_result = await db.execute(select(Team).where(Team.team_id == team_id))

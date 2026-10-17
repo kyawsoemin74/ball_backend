@@ -275,6 +275,7 @@ async def get_matches_by_date(
             MatchDateAsianHandicapOdd(
                 selection=odds_row.selection,
                 myanmar_odd=odds_row.myanmar_odd,
+                giving_team=getattr(odds_row, "giving_team", None),
             )
         )
 

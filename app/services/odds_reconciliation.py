@@ -42,6 +42,11 @@ def snapshot_fingerprint(rows: list[dict | object]) -> str:
                 _value(row, "selection"),
                 format_canonical_odd(_value(row, "odd_value")),
                 _value(row, "myanmar_odd"),
+                (
+                    row.get("giving_team")
+                    if isinstance(row, dict)
+                    else getattr(row, "giving_team", None)
+                ),
                 timestamp,
                 (
                     row.get("source_provider", "api-football")

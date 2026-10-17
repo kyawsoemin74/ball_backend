@@ -56,15 +56,26 @@ class OddsRepository:
             return
 
         canonical_rows = [
-            {**row, "odd_value": format_canonical_odd(row["odd_value"])}
+            {
+                **row,
+                "odd_value": (
+                    str(row["odd_value"])
+                    if row.get("market_name") == "ASIAN_HANDICAP"
+                    else format_canonical_odd(row["odd_value"])
+                ),
+            }
             for row in rows
         ]
+        for row in canonical_rows:
+            if row.get("market_name") == "ASIAN_HANDICAP":
+                format_canonical_odd(row["odd_value"])
         insert_stmt = pg_insert(Odds).values(canonical_rows)
         upsert_stmt = insert_stmt.on_conflict_do_update(
             constraint="uq_odds_fixture_bookmaker_market_selection",
             set_={
                 "odd_value": insert_stmt.excluded.odd_value,
                 "myanmar_odd": insert_stmt.excluded.myanmar_odd,
+                "giving_team": insert_stmt.excluded.giving_team,
                 "last_updated": insert_stmt.excluded.last_updated,
             },
         )
@@ -85,7 +96,11 @@ class OddsRepository:
         actual_rows = result.scalars().all()
 
         def row_key(row: dict | Odds) -> tuple:
-            get = row.get if isinstance(row, dict) else lambda key: getattr(row, key)
+            get = (
+                row.get
+                if isinstance(row, dict)
+                else lambda key: getattr(row, key, None)
+            )
             return (
                 get("fixture_id"),
                 get("bookmaker_name"),
@@ -100,11 +115,22 @@ class OddsRepository:
                 return None
 
         def row_content(row: dict | Odds) -> tuple:
-            get = row.get if isinstance(row, dict) else lambda key: getattr(row, key)
+            get = (
+                row.get
+                if isinstance(row, dict)
+                else lambda key: getattr(row, key, None)
+            )
+            normalized_odd = odd_value(get("odd_value"))
+            persisted_odd = (
+                str(get("odd_value"))
+                if get("market_name") == "ASIAN_HANDICAP"
+                else normalized_odd
+            )
             return (
                 row_key(row),
-                odd_value(get("odd_value")),
+                persisted_odd,
                 get("myanmar_odd"),
+                get("giving_team"),
                 get("last_updated"),
             )
 

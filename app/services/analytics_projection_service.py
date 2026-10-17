@@ -275,6 +275,7 @@ class AnalyticsProjectionService:
                     "selection": row["selection"],
                     "odd_value": odd,
                     "myanmar_odd": row.get("myanmar_odd"),
+                    "giving_team": row.get("giving_team"),
                     "source_provider": "api-football",
                     "observed_at": row.get("observed_at"),
                 }

@@ -555,6 +555,7 @@ class OddsSyncService:
                 "selection": row["selection"],
                 "odd_value": row["odd_value"],
                 "myanmar_odd": row["myanmar_odd"],
+                "giving_team": row.get("giving_team"),
                 "last_updated": now_utc,
             }
             for row in candidate
@@ -603,6 +604,7 @@ class OddsSyncService:
                 "selection": row["selection"],
                 "odd": row["odd_value"],
                 "myanmar_odd": row["myanmar_odd"],
+                "giving_team": row.get("giving_team"),
                 "updated_at": now_utc.isoformat(),
             }
             for row in persistence_rows

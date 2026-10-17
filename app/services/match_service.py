@@ -5,7 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.cache import make_cache_key
 from app.models.match import Match
 from app.providers.fixture_provider import FixtureProvider
-from app.schemas.match import MatchResponse
+from app.repositories.odds_repository import OddsRepository
+from app.schemas.match import MatchDateAsianHandicapOdd, MatchResponse
 from app.services.base.football_client import FootballAPIClient
 from app.services.cache_service import CacheService
 from app.services.fixture_sync_service import FixtureSyncService
@@ -33,6 +34,7 @@ class MatchService:
             standing_service=standing_service,
             fixture_provider=fixture_provider,
         )
+        self.odds_repository = OddsRepository()
         self._fixture_sync_upsert_leagues_impl = self.fixture_sync_service._upsert_leagues_from_fixtures
         self.fixture_sync_service._upsert_leagues_from_fixtures = self._upsert_leagues_from_fixtures
 
@@ -187,23 +189,35 @@ class MatchService:
     async def get_team_finished_matches(self, db: AsyncSession, team_id: int):
         cache_key = make_cache_key("team", team_id, "finished-matches")
         cached = await self.cache_service.get_json(cache_key)
-        if cached is not None:
-            return cached
+        if cached is None:
+            # Delegate to repository for newest-first results
+            matches = await self.match_repository.get_team_matches_recent(db, team_id)
+            finished: list = []
+            for match in matches:
+                response = MatchResponse.model_validate(match)
+                if response.status in {"FT", "AET", "PEN", "CANC", "ABD", "AWD", "WO"}:
+                    finished.append(response.model_dump(mode="json"))
 
-        # Delegate to repository for newest-first results
-        matches = await self.match_repository.get_team_matches_recent(db, team_id)
-        if not matches:
-            payload: list = []
-            await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_TEAM_FIXTURES)
-            return payload
+            # Apply business rule: newest first already from repo, take top 10 finished matches
+            cached = finished[:10]
+            await self.cache_service.set_json(cache_key, cached, settings.REDIS_TTL_TEAM_FIXTURES)
 
-        finished: list = []
-        for match in matches:
-            response = MatchResponse.model_validate(match)
-            if response.status in {"FT", "AET", "PEN", "CANC", "ABD", "AWD", "WO"}:
-                finished.append(response.model_dump(mode="json"))
+        if not cached:
+            return []
 
-        # Apply business rule: newest first already from repo, take top 10 finished matches
-        payload = finished[:10]
-        await self.cache_service.set_json(cache_key, payload, settings.REDIS_TTL_TEAM_FIXTURES)
-        return payload
+        local_match_ids = [match["match_id"] for match in cached]
+        odds_rows = await self.odds_repository.get_asian_handicap_for_fixtures(db, local_match_ids)
+        odds_by_match_id: dict[int, list[dict]] = {match_id: [] for match_id in local_match_ids}
+        for odds in odds_rows:
+            odds_by_match_id.setdefault(odds.fixture_id, []).append(
+                MatchDateAsianHandicapOdd(
+                    selection=odds.selection,
+                    myanmar_odd=odds.myanmar_odd,
+                    giving_team=odds.giving_team,
+                ).model_dump(mode="json")
+            )
+
+        return [
+            {**match, "asian_handicap_odds": odds_by_match_id.get(match["match_id"], [])}
+            for match in cached
+        ]
