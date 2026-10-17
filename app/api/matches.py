@@ -19,7 +19,12 @@ from app.models.match_lineup import MatchLineup
 from app.models.odds import Odds
 from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.match_repository import MatchRepository
-from app.schemas.match import MatchDateResponse, MatchResponse, MatchStatisticsResponse
+from app.schemas.match import (
+    MatchDateAsianHandicapOdd,
+    MatchDateResponse,
+    MatchResponse,
+    MatchStatisticsResponse,
+)
 from app.services.analytics_projection_service import log_projection_transaction
 from app.services.cache_service import CacheService
 from app.services.league_structure_resolver import LeagueStructureResolver
@@ -49,6 +54,7 @@ from app.services.odds_reconciliation import (
     MANUAL_REVIEW,
 )
 from app.services.football import football_service, LIVE_STATUSES
+from app.repositories.odds_repository import OddsRepository
 
 router = APIRouter(prefix="/matches", tags=["matches"])
 league_structure_resolver = LeagueStructureResolver()
@@ -256,7 +262,28 @@ async def get_matches_by_date(
     """
     allowed_ids = await AllowedLeagueRepository().get_allowed_ids(db)
     matches = await MatchRepository().get_matches_by_date(db, date_val, allowed_ids)
-    return MatchRepository.order_matches_for_date(matches)
+    ordered_matches = MatchRepository.order_matches_for_date(matches)
+    if not ordered_matches:
+        return []
+
+    date_responses = [MatchDateResponse.model_validate(match) for match in ordered_matches]
+    local_match_ids = [match.match_id for match in date_responses]
+    asian_handicap_rows = await OddsRepository().get_asian_handicap_for_fixtures(db, local_match_ids)
+    odds_by_match_id: dict[int, list[MatchDateAsianHandicapOdd]] = {}
+    for odds_row in asian_handicap_rows:
+        odds_by_match_id.setdefault(odds_row.fixture_id, []).append(
+            MatchDateAsianHandicapOdd(
+                selection=odds_row.selection,
+                myanmar_odd=odds_row.myanmar_odd,
+            )
+        )
+
+    return [
+        match.model_copy(
+            update={"asian_handicap_odds": odds_by_match_id.get(match.match_id, [])}
+        )
+        for match in date_responses
+    ]
 
 
 @router.get("/{match_id}/events")

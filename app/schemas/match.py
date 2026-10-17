@@ -102,6 +102,11 @@ class MatchStatisticsResponse(BaseModel):
         from_attributes = True
 
 
+class MatchDateAsianHandicapOdd(BaseModel):
+    selection: str
+    myanmar_odd: Optional[str] = None
+
+
 class MatchDateResponse(BaseModel):
     # Primary Key
     match_id: int = Field(..., description="Unique match ID (Primary Key)")
@@ -146,6 +151,10 @@ class MatchDateResponse(BaseModel):
     # Timestamps
     created_at: Optional[datetime] = Field(None, description="Creation timestamp")
     updated_at: Optional[datetime] = Field(None, description="Last update timestamp")
+    asian_handicap_odds: list[MatchDateAsianHandicapOdd] = Field(
+        default_factory=list,
+        description="Stored Asian Handicap Myanmar odds for this match",
+    )
 
     class Config:
         from_attributes = True

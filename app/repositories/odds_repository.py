@@ -11,6 +11,22 @@ class OddsRepository:
         result = await db.execute(select(Odds).where(Odds.fixture_id == fixture_id))
         return list(result.scalars().all())
 
+    async def get_asian_handicap_for_fixtures(
+        self,
+        db: AsyncSession,
+        local_match_ids: list[int],
+    ) -> list[Odds]:
+        if not local_match_ids:
+            return []
+
+        result = await db.execute(
+            select(Odds).where(
+                Odds.fixture_id.in_(local_match_ids),
+                Odds.market_name == "ASIAN_HANDICAP",
+            )
+        )
+        return list(result.scalars().all())
+
     async def get_by_match(self, db: AsyncSession, fixture_id: int) -> list[Odds]:
         return await self.get_fixture_odds(db, fixture_id)
 

@@ -840,3 +840,209 @@ def test_get_cached_odds_live_ft_set_ttl_86400():
 
     assert cache_live.set_calls == []
     assert cache_ft.set_calls == []
+
+
+def test_date_matches_batch_stored_asian_handicap_odds_by_local_match_id(monkeypatch):
+    from datetime import date
+
+    from app.api import matches as matches_api
+
+    matches = [
+        SimpleNamespace(
+            match_id=1510,
+            provider_fixture_id=91010,
+            league_id=2,
+            match_time="2026-06-10T18:00:00+00:00",
+            status="NS",
+            home_team="Home A",
+            away_team="Away A",
+            home_score=0,
+            away_score=0,
+        ),
+        SimpleNamespace(
+            match_id=1511,
+            provider_fixture_id=91011,
+            league_id=2,
+            match_time="2026-06-10T19:00:00+00:00",
+            status="NS",
+            home_team="Home B",
+            away_team="Away B",
+            home_score=0,
+            away_score=0,
+        ),
+        SimpleNamespace(
+            match_id=1512,
+            provider_fixture_id=91012,
+            league_id=2,
+            match_time="2026-06-10T20:00:00+00:00",
+            status="NS",
+            home_team="Home C",
+            away_team="Away C",
+            home_score=0,
+            away_score=0,
+        ),
+    ]
+    stored_odds = [
+        SimpleNamespace(fixture_id=1510, selection="Home -0.25", myanmar_odd="  -50 "),
+        SimpleNamespace(fixture_id=1510, selection="Away -0.25", myanmar_odd=None),
+        SimpleNamespace(fixture_id=1511, selection="Home +0.5", myanmar_odd="+25"),
+    ]
+    batch_calls = []
+
+    async def get_allowed_ids(_self, _db):
+        return {2}
+
+    async def get_matches_by_date(_self, _db, _date, allowed_ids=None):
+        assert allowed_ids == {2}
+        return matches
+
+    async def get_asian_handicap_for_fixtures(_self, _db, fixture_ids):
+        batch_calls.append(fixture_ids)
+        return stored_odds
+
+    def preserve_order(rows):
+        return rows
+
+    async def unexpected_provider_call(*_args, **_kwargs):
+        raise AssertionError("GET date endpoint must not call the provider")
+
+    async def unexpected_sync_call(*_args, **_kwargs):
+        raise AssertionError("GET date endpoint must not trigger Odds synchronization")
+
+    monkeypatch.setattr(matches_api.AllowedLeagueRepository, "get_allowed_ids", get_allowed_ids)
+    monkeypatch.setattr(matches_api.MatchRepository, "get_matches_by_date", get_matches_by_date)
+    monkeypatch.setattr(matches_api.MatchRepository, "order_matches_for_date", staticmethod(preserve_order))
+    monkeypatch.setattr(
+        matches_api.OddsRepository,
+        "get_asian_handicap_for_fixtures",
+        get_asian_handicap_for_fixtures,
+    )
+    monkeypatch.setattr(matches_api.football_service, "get_match_odds", unexpected_provider_call)
+    monkeypatch.setattr(matches_api.football_service.odds_sync_service, "refresh_odds", unexpected_sync_call)
+
+    response = asyncio.run(matches_api.get_matches_by_date(date(2026, 6, 10), object()))
+    payload = [match.model_dump(mode="json") for match in response]
+
+    assert batch_calls == [[1510, 1511, 1512]]
+    assert [match["match_id"] for match in payload] == [1510, 1511, 1512]
+    assert payload[0]["home_team"] == "Home A"
+    assert payload[0]["asian_handicap_odds"] == [
+        {"selection": "Home -0.25", "myanmar_odd": "  -50 "},
+        {"selection": "Away -0.25", "myanmar_odd": None},
+    ]
+    assert payload[1]["asian_handicap_odds"] == [
+        {"selection": "Home +0.5", "myanmar_odd": "+25"},
+    ]
+    assert payload[2]["asian_handicap_odds"] == []
+    assert all(
+        set(odd) == {"selection", "myanmar_odd"}
+        for match in payload
+        for odd in match["asian_handicap_odds"]
+    )
+
+
+def test_date_matches_without_matches_skip_odds_batch_query(monkeypatch):
+    from datetime import date
+
+    from app.api import matches as matches_api
+
+    async def get_allowed_ids(_self, _db):
+        return {2}
+
+    async def get_matches_by_date(_self, _db, _date, allowed_ids=None):
+        return []
+
+    async def unexpected_odds_query(*_args, **_kwargs):
+        raise AssertionError("Odds query must be skipped when no Matches were found")
+
+    monkeypatch.setattr(matches_api.AllowedLeagueRepository, "get_allowed_ids", get_allowed_ids)
+    monkeypatch.setattr(matches_api.MatchRepository, "get_matches_by_date", get_matches_by_date)
+    monkeypatch.setattr(
+        matches_api.OddsRepository,
+        "get_asian_handicap_for_fixtures",
+        unexpected_odds_query,
+    )
+
+    response = asyncio.run(matches_api.get_matches_by_date(date(2026, 6, 10), object()))
+
+    assert response == []
+
+
+def test_date_matches_odds_query_failure_propagates(monkeypatch):
+    from datetime import date
+
+    from app.api import matches as matches_api
+
+    match = SimpleNamespace(
+        match_id=1510,
+        league_id=2,
+        match_time="2026-06-10T18:00:00+00:00",
+        status="NS",
+        home_team="Home",
+        away_team="Away",
+        home_score=0,
+        away_score=0,
+    )
+
+    async def get_allowed_ids(_self, _db):
+        return {2}
+
+    async def get_matches_by_date(_self, _db, _date, allowed_ids=None):
+        return [match]
+
+    async def failing_odds_query(_self, _db, fixture_ids):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(matches_api.AllowedLeagueRepository, "get_allowed_ids", get_allowed_ids)
+    monkeypatch.setattr(matches_api.MatchRepository, "get_matches_by_date", get_matches_by_date)
+    monkeypatch.setattr(
+        matches_api.OddsRepository,
+        "get_asian_handicap_for_fixtures",
+        failing_odds_query,
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        asyncio.run(matches_api.get_matches_by_date(date(2026, 6, 10), object()))
+
+
+def test_odds_repository_batches_local_ids_and_filters_asian_handicap():
+    from app.repositories.odds_repository import OddsRepository
+
+    rows = [SimpleNamespace(fixture_id=1510, market_name="ASIAN_HANDICAP")]
+
+    class CapturingDB:
+        queries = []
+
+        async def execute(self, query):
+            self.queries.append(query)
+            return _FakeResult(odds_rows=rows)
+
+    db = CapturingDB()
+    result = asyncio.run(OddsRepository().get_asian_handicap_for_fixtures(db, [1510, 1511]))
+
+    assert result == rows
+    assert len(db.queries) == 1
+    query = db.queries[0]
+    assert "odds.fixture_id IN" in str(query)
+    assert "odds.market_name =" in str(query)
+    params = query.compile().params
+    assert [value for value in params.values() if isinstance(value, list)] == [[1510, 1511]]
+    assert "ASIAN_HANDICAP" in params.values()
+
+
+def test_odds_repository_empty_batch_skips_database_query():
+    from app.repositories.odds_repository import OddsRepository
+
+    class CapturingDB:
+        queries = []
+
+        async def execute(self, query):
+            self.queries.append(query)
+            return _FakeResult(odds_rows=[])
+
+    db = CapturingDB()
+
+    result = asyncio.run(OddsRepository().get_asian_handicap_for_fixtures(db, []))
+
+    assert result == []
+    assert db.queries == []
