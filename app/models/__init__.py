@@ -12,6 +12,7 @@ from app.models.standing import Standings
 from app.models.odds import Odds
 from app.models.match_lineup import MatchLineup
 from app.models.match_h2h import MatchH2H
+from app.models.h2h_sync_work import H2HSyncWork
 from app.models.match_event import MatchEvent
 from app.models.match_statistics import MatchStatistics
 from app.models.lineup_refresh_state import LineupRefreshState

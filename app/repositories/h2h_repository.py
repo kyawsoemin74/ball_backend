@@ -1,4 +1,4 @@
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,10 +14,12 @@ class H2HRepository:
         await db.execute(delete(MatchH2H).where(MatchH2H.h2h_key == h2h_key))
 
     async def upsert_one(self, db: AsyncSession, h2h_key: str, data: list[dict]) -> MatchH2H:
-        insert_stmt = pg_insert(MatchH2H).values({"h2h_key": h2h_key, "data": data})
+        insert_stmt = pg_insert(MatchH2H).values(
+            {"h2h_key": h2h_key, "data": data, "updated_at": func.now()}
+        )
         upsert_stmt = insert_stmt.on_conflict_do_update(
             constraint="match_h2h_h2h_key_key",
-            set_={"data": insert_stmt.excluded.data},
+            set_={"data": insert_stmt.excluded.data, "updated_at": func.now()},
         )
         await db.execute(upsert_stmt)
 

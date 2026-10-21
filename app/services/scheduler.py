@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED, EVENT_JOB_MISSED, EVENT_JOB_SUBMITTED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -17,6 +18,7 @@ from app.models.odds import Odds
 from app.models.league_identity_recovery import LeagueIdentityRecovery
 from app.monitoring import SCHEDULER_JOB_ERRORS, SCHEDULER_JOB_RUNS
 from app.repositories.lineup_refresh_state_repository import LineupRefreshStateRepository
+from app.repositories.h2h_sync_work_repository import H2HSyncWorkRepository
 from app.repositories.league_identity_recovery_repository import LeagueIdentityRecoveryRepository
 from app.repositories.match_finalization_repository import (
     FINALIZATION_MAX_ATTEMPTS,
@@ -62,6 +64,11 @@ EVENT_REFRESH_ALLOWED_STATUSES = {"1H", "HT", "2H", "LIVE"}
 EVENT_REFRESH_INTERVAL_SECONDS = 300
 STATISTICS_REFRESH_ALLOWED_STATUSES = {"1H", "HT", "2H", "LIVE"}
 STATISTICS_REFRESH_BLOCKED_STATUSES = {"NS", "FT", "AET", "PEN", "PST", "CANC", "ABD", "AWD", "WO"}
+H2H_MAX_UPCOMING_WORKS = 90
+H2H_MAX_PAST_WORKS = 10
+H2H_MAX_WORKS_PER_RUN = 100
+H2H_WORK_RETRY_DELAY = timedelta(hours=6)
+H2H_WORK_LEASE_DURATION = timedelta(hours=2)
 ODDS_REFRESH_ELIGIBLE_STATUSES = {"NS", "TBD", "PST"}
 ODDS_REFRESH_STOP_STATUSES = {"LIVE", "HT", "FT", "AET", "PEN", "CANC", "ABD", "AWD", "WO"}
 ODDS_REFRESH_MAX_AGE = timedelta(hours=12)
@@ -458,7 +465,27 @@ class LiveUpdateScheduler:
             result = getattr(event, "retval", None)
             summary = {}
             if isinstance(result, dict):
-                for key in ("success", "updated", "synced_matches", "partial_matches", "failed_matches", "processed_matches"):
+                for key in (
+                    "success",
+                    "updated",
+                    "candidate_matches",
+                    "discovered",
+                    "enqueued",
+                    "pending_before",
+                    "selected_upcoming",
+                    "selected_past",
+                    "processing",
+                    "processing_recovered",
+                    "synced_matches",
+                    "empty",
+                    "retried",
+                    "lock_skipped",
+                    "provider_calls",
+                    "duration_seconds",
+                    "partial_matches",
+                    "failed_matches",
+                    "processed_matches",
+                ):
                     if key in result:
                         summary[key] = result[key]
             logger.info("SCHEDULER_JOB_COMPLETED job=%s result=%s", job_id, summary)
@@ -1972,13 +1999,37 @@ class LiveUpdateScheduler:
             return metrics
 
     async def _refresh_h2h_job(self):
-        metrics = {"candidate_matches": 0, "synced_matches": 0, "skipped_matches": 0, "failed_matches": 0}
+        metrics = {
+            "candidate_matches": 0,
+            "discovered": 0,
+            "enqueued": 0,
+            "pending_before": 0,
+            "selected_upcoming": 0,
+            "selected_past": 0,
+            "processing_recovered": 0,
+            "processing": 0,
+            "duration_seconds": 0.0,
+            "success": 0,
+            "empty": 0,
+            "failed": 0,
+            "retried": 0,
+            "lock_skipped": 0,
+            "provider_calls": 0,
+            "synced_matches": 0,
+            "skipped_matches": 0,
+            "failed_matches": 0,
+        }
         now = datetime.now(timezone.utc)
+        started_at = time.monotonic()
         window_start = now - timedelta(days=7)
         window_end = now + timedelta(days=7)
+        repository = H2HSyncWorkRepository()
 
         try:
             async with async_session() as db:
+                metrics["processing_recovered"] = await repository.recover_expired_processing(db, now)
+                await db.commit()
+
                 result = await db.execute(
                     select(Match)
                     .outerjoin(
@@ -2004,66 +2055,239 @@ class LiveUpdateScheduler:
                         )
                     )
                     .order_by(Match.match_time.asc(), Match.local_match_id.asc())
-                    .limit(100)
                 )
                 candidates = list(result.scalars().all())
-                metrics["candidate_matches"] = len(candidates)
-                processed_pairs = set()
+                metrics["candidate_matches"] = metrics["discovered"] = len(candidates)
+                metrics["enqueued"] = await repository.enqueue_discovered(db, candidates)
+                await db.commit()
 
-                for match in candidates:
-                    local_match_id = int(match.local_match_id)
-                    team_pair = tuple(sorted((int(match.home_team_id), int(match.away_team_id))))
-                    if team_pair in processed_pairs:
-                        metrics["skipped_matches"] += 1
-                        continue
-                    processed_pairs.add(team_pair)
+                metrics["pending_before"] = await repository.count_due(db, now)
+                upcoming = await repository.claim_due(
+                    db,
+                    now=now,
+                    lease_expires_at=now + H2H_WORK_LEASE_DURATION,
+                    upcoming=True,
+                    limit=H2H_MAX_UPCOMING_WORKS,
+                )
+                past = await repository.claim_due(
+                    db,
+                    now=now,
+                    lease_expires_at=now + H2H_WORK_LEASE_DURATION,
+                    upcoming=False,
+                    limit=H2H_MAX_PAST_WORKS,
+                )
+                remaining_capacity = H2H_MAX_WORKS_PER_RUN - len(upcoming) - len(past)
+                if remaining_capacity and len(upcoming) < H2H_MAX_UPCOMING_WORKS:
+                    additional_past = await repository.claim_due(
+                        db,
+                        now=now,
+                        lease_expires_at=now + H2H_WORK_LEASE_DURATION,
+                        upcoming=False,
+                        limit=remaining_capacity,
+                    )
+                    past.extend(additional_past)
 
+                remaining_capacity = H2H_MAX_WORKS_PER_RUN - len(upcoming) - len(past)
+                if remaining_capacity and len(past) < H2H_MAX_PAST_WORKS:
+                    additional_upcoming = await repository.claim_due(
+                        db,
+                        now=now,
+                        lease_expires_at=now + H2H_WORK_LEASE_DURATION,
+                        upcoming=True,
+                        limit=remaining_capacity,
+                    )
+                    upcoming.extend(additional_upcoming)
+
+                await db.commit()
+                metrics["selected_upcoming"] = len(upcoming)
+                metrics["selected_past"] = len(past)
+                metrics["processing"] = len(upcoming) + len(past)
+
+                selected = upcoming + past
+                work_by_pair = {}
+                for work in selected:
+                    work_by_pair.setdefault(work["pair_key"], []).append(work)
+
+                for pair_key, pair_work in work_by_pair.items():
+                    primary = pair_work[0]
+                    local_match_id = primary["local_match_id"]
+                    outcome_result = {}
+                    invalidation_ids = []
                     try:
                         async def sync_h2h() -> dict:
-                            result = await football_service.refresh_h2h(db=db, match_id=local_match_id)
-                            if "error" in result:
-                                await db.rollback()
-                                return result
-                            await db.commit()
-                            try:
-                                await self.cache_service.delete(
-                                    make_cache_key("match", "h2h", str(local_match_id))
+                            pair_result = await db.execute(
+                                select(MatchH2H).where(MatchH2H.h2h_key == pair_key)
+                            )
+                            existing_h2h = pair_result.scalar_one_or_none()
+                            finished_at = datetime.now(timezone.utc)
+                            if (
+                                existing_h2h is not None
+                                and existing_h2h.updated_at is not None
+                                and existing_h2h.updated_at >= finished_at - timedelta(hours=24)
+                            ):
+                                h2h_data = existing_h2h.data
+                            else:
+                                refresh_result = await football_service.refresh_h2h(
+                                    db=db,
+                                    match_id=local_match_id,
                                 )
-                            except Exception:
-                                logger.exception(
-                                    "H2H_REFRESH_CACHE_INVALIDATION_FAILED local_match_id=%s",
+                                metrics["provider_calls"] += 1
+                                if "error" in refresh_result:
+                                    await db.rollback()
+                                    return refresh_result
+                                h2h_data = refresh_result.get("data")
+                            if not isinstance(h2h_data, list):
+                                raise ValueError("H2H sync returned an invalid data payload")
+                            outcome = "EMPTY" if not h2h_data else "SUCCESS"
+                            if outcome == "EMPTY":
+                                claimed = await repository.mark_empty(
+                                    db,
                                     local_match_id,
+                                    primary["claim_token"],
+                                    finished_at,
                                 )
-                            return result
+                            else:
+                                claimed = await repository.mark_success(
+                                    db,
+                                    local_match_id,
+                                    primary["claim_token"],
+                                    finished_at,
+                                    len(h2h_data),
+                                )
+                            if not claimed:
+                                raise RuntimeError("H2H work claim is no longer owned by this worker")
+
+                            sibling_ids = await repository.complete_pair_siblings(
+                                db,
+                                pair_key=pair_key,
+                                exclude_local_match_id=local_match_id,
+                                outcome=outcome,
+                                now=finished_at,
+                                outcome_count=len(h2h_data),
+                                selected_claims=pair_work,
+                            )
+                            invalidation_ids.extend(
+                                [local_match_id, *(work["local_match_id"] for work in pair_work[1:]), *sibling_ids]
+                            )
+                            await db.commit()
+                            return {"outcome": outcome, "data": h2h_data}
+
+                        async def sync_with_pair_lock():
+                            pair_locked, pair_result = await run_with_resource_lock(
+                                db,
+                                "h2h_pair",
+                                pair_key,
+                                sync_h2h,
+                            )
+                            if not pair_locked:
+                                return {"pair_lock_skipped": True}
+                            return pair_result
 
                         locked, refresh_result = await run_with_resource_lock(
                             db,
                             "h2h",
                             str(local_match_id),
-                            sync_h2h,
+                            sync_with_pair_lock,
                         )
-                        if not locked:
-                            metrics["skipped_matches"] += 1
+                        if not locked or (
+                            isinstance(refresh_result, dict)
+                            and refresh_result.get("pair_lock_skipped")
+                        ):
+                            for work in pair_work:
+                                await repository.release_claim(
+                                    db,
+                                    work["local_match_id"],
+                                    work["claim_token"],
+                                    now,
+                                )
+                            await db.commit()
+                            metrics["lock_skipped"] += len(pair_work)
+                            metrics["skipped_matches"] += len(pair_work)
                             logger.info(
                                 "H2H_REFRESH_SKIPPED local_match_id=%s reason=resource_lock_not_acquired",
                                 local_match_id,
                             )
                         elif "error" in refresh_result:
-                            metrics["failed_matches"] += 1
-                            logger.error("H2H_REFRESH_FAILED local_match_id=%s", local_match_id)
+                            outcome_result = refresh_result
                         else:
-                            metrics["synced_matches"] += 1
-                            logger.info("H2H_REFRESH_SYNCED local_match_id=%s", local_match_id)
-                    except Exception:
+                            outcome_result = refresh_result
+
+                        if locked and "error" in outcome_result:
+                            error_code = str(outcome_result.get("error", "provider_failure"))
+                            for work in pair_work:
+                                await repository.mark_failed(
+                                    db,
+                                    work["local_match_id"],
+                                    work["claim_token"],
+                                    datetime.now(timezone.utc),
+                                    error_code,
+                                    error_code,
+                                    int(H2H_WORK_RETRY_DELAY.total_seconds()),
+                                )
+                            await db.commit()
+                            metrics["failed"] += len(pair_work)
+                            metrics["retried"] += len(pair_work)
+                            metrics["failed_matches"] += len(pair_work)
+                            logger.error("H2H_REFRESH_FAILED local_match_id=%s", local_match_id)
+                        elif locked and outcome_result:
+                            for cache_match_id in dict.fromkeys(invalidation_ids):
+                                try:
+                                    await self.cache_service.delete(
+                                        make_cache_key("match", "h2h", str(cache_match_id))
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "H2H_REFRESH_CACHE_INVALIDATION_FAILED local_match_id=%s",
+                                        cache_match_id,
+                                    )
+                            if outcome_result["outcome"] == "EMPTY":
+                                metrics["empty"] += len(pair_work)
+                            else:
+                                metrics["success"] += len(pair_work)
+                            metrics["synced_matches"] += len(pair_work)
+                            logger.info(
+                                "H2H_REFRESH_%s local_match_id=%s pair_key=%s work_count=%s",
+                                outcome_result["outcome"],
+                                local_match_id,
+                                pair_key,
+                                len(pair_work),
+                            )
+                    except Exception as exc:
+                        if getattr(exc, "h2h_provider_called", False):
+                            metrics["provider_calls"] += 1
                         await db.rollback()
-                        metrics["failed_matches"] += 1
+                        failure_time = datetime.now(timezone.utc)
+                        try:
+                            for work in pair_work:
+                                await repository.mark_failed(
+                                    db,
+                                    work["local_match_id"],
+                                    work["claim_token"],
+                                    failure_time,
+                                    type(exc).__name__,
+                                    str(exc) or "H2H work processing failed",
+                                    int(H2H_WORK_RETRY_DELAY.total_seconds()),
+                                )
+                            await db.commit()
+                        except Exception:
+                            await db.rollback()
+                            logger.exception(
+                                "H2H_REFRESH_FAILURE_STATE_PERSIST_FAILED local_match_id=%s",
+                                local_match_id,
+                            )
+                        metrics["failed"] += len(pair_work)
+                        metrics["retried"] += len(pair_work)
+                        metrics["failed_matches"] += len(pair_work)
                         logger.exception("H2H_REFRESH_FAILED local_match_id=%s", local_match_id)
 
+                metrics["failed_matches"] = metrics["failed"]
+                metrics["duration_seconds"] = round(time.monotonic() - started_at, 3)
                 SCHEDULER_JOB_RUNS.labels(job="refresh_h2h").inc()
                 logger.info("H2H_REFRESH_COMPLETE metrics=%s", metrics)
                 return metrics
         except Exception:
             SCHEDULER_JOB_ERRORS.labels(job="refresh_h2h").inc()
+            metrics["duration_seconds"] = round(time.monotonic() - started_at, 3)
             logger.exception("Error in H2H refresh job")
             return metrics
 

@@ -18,6 +18,7 @@ from app.models.match_h2h import MatchH2H
 from app.models.match_lineup import MatchLineup
 from app.models.odds import Odds
 from app.repositories.allowed_league_repository import AllowedLeagueRepository
+from app.repositories.h2h_sync_work_repository import H2HSyncWorkRepository
 from app.repositories.match_repository import MatchRepository
 from app.schemas.match import (
     MatchDateAsianHandicapOdd,
@@ -396,24 +397,53 @@ async def refresh_h2h_route(
             await db.rollback()
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="H2H provider refresh failed")
 
+        outcome_data = result.get("data")
+        outcome_count = len(outcome_data) if isinstance(outcome_data, list) else 1
+        team_ids = sorted((int(home_team_id), int(away_team_id)))
+        completed_at = datetime.now(timezone.utc)
+        sibling_ids = await H2HSyncWorkRepository().complete_manual(
+            db,
+            local_match_id=match_id,
+            pair_key=f"{team_ids[0]}-{team_ids[1]}",
+            match_time=getattr(match, "match_time", None) or completed_at,
+            now=completed_at,
+            outcome_count=outcome_count,
+        )
         await db.commit()
         analytics = result.get("analytics")
         if analytics:
             log_projection_transaction(analytics, "committed")
             analytics = dict(analytics)
             analytics["transaction_outcome"] = "committed"
-        try:
-            await CacheService().delete(make_cache_key("match", "h2h", str(match_id)))
-        except Exception:
-            logger.exception("H2H refresh cache invalidation failed", extra={"match_id": match_id})
+        for cache_match_id in dict.fromkeys([match_id, *sibling_ids]):
+            try:
+                await CacheService().delete(
+                    make_cache_key("match", "h2h", str(cache_match_id))
+                )
+            except Exception:
+                logger.exception(
+                    "H2H refresh cache invalidation failed",
+                    extra={"match_id": cache_match_id},
+                )
         return {"success": True, "updated": result.get("updated", False), "analytics": analytics}
+
+    async def refresh_with_pair_lock() -> dict:
+        pair_locked, result = await run_with_resource_lock(
+            db,
+            "h2h_pair",
+            f"{min(int(home_team_id), int(away_team_id))}-{max(int(home_team_id), int(away_team_id))}",
+            refresh,
+        )
+        if not pair_locked:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="H2H pair refresh already in progress")
+        return result
 
     try:
         locked, result = await run_with_resource_lock(
             db,
             "h2h",
             str(match_id),
-            refresh,
+            refresh_with_pair_lock,
         )
     except HTTPException:
         raise

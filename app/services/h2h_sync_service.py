@@ -90,24 +90,42 @@ class H2HSyncService:
             raise ValueError("invalid provider team identity for H2H refresh")
 
         provider_h2h_key = f"{provider_ids[0]}-{provider_ids[1]}"
-        api_res = await self.h2h_provider.get_h2h_by_team_ids(provider_ids[0], provider_ids[1])
+        try:
+            api_res = await self.h2h_provider.get_h2h_by_team_ids(
+                provider_ids[0],
+                provider_ids[1],
+            )
+        except Exception as exc:
+            setattr(exc, "h2h_provider_called", True)
+            raise
         if not api_res or "response" not in api_res:
             log_projection_failure("h2h", {"local_match_id": local_match_id, "provider_h2h_key": provider_h2h_key}, "provider_failure")
             return {"error": "API error"}
 
-        h2h_data = api_res["response"]
-        if not isinstance(h2h_data, list):
-            raise ValueError("Invalid H2H provider response")
+        try:
+            h2h_data = api_res["response"]
+            if not isinstance(h2h_data, list):
+                raise ValueError("Invalid H2H provider response")
 
-        local_ids = sorted(int(team.team_id) for team in local_teams)
-        canonical_source_key = f"{local_ids[0]}-{local_ids[1]}"
-        await self.h2h_repository.upsert_one(db, canonical_source_key, h2h_data)
-        await db.flush()
+            local_ids = sorted(int(team.team_id) for team in local_teams)
+            canonical_source_key = f"{local_ids[0]}-{local_ids[1]}"
+            await self.h2h_repository.upsert_one(db, canonical_source_key, h2h_data)
+            await db.flush()
 
-        projection = await self.analytics_projection_service.project_h2h(
-            db, provider_ids[0], provider_ids[1], h2h_data
-        )
-        if not projection["success"]:
-            raise ValueError(f"H2H analytics projection rejected: {projection.get('reason', 'reconciliation failure')}")
+            projection = await self.analytics_projection_service.project_h2h(
+                db, provider_ids[0], provider_ids[1], h2h_data
+            )
+            if not projection["success"]:
+                raise ValueError(f"H2H analytics projection rejected: {projection.get('reason', 'reconciliation failure')}")
+        except Exception as exc:
+            setattr(exc, "h2h_provider_called", True)
+            raise
 
-        return {"source": "api", "data": h2h_data, "cached": False, "updated": True, "analytics": projection}
+        return {
+            "source": "api",
+            "data": h2h_data,
+            "outcome": "EMPTY" if not h2h_data else "SUCCESS",
+            "cached": False,
+            "updated": True,
+            "analytics": projection,
+        }
