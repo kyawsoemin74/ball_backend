@@ -2,16 +2,16 @@
 
 **Phase:** 2 — design only  
 **Date:** 2026-10-29  
-**Status:** Proposed design; decisions marked for approval below  
+**Status:** H2H v2 summary amendment implemented; H2H analytics local-side identity design frozen (2026-10-29; design only)
 **Primary evidence:** [Phase 1 H2H Local Team ID Consistency Audit](./H2H_LOCAL_TEAM_ID_CONSISTENCY_AUDIT.md)
 
-> This document defines a proposed implementation contract. It does not authorize or perform implementation. No source, tests, database, cache, queue, provider, or production state was changed in this phase.
+> This document retains the earlier Phase 2 response-contract proposal and approval history. The final analytics identity freeze in Section 16 is controlling for H2H analytics persistence and supersedes earlier statements that analytics schema changes were out of scope or unnecessary. It authorizes design only, not implementation. The additive v2 summary amendment is documented in [H2H v2 Summary Design Amendment](./H2H_V2_SUMMARY_DESIGN_AMENDMENT.md); its implementation approval is limited to that amendment.
 
 ## 1. Executive Summary
 
 Phase 1's confirmed issue remains present in current source: the Flutter API-Football parser reads provider team IDs from historical fixtures, then compares them to local team IDs supplied from match detail when calculating team names, wins, and goals. In the observed local pair, local IDs are `97/98` while provider IDs are `5/774`.
 
-The backend already has the required canonical mapping: `teams.team_id` is the local ID and `(teams.provider, teams.provider_id)` is the unique provider identity. H2H sync resolves current match teams through this Team master, and the analytics projection already resolves provider IDs back to local IDs. The smallest correction is to put equivalent historical-fixture normalization and summary calculation in the backend read Service.
+The backend already has the canonical mapping: `teams.team_id` is the local ID and `(teams.provider, teams.provider_id)` is the unique provider identity. H2H sync resolves the requested current pair through this Team master. The existing analytics projection maps that requested pair to local IDs, but stores each historical fixture's home/away IDs only as provider IDs; it does not resolve those fixture sides before persistence. Section 16 freezes the additive analytics storage and validation design for those local fixture-side identities.
 
 Replacing the existing bare provider-shaped response would break the current Flutter parser and potentially undocumented consumers. Therefore, the recommended rollout is:
 
@@ -21,7 +21,40 @@ Replacing the existing bare provider-shaped response would break the current Flu
 4. Align match-detail `has_h2h` with whether the v2 response contains displayable, locally mapped meetings.
 5. Keep raw provider JSON storage, analytics projection, durable queue, transaction ownership, and post-commit cache invalidation unchanged.
 
-The response/status choices and summary eligibility rules below are ready for explicit approval. Phase 3 implementation must not begin until the user approves this freeze.
+The original response/status choices and summary eligibility rules below were
+recorded as awaiting explicit approval. The additive summary amendment has
+since been approved and implemented as documented above; that approval is
+limited to the amendment's stated scope.
+
+### Approved H2H v2 summary amendment (2026-10-29)
+
+The approved additive amendment adds six integer aliases to the existing
+`summary` object without replacing `summary.home`, `summary.away`, or
+`summary.included_meeting_count`:
+
+| Field | Meaning |
+|---|---|
+| `total_matches` | `included_meeting_count` |
+| `home_win` | Eligible wins by the current local home team |
+| `draw` | Eligible draws between the requested teams |
+| `away_win` | Eligible wins by the current local away team |
+| `home_goals` | Eligible goals-for total for the current local home team |
+| `away_goals` | Eligible goals-for total for the current local away team |
+
+These values reuse the existing normalized counters in
+`H2HService._normalize_h2h_data()`. Required invariants are
+`total_matches = home_win + draw + away_win`,
+`summary.home.draws = summary.away.draws = draw`, and goals equal the matching
+nested `goals_for` values. Historical fixture orientation is mapped to local
+team identity before attribution, so reversed fixtures remain correct.
+Eligibility, persistence, v1 compatibility, cache behavior, and the other
+boundaries in this freeze remain unchanged.
+
+Implementation is recorded in `app/services/h2h_service.py`,
+`app/schemas/h2h_v2.py`, and `tests/test_h2h_v2.py`. The focused H2H v2 tests
+passed (17 tests); adjacent H2H/provider/sync/scheduler tests passed (42 tests).
+No database schema or migration, provider/sync/queue behavior, cache contract,
+or frontend change was introduced.
 
 ## 2. Pre-Design Verification
 
@@ -512,4 +545,147 @@ No changes to provider transport, current H2H SyncService, result/analytics/queu
 6. Flutter consumes backend totals, keeps the current UI shape/behavior, and never compares provider IDs with local IDs.
 7. Main remaining approvals are the v2 contract, summary status policy, empty/unmappable semantics, v1 lifetime, Redis contract, and whether a stable meeting identifier is required.
 
-**Implementation is not authorized by this design document. Wait for explicit approval before Phase 3.**
+**The additive summary amendment is approved and implemented. Changes outside that amendment's scope continue to require explicit approval.**
+
+## 16. Final Design Freeze — Analytics Local Fixture-Side Identity
+
+**Status:** FROZEN — design only
+**Date:** 2026-10-29
+**Implementation authorization:** The user separately authorized the implementation phase on 2026-10-30. This does not change the frozen design decisions.
+
+This section freezes the required analytics identity behavior for historical H2H fixtures. It controls over earlier sections that described analytics persistence or schema changes as unchanged, out of scope, or unnecessary. It does not revise either public GET response contract.
+
+### 16.1 Evidence and verified current state
+
+**VERIFIED FROM SOURCE**
+
+- `matches.local_match_id` and `teams.team_id` are local primary keys. `matches.provider_fixture_id` and `teams.provider_id` are provider identities; Team provider identity is scoped by `teams.provider`. See [`app/models/match.py`](../app/models/match.py), [`app/models/team.py`](../app/models/team.py), and [`app/repositories/team_repository.py`](../app/repositories/team_repository.py).
+- `analytics_h2h_snapshots.team_low_id` and `team_high_id` are non-null foreign keys to `teams.team_id`. `ck_analytics_h2h_team_order` requires low < high. `uq_analytics_h2h_business` uniquely identifies `(source_provider, team_low_id, team_high_id, source_fixture_id)`. Existing `home_provider_team_id` and `away_provider_team_id` are non-null provider-ID columns, not Team foreign keys. See [`app/models/analytics.py`](../app/models/analytics.py) and [`alembic/versions/20260824_create_analytics_v1.py`](../alembic/versions/20260824_create_analytics_v1.py).
+- Existing indexes are the primary-key index, `ix_analytics_h2h_pair(team_low_id, team_high_id)`, `ix_analytics_h2h_source_fixture(source_provider, source_fixture_id)`, and the unique business-key index. No fixture-side local identity columns or indexes currently exist.
+- `AnalyticsProjectionService.project_h2h()` resolves the requested pair using `TeamRepository.find_by_provider_identity()`, stores that pair as sorted local IDs, and copies each historical fixture's provider side IDs into provider-named columns. It currently does not resolve or validate the historical fixture sides before writing. `AnalyticsH2HRepository.replace_by_pair()` replaces all analytics rows for that local pair. See [`app/services/analytics_projection_service.py`](../app/services/analytics_projection_service.py) and [`app/repositories/analytics_repository.py`](../app/repositories/analytics_repository.py).
+- Automatic and manual refresh both call the shared `H2HSyncService` and projection. The manual route owns commit/rollback; the scheduler also owns its transactions. The scheduler has a 24-hour raw-data reuse path, which can skip a new projection. See [`app/services/h2h_sync_service.py`](../app/services/h2h_sync_service.py), [`app/api/matches.py`](../app/api/matches.py), and [`app/services/scheduler.py`](../app/services/scheduler.py).
+- Raw provider JSON is stored separately in `match_h2h.data`. It is upserted by the canonical local Team-pair key and is returned unchanged by the legacy raw GET. New analytics columns must not rewrite this JSON or alter the legacy response.
+- In a read-only inspection of the configured local `fover_db` (`public`, loopback PostgreSQL), the analytics table had 18 rows. Exact provider-scoped joins resolved both fixture-side provider IDs for all 18 rows, and all 18 mapped sides matched their stored canonical local pair in either orientation; unresolved sides and pair mismatches were zero. No backfill was executed. This is evidence for that local snapshot only, not for production or another target.
+- The configured local database's Alembic revision was `20261009_odds_retry_state`; the repository's single Alembic head was `20261020_h2h_sync_work`. The intended deployment database and its data coverage remain unverified. Confirm the target and repeat read-only preflight there before planning deployment.
+
+### 16.2 Frozen schema specification
+
+Modify the existing `analytics_h2h_snapshots` table. Do not create another table.
+
+| Column | Type | Nullability | Meaning |
+|---|---|---|---|
+| `home_local_team_id` | `INTEGER` | Nullable for legacy unresolved rows; required for every newly projected fixture | Local `teams.team_id` resolved from this fixture's provider home Team ID |
+| `away_local_team_id` | `INTEGER` | Nullable for legacy unresolved rows; required for every newly projected fixture | Local `teams.team_id` resolved from this fixture's provider away Team ID |
+
+Add these integrity rules:
+
+1. `home_local_team_id` references `teams.team_id` with `ON DELETE RESTRICT`; name the FK `fk_analytics_h2h_home_local_team`.
+2. `away_local_team_id` references `teams.team_id` with `ON DELETE RESTRICT`; name the FK `fk_analytics_h2h_away_local_team`.
+3. Add a check constraint, proposed name `ck_analytics_h2h_local_sides_match_pair`, requiring either **both** local-side columns to be NULL, or both to be non-NULL, distinct, and equal to the canonical pair in either orientation:
+
+   ```sql
+   (
+     home_local_team_id IS NULL AND away_local_team_id IS NULL
+   )
+   OR
+   (
+     home_local_team_id IS NOT NULL
+     AND away_local_team_id IS NOT NULL
+     AND home_local_team_id <> away_local_team_id
+     AND LEAST(home_local_team_id, away_local_team_id) = team_low_id
+     AND GREATEST(home_local_team_id, away_local_team_id) = team_high_id
+   )
+   ```
+
+4. Keep `team_low_id`, `team_high_id`, their existing foreign keys/check, and `uq_analytics_h2h_business` unchanged. Keep both provider-side columns and their values unchanged.
+5. Add no new index in this migration. Existing analytics reads are pair-scoped through `ix_analytics_h2h_pair`; add a fixture-side index only if a separately evidenced query requires it.
+
+The columns remain nullable to preserve historical analytics rows whose provider identities cannot be verified. For all **new** projection writes, both fields are mandatory by application validation; NULL in both fields is reserved for pre-existing rows that could not be safely backfilled. The check constraint prevents one-sided NULLs and pair/orientation contradictions.
+
+### 16.3 Frozen identity-resolution and sync policy
+
+For each historical fixture, the shared projection must:
+
+1. Validate the provider home and away IDs are present and valid.
+2. Resolve each through the existing Team Master lookup scoped by `source_provider` (for this integration, `api-football`), never by name or numeric equality.
+3. Reject missing or ambiguous mappings.
+4. Require the two resolved local Team IDs to be distinct and their unordered set to equal `(team_low_id, team_high_id)`.
+5. Persist the resolved values to `home_local_team_id` and `away_local_team_id` in the fixture's original Home/Away orientation. Preserve original provider IDs in `home_provider_team_id`, `away_provider_team_id`, and the raw JSON.
+
+**Unresolved identity policy — FROZEN:** if any fixture in a refresh is missing an ID, has an invalid/ambiguous/unresolved provider mapping, or resolves outside the requested local pair, reject the complete analytics projection for that response. Do not insert or replace a partial or misattributed analytics set. Raise a typed, observable projection failure; the outer API or scheduler transaction rolls back raw upsert and analytics work together, preserving the prior committed source and projection. Log provider, fixture ID when available, failure category, and affected local pair without treating row counts alone as successful identity validation.
+
+Automatic and manual refresh must use the same projection and rejection policy. The scheduler's existing 24-hour raw-data reuse shortcut may not mark work complete while analytics rows for the pair have NULL or invalid local-side identities; it must cause the shared projection to run against the stored raw payload first. If that projection cannot resolve identities, retain existing committed rows, report the failure, and follow the existing retry/transaction policy rather than reporting H2H success.
+
+### 16.4 Existing-record backfill and reporting
+
+Backfill only through exact, provider-scoped Team Master mappings:
+
+```text
+analytics.source_provider = teams.provider
+teams.provider_id = textual form of the stored provider-side ID
+```
+
+Populate local sides only when both provider-side IDs resolve to distinct local Teams and those two local IDs match the row's stored `team_low_id` / `team_high_id` pair in either orientation. Never use team names, provider/local numeric equality, external assumptions, or an unverified example mapping.
+
+- If both sides resolve and match the canonical pair, set both local columns, preserving home/away order.
+- If either side is missing, invalid, ambiguous, or the resolved pair conflicts with the row's canonical pair, preserve the analytics row and leave **both** local columns NULL. Report it as an unresolved legacy record using a read-only count/query and deployment logs. Do not delete, silently guess, or rewrite its provider IDs.
+- The migration remains nullable and succeeds with unresolved legacy rows; report resolved, unresolved, and pair-mismatch counts. The application rejects equivalent conditions for new projections, so NULL is not a valid new-write outcome.
+
+The current local database snapshot had 18/18 rows exactly mappable and pair-consistent. That does not establish that a deployment database has the same coverage. The migration/backfill must be evaluated using a backup and preflight on the confirmed target.
+
+### 16.5 Migration and rollback plan
+
+**Required schema change:** one new additive Alembic revision that adds the two nullable integer columns, both Team foreign keys, the paired-null/pair-consistency check, and the exact-match backfill described above. No new table and no change to the raw H2H table are approved.
+
+The repository currently has a single head, `20261020_h2h_sync_work`; the new revision should descend from the repository head when implemented. For the inspected local database at `20261009_odds_retry_state`, the already-existing unapplied ancestors are `20261017_odds_giving_team` and then `20261020_h2h_sync_work`; those must precede the new revision if that database is the approved target. Do not assume another environment has the same revision. Confirm its current revision and migration graph before producing a deployment command.
+
+Deployment safeguards for a future, separately approved implementation:
+
+1. Confirm the destination database/environment with its owner; the locally configured loopback `fover_db` is not established as production.
+2. Take and verify a restorable backup. Record current Alembic revision, target table row count, provider-scoped mapping coverage, pair mismatches, and duplicate business keys.
+3. Pause automatic H2H scheduler execution and manual H2H writes during schema/backfill rollout. Do not run old writers after migration and before code that populates both local-side columns is deployed.
+4. Apply the pending migration chain to the new revision, deploy the compatible implementation, verify column/FK/check presence and backfill counts, then resume sync writers.
+5. Keep rollback code-compatible by preferring application rollback while retaining the additive schema. A schema downgrade would drop both new identity values/columns and their constraints; it does not delete analytics rows, but it loses the resolved local-side associations. Restore from backup or re-backfill only through verified mappings if those values must be recovered. Never use Alembic stamp to conceal unapplied schema.
+
+### 16.6 Expected persisted values
+
+Illustrative only; `172`, `180`, and the provider values below are not verified mappings:
+
+| Field | Home 172 / Away 180 fixture |
+|---|---|
+| `team_low_id` | `172` |
+| `team_high_id` | `180` |
+| `home_local_team_id` | `172` |
+| `away_local_team_id` | `180` |
+| `home_provider_team_id` | Original provider Home ID, unchanged |
+| `away_provider_team_id` | Original provider Away ID, unchanged |
+
+For the reverse fixture orientation, canonical pair columns remain `172`/`180`; `home_local_team_id` becomes `180` and `away_local_team_id` becomes `172`. Provider-side columns remain the original provider IDs in that same reversed orientation.
+
+### 16.7 Risks, assumptions, and unresolved evidence
+
+- **Target-specific backfill remains unverified:** only the configured local database was inspected. The 18/18 result is not a production claim.
+- **Provider identity ambiguity:** the Team model has a unique `(provider, provider_id)` constraint and the repository raises on multiple rows, but migration preflight must still detect historical anomalies and abort/leave unresolved rather than select arbitrarily.
+- **Replacement semantics:** analytics persistence deletes/replaces a pair. The frozen all-or-nothing projection requirement is necessary so a bad fixture cannot delete good rows and publish a partial set.
+- **Scheduler freshness:** the current shortcut can skip projection for recent raw data; implementation must gate success on local-side analytics completeness as specified above.
+- **Index performance:** no current query uses local fixture-side columns; query-plan or workload evidence may later justify indexes, but no index decision blocks this freeze.
+- **API compatibility:** legacy raw-list and v2 normalized response shapes remain unchanged. The new columns are internal persistence fields, not approved response additions.
+
+No unresolved design choice blocks this scoped freeze. The deployment target's exact data coverage, runtime behavior, and migration outcome are evidence still to collect before implementation/deployment; they are not presumed facts or a reason to weaken the frozen identity rules.
+
+### 16.8 Implementation acceptance criteria
+
+Implementation is acceptable only when all of the following hold:
+
+1. The migration modifies `analytics_h2h_snapshots` only for this feature; no new H2H table is added.
+2. Both new columns have the specified type, paired-null legacy policy, Team foreign keys, and pair/orientation check.
+3. Existing rows are backfilled solely via exact provider-scoped Team Master mappings; unmappable/mismatched rows remain with both new columns NULL and are counted/reported.
+4. For new analytics facts, both provider side IDs resolve through Team Master and the resolved Local Team IDs equal the requested canonical pair.
+5. Persisted Home/Away local IDs preserve source orientation, including reversed fixtures; provider IDs and raw provider JSON remain unchanged.
+6. Missing, invalid, ambiguous, and unrelated identities fail the whole analytics projection before pair replacement; no successful/partial response is reported, and the caller rolls back the transaction.
+7. Manual and automatic refresh use the same identity projection rules. The scheduler's raw freshness shortcut cannot complete work while local-side analytics identity is incomplete.
+8. Analytics uniqueness and pair lookup behavior remain unchanged; existing legacy API response and v2 API schema are not changed by this storage work.
+9. Tests cover distinct local/provider IDs, both orientations, each unresolved category, pair mismatch, raw payload preservation, existing-row backfill behavior, transaction rollback, automatic/manual parity, freshness shortcut gating, and migration constraints without invoking a live provider or shared database.
+10. Read-only post-deployment checks reconcile total, resolved, unresolved, pair-mismatch, and invalid-FK counts against the backup/preflight record; no unresolved row is misrepresented as mapped.
+
+**FINAL DESIGN FREEZE — H2H LOCAL FIXTURE-SIDE IDENTITY.** The original design-freeze review made no code or database changes.

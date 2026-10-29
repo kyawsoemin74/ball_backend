@@ -19,10 +19,30 @@ from app.repositories.analytics_repository import (
 from app.repositories.league_season_repository import LeagueSeasonRepository
 from app.repositories.match_repository import MatchRepository
 from app.repositories.player_repository import PlayerRepository
-from app.repositories.team_repository import TeamRepository
+from app.repositories.team_repository import (
+    AmbiguousProviderIdentityError,
+    TeamRepository,
+)
 from app.services.odds_value import canonicalize_odd_value
 
 logger = logging.getLogger(__name__)
+
+
+class H2HIdentityProjectionError(ValueError):
+    def __init__(
+        self,
+        reason: str,
+        *,
+        fixture_id: int | None = None,
+        local_pair: tuple[int, int] | None = None,
+    ) -> None:
+        self.projection_context = {
+            "provider": "api-football",
+            "fixture_id": fixture_id,
+            "local_pair": local_pair,
+            "identity_failure": reason,
+        }
+        super().__init__(f"H2H identity projection rejected: {reason}")
 
 
 def log_projection_failure(fact: str, scope: dict, failure_type: str) -> None:
@@ -53,6 +73,7 @@ def _projection_observer(fact: str, scope_builder):
             try:
                 result = await method(self, db, *args, **kwargs)
             except Exception as exc:
+                scope.update(getattr(exc, "projection_context", {}))
                 log_projection_failure(fact, scope, exc.__class__.__name__)
                 raise
 
@@ -367,27 +388,162 @@ class AnalyticsProjectionService:
             lambda: self.lineup_repository.list_by_match(db, match_id),
         )
 
-    @_projection_observer("h2h", lambda args, kwargs: {"provider_team_low_id": args[0] if args else kwargs.get("provider_team_low_id"), "provider_team_high_id": args[1] if len(args) > 1 else kwargs.get("provider_team_high_id")})
+    @_projection_observer(
+        "h2h",
+        lambda args, kwargs: {
+            "provider_team_low_id": args[1] if len(args) > 1 else kwargs.get("provider_team_low_id"),
+            "provider_team_high_id": args[2] if len(args) > 2 else kwargs.get("provider_team_high_id"),
+        },
+    )
     async def project_h2h(self, db, provider_team_low_id: int, provider_team_high_id: int, fixtures: list[dict]) -> dict:
-        low = await self.team_repository.find_by_provider_identity(db, "api-football", provider_team_low_id)
-        high = await self.team_repository.find_by_provider_identity(db, "api-football", provider_team_high_id)
+        try:
+            low = await self.team_repository.find_by_provider_identity(
+                db, "api-football", provider_team_low_id
+            )
+            high = await self.team_repository.find_by_provider_identity(
+                db, "api-football", provider_team_high_id
+            )
+        except AmbiguousProviderIdentityError as exc:
+            raise H2HIdentityProjectionError("AMBIGUOUS_REQUESTED_TEAM") from exc
         if low is None or high is None:
-            raise ValueError("unresolved Team identity in H2H")
+            raise H2HIdentityProjectionError("UNRESOLVED_REQUESTED_TEAM")
         local_low, local_high = sorted((int(low.team_id), int(high.team_id)))
+        local_pair = (local_low, local_high)
+        if local_low <= 0 or local_low == local_high:
+            raise H2HIdentityProjectionError(
+                "INVALID_REQUESTED_LOCAL_PAIR",
+                local_pair=local_pair,
+            )
+
+        def parse_provider_id(value, *, fixture_id, identity_name):
+            if isinstance(value, bool):
+                raise H2HIdentityProjectionError(
+                    f"INVALID_{identity_name}",
+                    fixture_id=fixture_id,
+                    local_pair=local_pair,
+                )
+            if isinstance(value, int):
+                parsed = value
+            elif isinstance(value, str) and value.isdigit():
+                parsed = int(value)
+            else:
+                raise H2HIdentityProjectionError(
+                    f"INVALID_{identity_name}",
+                    fixture_id=fixture_id,
+                    local_pair=local_pair,
+                )
+            if parsed <= 0:
+                raise H2HIdentityProjectionError(
+                    f"INVALID_{identity_name}",
+                    fixture_id=fixture_id,
+                    local_pair=local_pair,
+                )
+            return parsed
+
+        identity_cache = {
+            str(provider_team_low_id): int(low.team_id),
+            str(provider_team_high_id): int(high.team_id),
+        }
+
+        async def resolve_side(value, *, fixture_id, identity_name):
+            provider_id = parse_provider_id(
+                value,
+                fixture_id=fixture_id,
+                identity_name=identity_name,
+            )
+            identity_key = str(value)
+            if identity_key not in identity_cache:
+                try:
+                    team = await self.team_repository.find_by_provider_identity(
+                        db,
+                        "api-football",
+                        value,
+                    )
+                except AmbiguousProviderIdentityError as exc:
+                    raise H2HIdentityProjectionError(
+                        "AMBIGUOUS_PROVIDER_IDENTITY",
+                        fixture_id=fixture_id,
+                        local_pair=local_pair,
+                    ) from exc
+                if team is None:
+                    raise H2HIdentityProjectionError(
+                        "UNRESOLVED_PROVIDER_IDENTITY",
+                        fixture_id=fixture_id,
+                        local_pair=local_pair,
+                    )
+                team_id = getattr(team, "team_id", None)
+                if (
+                    isinstance(team_id, bool)
+                    or not isinstance(team_id, int)
+                    or team_id <= 0
+                ):
+                    raise H2HIdentityProjectionError(
+                        "INVALID_LOCAL_TEAM_ID",
+                        fixture_id=fixture_id,
+                        local_pair=local_pair,
+                    )
+                identity_cache[identity_key] = team_id
+            return provider_id, identity_cache[identity_key]
+
         rows = []
         seen = set()
         for fixture in fixtures:
+            if not isinstance(fixture, dict):
+                raise H2HIdentityProjectionError(
+                    "INVALID_FIXTURE",
+                    local_pair=local_pair,
+                )
             info = fixture.get("fixture") or {}
-            fixture_id = info.get("id")
-            if fixture_id is None or fixture_id in seen:
+            raw_fixture_id = info.get("id")
+            try:
+                fixture_id = parse_provider_id(
+                    raw_fixture_id,
+                    fixture_id=None,
+                    identity_name="FIXTURE_ID",
+                )
+            except H2HIdentityProjectionError:
+                return self._result({"team_low_id": local_low, "team_high_id": local_high}, len(fixtures), 0, [], duplicate_count=1, reason="duplicate_source_rejected")
+            if fixture_id in seen:
                 return self._result({"team_low_id": local_low, "team_high_id": local_high}, len(fixtures), 0, [], duplicate_count=1, reason="duplicate_source_rejected")
             seen.add(fixture_id)
             timestamp = info.get("timestamp")
             fixture_at = datetime.fromtimestamp(timestamp, timezone.utc) if isinstance(timestamp, (int, float)) else datetime.fromisoformat(str(info.get("date")).replace("Z", "+00:00"))
             teams = fixture.get("teams") or {}
+            if not isinstance(teams, dict):
+                raise H2HIdentityProjectionError(
+                    "INVALID_FIXTURE_TEAMS",
+                    fixture_id=fixture_id,
+                    local_pair=local_pair,
+                )
+            home_provider_id, home_local_id = await resolve_side(
+                (teams.get("home") or {}).get("id")
+                if isinstance(teams.get("home") or {}, dict)
+                else None,
+                fixture_id=fixture_id,
+                identity_name="HOME_PROVIDER_TEAM_ID",
+            )
+            away_provider_id, away_local_id = await resolve_side(
+                (teams.get("away") or {}).get("id")
+                if isinstance(teams.get("away") or {}, dict)
+                else None,
+                fixture_id=fixture_id,
+                identity_name="AWAY_PROVIDER_TEAM_ID",
+            )
+            if home_local_id == away_local_id:
+                raise H2HIdentityProjectionError(
+                    "SAME_LOCAL_TEAM_ON_BOTH_SIDES",
+                    fixture_id=fixture_id,
+                    local_pair=local_pair,
+                )
+            if {home_local_id, away_local_id} != {local_low, local_high}:
+                raise H2HIdentityProjectionError(
+                    "UNRELATED_FIXTURE_PAIR",
+                    fixture_id=fixture_id,
+                    local_pair=local_pair,
+                )
             goals = fixture.get("goals") or {}
             score = fixture.get("score") or {}
-            rows.append({"source_provider": "api-football", "source_fixture_id": int(fixture_id), "fixture_at": fixture_at, "fixture_status": str((info.get("status") or {}).get("short", "")), "home_provider_team_id": int((teams.get("home") or {}).get("id")), "away_provider_team_id": int((teams.get("away") or {}).get("id")), "home_goals": goals.get("home"), "away_goals": goals.get("away"), "halftime_home_score": (score.get("halftime") or {}).get("home"), "halftime_away_score": (score.get("halftime") or {}).get("away"), "fulltime_home_score": (score.get("fulltime") or {}).get("home"), "fulltime_away_score": (score.get("fulltime") or {}).get("away"), "extratime_home_score": (score.get("extratime") or {}).get("home"), "extratime_away_score": (score.get("extratime") or {}).get("away"), "penalty_home_score": (score.get("penalty") or {}).get("home"), "penalty_away_score": (score.get("penalty") or {}).get("away")})
+            rows.append({"source_provider": "api-football", "source_fixture_id": fixture_id, "fixture_at": fixture_at, "fixture_status": str((info.get("status") or {}).get("short", "")), "home_provider_team_id": home_provider_id, "away_provider_team_id": away_provider_id, "home_local_team_id": home_local_id, "away_local_team_id": away_local_id, "home_goals": goals.get("home"), "away_goals": goals.get("away"), "halftime_home_score": (score.get("halftime") or {}).get("home"), "halftime_away_score": (score.get("halftime") or {}).get("away"), "fulltime_home_score": (score.get("fulltime") or {}).get("home"), "fulltime_away_score": (score.get("fulltime") or {}).get("away"), "extratime_home_score": (score.get("extratime") or {}).get("home"), "extratime_away_score": (score.get("extratime") or {}).get("away"), "penalty_home_score": (score.get("penalty") or {}).get("home"), "penalty_away_score": (score.get("penalty") or {}).get("away")})
         await self.h2h_repository.replace_by_pair(db, local_low, local_high, rows)
         result = self._result({"team_low_id": local_low, "team_high_id": local_high}, len(fixtures), len(rows), rows)
         return await self._persisted_result(

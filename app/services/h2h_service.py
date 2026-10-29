@@ -121,6 +121,56 @@ class H2HService:
         # Reads never trigger Analytics publication. Call refresh_h2h explicitly from a source owner.
         return None
 
+    async def get_h2h_with_local_team_ids(
+        self,
+        db: AsyncSession,
+        team1_id: int,
+        team2_id: int,
+        match_id: int,
+    ) -> Optional[dict]:
+        payload = await self.get_cached_h2h(
+            db,
+            team1_id=team1_id,
+            team2_id=team2_id,
+            match_id=match_id,
+        )
+        if not isinstance(payload, list):
+            return payload
+
+        team_cache: dict[int, tuple[object | None, str | None]] = {}
+        enriched_payload = []
+        for fixture in payload:
+            if not isinstance(fixture, dict):
+                enriched_payload.append(fixture)
+                continue
+
+            teams = fixture.get("teams")
+            if not isinstance(teams, dict):
+                enriched_payload.append(fixture)
+                continue
+
+            enriched_teams = dict(teams)
+            for side in ("home", "away"):
+                team = teams.get(side)
+                if not isinstance(team, dict):
+                    continue
+                mapped_team, _issue = await self._resolve_historical_team(
+                    db,
+                    team.get("id"),
+                    team_cache,
+                )
+                enriched_team = dict(team)
+                enriched_team["local_id"] = (
+                    int(mapped_team.team_id) if mapped_team is not None else None
+                )
+                enriched_teams[side] = enriched_team
+
+            enriched_fixture = dict(fixture)
+            enriched_fixture["teams"] = enriched_teams
+            enriched_payload.append(enriched_fixture)
+
+        return enriched_payload
+
     async def get_normalized_h2h(self, db: AsyncSession, match: Match) -> dict | None:
         match_id = int(getattr(match, "local_match_id", getattr(match, "match_id", 0)) or 0)
         home_team_id = self._positive_int(getattr(match, "home_team_id", None))
@@ -380,6 +430,12 @@ class H2HService:
                     **counters[away_team_id],
                 },
                 "included_meeting_count": included_meeting_count,
+                "total_matches": included_meeting_count,
+                "home_win": counters[home_team_id]["wins"],
+                "draw": counters[home_team_id]["draws"],
+                "away_win": counters[away_team_id]["wins"],
+                "home_goals": counters[home_team_id]["goals_for"],
+                "away_goals": counters[away_team_id]["goals_for"],
             },
             "meetings": meetings,
             "excluded_meeting_count": excluded_count,
@@ -457,6 +513,21 @@ class H2HService:
 
     async def refresh_h2h(self, db: AsyncSession, match_id: int) -> dict:
         result = await self.h2h_sync_service.refresh_h2h(db, int(match_id))
+        if "data" in result:
+            result["data"] = self._prepare_h2h_payload(result["data"])
+        return result
+
+    async def project_stored_h2h(
+        self,
+        db: AsyncSession,
+        match_id: int,
+        h2h_data: list[dict],
+    ) -> dict:
+        result = await self.h2h_sync_service.project_stored_h2h(
+            db,
+            int(match_id),
+            h2h_data,
+        )
         if "data" in result:
             result["data"] = self._prepare_h2h_payload(result["data"])
         return result

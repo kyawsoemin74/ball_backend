@@ -35,15 +35,7 @@ class H2HSyncService:
         self.analytics_projection_service = analytics_projection_service or AnalyticsProjectionService()
         self.team_repository = team_repository or TeamRepository()
 
-    @observe_sync("h2h")
-    async def refresh_h2h(self, db, local_match_id: int) -> dict:
-        try:
-            local_match_id = int(local_match_id)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("invalid local_match_id for H2H refresh") from exc
-        if local_match_id <= 0:
-            raise ValueError("invalid local_match_id for H2H refresh")
-
+    async def _load_match_identity(self, db, local_match_id: int):
         match_result = await db.execute(
             select(Match).where(Match.local_match_id == local_match_id)
         )
@@ -88,6 +80,43 @@ class H2HSyncService:
             raise ValueError("invalid provider team identity for H2H refresh") from exc
         if any(provider_id <= 0 for provider_id in provider_ids) or provider_ids[0] == provider_ids[1]:
             raise ValueError("invalid provider team identity for H2H refresh")
+        return local_teams, provider_ids
+
+    async def _project_h2h_payload(
+        self,
+        db,
+        local_teams,
+        provider_ids: list[int],
+        h2h_data: list[dict],
+        *,
+        persist_raw: bool,
+    ) -> dict:
+        if not isinstance(h2h_data, list):
+            raise ValueError("Invalid H2H provider response")
+
+        local_ids = sorted(int(team.team_id) for team in local_teams)
+        if persist_raw:
+            canonical_source_key = f"{local_ids[0]}-{local_ids[1]}"
+            await self.h2h_repository.upsert_one(db, canonical_source_key, h2h_data)
+            await db.flush()
+
+        projection = await self.analytics_projection_service.project_h2h(
+            db, provider_ids[0], provider_ids[1], h2h_data
+        )
+        if not projection["success"]:
+            raise ValueError(f"H2H analytics projection rejected: {projection.get('reason', 'reconciliation failure')}")
+        return projection
+
+    @observe_sync("h2h")
+    async def refresh_h2h(self, db, local_match_id: int) -> dict:
+        try:
+            local_match_id = int(local_match_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid local_match_id for H2H refresh") from exc
+        if local_match_id <= 0:
+            raise ValueError("invalid local_match_id for H2H refresh")
+
+        local_teams, provider_ids = await self._load_match_identity(db, local_match_id)
 
         provider_h2h_key = f"{provider_ids[0]}-{provider_ids[1]}"
         try:
@@ -104,19 +133,13 @@ class H2HSyncService:
 
         try:
             h2h_data = api_res["response"]
-            if not isinstance(h2h_data, list):
-                raise ValueError("Invalid H2H provider response")
-
-            local_ids = sorted(int(team.team_id) for team in local_teams)
-            canonical_source_key = f"{local_ids[0]}-{local_ids[1]}"
-            await self.h2h_repository.upsert_one(db, canonical_source_key, h2h_data)
-            await db.flush()
-
-            projection = await self.analytics_projection_service.project_h2h(
-                db, provider_ids[0], provider_ids[1], h2h_data
+            projection = await self._project_h2h_payload(
+                db,
+                local_teams,
+                provider_ids,
+                h2h_data,
+                persist_raw=True,
             )
-            if not projection["success"]:
-                raise ValueError(f"H2H analytics projection rejected: {projection.get('reason', 'reconciliation failure')}")
         except Exception as exc:
             setattr(exc, "h2h_provider_called", True)
             raise
@@ -127,5 +150,31 @@ class H2HSyncService:
             "outcome": "EMPTY" if not h2h_data else "SUCCESS",
             "cached": False,
             "updated": True,
+            "analytics": projection,
+        }
+
+    @observe_sync("h2h")
+    async def project_stored_h2h(self, db, local_match_id: int, h2h_data: list[dict]) -> dict:
+        try:
+            local_match_id = int(local_match_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid local_match_id for H2H projection") from exc
+        if local_match_id <= 0:
+            raise ValueError("invalid local_match_id for H2H projection")
+
+        local_teams, provider_ids = await self._load_match_identity(db, local_match_id)
+        projection = await self._project_h2h_payload(
+            db,
+            local_teams,
+            provider_ids,
+            h2h_data,
+            persist_raw=False,
+        )
+        return {
+            "source": "stored",
+            "data": h2h_data,
+            "outcome": "EMPTY" if not h2h_data else "SUCCESS",
+            "cached": False,
+            "updated": False,
             "analytics": projection,
         }

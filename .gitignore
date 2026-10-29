@@ -21,4 +21,5 @@ tests/*
 !tests/test_odds_identity_resolution_bridge.py
 !tests/test_odds_identity_mapping.py
 !tests/test_analytics_projection_service.py
+!tests/test_analytics_v1_schema.py
 !tests/test_odds_precision.py

@@ -69,6 +69,12 @@ class H2HSummaryV2(BaseModel):
     home: H2HTeamSummaryV2
     away: H2HTeamSummaryV2
     included_meeting_count: int
+    total_matches: int
+    home_win: int
+    draw: int
+    away_win: int
+    home_goals: int
+    away_goals: int
 
 
 class H2HResponseV2(BaseModel):

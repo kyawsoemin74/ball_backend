@@ -105,12 +105,38 @@ class AnalyticsH2HSnapshot(Base):
     __table_args__ = (
         UniqueConstraint("source_provider", "team_low_id", "team_high_id", "source_fixture_id", name="uq_analytics_h2h_business"),
         CheckConstraint("team_low_id < team_high_id", name="ck_analytics_h2h_team_order"),
+        CheckConstraint(
+            "(home_local_team_id IS NULL AND away_local_team_id IS NULL) OR "
+            "(home_local_team_id IS NOT NULL AND away_local_team_id IS NOT NULL "
+            "AND home_local_team_id <> away_local_team_id "
+            "AND LEAST(home_local_team_id, away_local_team_id) = team_low_id "
+            "AND GREATEST(home_local_team_id, away_local_team_id) = team_high_id)",
+            name="ck_analytics_h2h_local_sides_match_pair",
+        ),
         Index("ix_analytics_h2h_pair", "team_low_id", "team_high_id"),
         Index("ix_analytics_h2h_source_fixture", "source_provider", "source_fixture_id"),
     )
     h2h_fact_id = mapped_column(BigInteger, Identity(), primary_key=True)
     team_low_id = mapped_column(Integer, ForeignKey("teams.team_id"), nullable=False)
     team_high_id = mapped_column(Integer, ForeignKey("teams.team_id"), nullable=False)
+    home_local_team_id = mapped_column(
+        Integer,
+        ForeignKey(
+            "teams.team_id",
+            name="fk_analytics_h2h_home_local_team",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    away_local_team_id = mapped_column(
+        Integer,
+        ForeignKey(
+            "teams.team_id",
+            name="fk_analytics_h2h_away_local_team",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
     source_provider = mapped_column(Text, server_default="api-football", nullable=False)
     source_fixture_id = mapped_column(BigInteger, nullable=False)
     fixture_at = mapped_column(DateTime(timezone=True), nullable=False)

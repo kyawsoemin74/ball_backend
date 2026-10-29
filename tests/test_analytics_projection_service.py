@@ -1,10 +1,23 @@
 import asyncio
+import importlib.util
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import CheckConstraint
 
-from app.services.analytics_projection_service import AnalyticsProjectionService, log_projection_transaction
+from app.api import matches as matches_api
+from app.models.analytics import AnalyticsH2HSnapshot
+from app.repositories.team_repository import AmbiguousProviderIdentityError
+from app.services.analytics_projection_service import (
+    AnalyticsProjectionService,
+    H2HIdentityProjectionError,
+    log_projection_transaction,
+)
+from app.services.h2h_service import H2HService
+from app.services.h2h_sync_service import H2HSyncService
 
 
 class Team:
@@ -286,6 +299,460 @@ def test_h2h_projection_logging_exposes_reconciliation_fields(caplog):
     assert record.fact == "h2h"
     assert record.source_count == result["source_count"] == 0
     assert record.analytics_count == result["analytics_count"] == 0
+
+
+class H2HTeams:
+    def __init__(self, *, unresolved=(), ambiguous=()):
+        self.unresolved = set(unresolved)
+        self.ambiguous = set(ambiguous)
+        self.calls = []
+
+    async def find_by_provider_identity(self, _db, provider, provider_id):
+        provider_id = str(provider_id)
+        self.calls.append((provider, provider_id))
+        if provider_id in self.ambiguous:
+            raise AmbiguousProviderIdentityError("ambiguous test identity")
+        if provider_id in self.unresolved:
+            return None
+        return Team(int(provider_id) + 100)
+
+    async def get_by_id(self, _db, team_id):
+        provider_id = {101: "1", 102: "2"}.get(team_id)
+        if provider_id is None:
+            return None
+        return SimpleNamespace(
+            team_id=team_id,
+            provider="api-football",
+            provider_id=provider_id,
+        )
+
+
+class H2HRepository(Repository):
+    def __init__(self):
+        super().__init__([{"old": True}])
+        self.replacements = 0
+
+    async def replace_by_pair(self, db, team_low_id, team_high_id, rows):
+        self.replacements += 1
+        self.rows = [
+            {
+                "team_low_id": team_low_id,
+                "team_high_id": team_high_id,
+                **row,
+            }
+            for row in rows
+        ]
+
+
+def h2h_fixture(fixture_id=700, home_id=1, away_id=2):
+    return {
+        "fixture": {
+            "id": fixture_id,
+            "timestamp": 1,
+            "status": {"short": "FT"},
+        },
+        "teams": {
+            "home": {"id": home_id},
+            "away": {"id": away_id},
+        },
+        "goals": {"home": 2, "away": 1},
+        "score": {},
+    }
+
+
+def h2h_projection(team_repository=None):
+    projection = AnalyticsProjectionService(
+        team_repository=team_repository or H2HTeams(),
+        player_repository=Players(),
+        league_season_repository=Seasons(),
+    )
+    projection.h2h_repository = H2HRepository()
+    return projection
+
+
+def test_h2h_projection_persists_local_ids_and_preserves_fixture_orientation():
+    team_repository = H2HTeams()
+    projection = h2h_projection(team_repository)
+    fixture = h2h_fixture(home_id="2", away_id="1")
+
+    result = asyncio.run(projection.project_h2h(None, 1, 2, [fixture]))
+
+    assert result["success"] is True
+    row = projection.h2h_repository.rows[0]
+    assert (row["team_low_id"], row["team_high_id"]) == (101, 102)
+    assert (row["home_local_team_id"], row["away_local_team_id"]) == (102, 101)
+    assert (row["home_provider_team_id"], row["away_provider_team_id"]) == (2, 1)
+    assert team_repository.calls == [
+        ("api-football", "1"),
+        ("api-football", "2"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("team_repository", "fixture", "failure"),
+    [
+        (H2HTeams(unresolved={"3"}), h2h_fixture(home_id=3), "UNRESOLVED_PROVIDER_IDENTITY"),
+        (H2HTeams(ambiguous={"3"}), h2h_fixture(home_id=3), "AMBIGUOUS_PROVIDER_IDENTITY"),
+        (H2HTeams(), h2h_fixture(home_id=1, away_id=1), "SAME_LOCAL_TEAM_ON_BOTH_SIDES"),
+        (H2HTeams(), h2h_fixture(home_id=3), "UNRELATED_FIXTURE_PAIR"),
+        (H2HTeams(), h2h_fixture(home_id=None), "INVALID_HOME_PROVIDER_TEAM_ID"),
+    ],
+)
+def test_h2h_identity_failure_preserves_existing_pair_rows(
+    team_repository,
+    fixture,
+    failure,
+):
+    projection = h2h_projection(team_repository)
+    existing_rows = projection.h2h_repository.rows.copy()
+
+    with pytest.raises(H2HIdentityProjectionError, match=failure):
+        asyncio.run(projection.project_h2h(None, 1, 2, [fixture]))
+
+    assert projection.h2h_repository.replacements == 0
+    assert projection.h2h_repository.rows == existing_rows
+
+
+def test_h2h_identity_failure_log_includes_fixture_and_local_pair(caplog):
+    projection = h2h_projection(H2HTeams(unresolved={"3"}))
+    with caplog.at_level("ERROR"), pytest.raises(H2HIdentityProjectionError):
+        asyncio.run(projection.project_h2h(None, 1, 2, [h2h_fixture(home_id=3)]))
+
+    record = next(item for item in caplog.records if item.message == "ANALYTICS_PROJECTION_FAILURE")
+    assert record.scope["provider"] == "api-football"
+    assert record.scope["fixture_id"] == 700
+    assert record.scope["local_pair"] == (101, 102)
+    assert record.scope["identity_failure"] == "UNRESOLVED_PROVIDER_IDENTITY"
+
+
+def test_h2h_api_rolls_back_transaction_on_identity_projection_failure(monkeypatch):
+    async def allow_match(_match_id, _db):
+        return SimpleNamespace(home_team_id=101, away_team_id=102)
+
+    async def fail_refresh(**_kwargs):
+        raise H2HIdentityProjectionError(
+            "UNRELATED_FIXTURE_PAIR",
+            fixture_id=700,
+            local_pair=(101, 102),
+        )
+
+    async def run_locked(db, _resource_type, _resource_id, operation):
+        return True, await operation()
+
+    class DB:
+        def __init__(self):
+            self.rollbacks = 0
+            self.commits = 0
+
+        async def rollback(self):
+            self.rollbacks += 1
+
+        async def commit(self):
+            self.commits += 1
+
+    monkeypatch.setattr(matches_api, "_assert_match_allowed", allow_match)
+    monkeypatch.setattr(matches_api.football_service, "refresh_h2h", fail_refresh)
+    monkeypatch.setattr(matches_api, "run_with_resource_lock", run_locked)
+    db = DB()
+
+    with pytest.raises(Exception) as exc_info:
+        asyncio.run(matches_api.refresh_h2h_route(77, db))
+
+    assert getattr(exc_info.value, "status_code", None) == 422
+    assert db.rollbacks == 1
+    assert db.commits == 0
+
+
+def test_legacy_h2h_enrichment_preserves_provider_fields_and_orientation(monkeypatch):
+    class Cache:
+        async def get_json(self, _key):
+            return None
+
+    raw_payload = [
+        {
+            "fixture": {"id": 700, "date": "2025-01-01"},
+            "teams": {
+                "home": {"id": 2, "name": "Provider Away", "logo": "home.png"},
+                "away": {"id": 1, "name": "Provider Home", "logo": "away.png"},
+            },
+            "goals": {"home": 2, "away": 1},
+        },
+        {
+            "fixture": {"id": 701, "date": "2025-02-01"},
+            "teams": {
+                "home": {"id": 1, "name": "Provider Home"},
+                "away": {"id": 2, "name": "Provider Away"},
+            },
+            "goals": {"home": 1, "away": 0},
+        },
+        {
+            "fixture": {"id": 702, "date": "2025-03-01"},
+            "teams": {
+                "home": {"id": 999, "name": "Unmapped"},
+                "away": {"id": 1, "name": "Provider Home"},
+            },
+            "goals": {"home": 0, "away": 1},
+        },
+    ]
+    lookups = []
+
+    class TeamRepository:
+        async def find_by_provider_identity(self, _db, provider, provider_id):
+            lookups.append((provider, provider_id))
+            return {
+                1: SimpleNamespace(team_id=101),
+                2: SimpleNamespace(team_id=102),
+            }.get(provider_id)
+
+    monkeypatch.setattr("app.services.h2h_service.TeamRepository", TeamRepository)
+    service = H2HService(client=object(), cache_service=Cache())
+    reads = []
+    writes = []
+
+    async def get_raw_payload(_db, *, team1_id, team2_id, match_id):
+        reads.append((team1_id, team2_id, match_id))
+        return raw_payload
+
+    monkeypatch.setattr(service, "get_cached_h2h", get_raw_payload)
+
+    class DB:
+        async def execute(self, _statement):
+            writes.append("execute")
+            raise AssertionError("enrichment must not query or write through DB")
+
+        async def flush(self):
+            writes.append("flush")
+
+        async def commit(self):
+            writes.append("commit")
+
+    enriched = asyncio.run(
+        service.get_h2h_with_local_team_ids(DB(), 101, 102, 55)
+    )
+
+    assert reads == [(101, 102, 55)]
+    assert writes == []
+    assert enriched[0]["teams"]["home"] == {
+        "id": 2,
+        "name": "Provider Away",
+        "logo": "home.png",
+        "local_id": 102,
+    }
+    assert enriched[0]["teams"]["away"]["id"] == 1
+    assert enriched[0]["teams"]["away"]["local_id"] == 101
+    assert enriched[1]["teams"]["home"]["id"] == 1
+    assert enriched[1]["teams"]["home"]["local_id"] == 101
+    assert enriched[1]["teams"]["away"]["id"] == 2
+    assert enriched[1]["teams"]["away"]["local_id"] == 102
+    assert enriched[2]["teams"]["home"]["id"] == 999
+    assert enriched[2]["teams"]["home"]["local_id"] is None
+    assert enriched[2]["teams"]["away"]["local_id"] == 101
+    assert raw_payload[0]["teams"]["home"] == {
+        "id": 2,
+        "name": "Provider Away",
+        "logo": "home.png",
+    }
+    assert lookups == [
+        ("api-football", 2),
+        ("api-football", 1),
+        ("api-football", 999),
+    ]
+
+
+def test_legacy_h2h_endpoint_returns_additive_local_ids(monkeypatch):
+    async def allow_match(_match_id, _db):
+        return object()
+
+    async def get_enriched_payload(_db, team1_id, team2_id, match_id):
+        return [{
+            "fixture": {"id": 700},
+            "teams": {
+                "home": {"id": 2, "local_id": 102},
+                "away": {"id": 1, "local_id": 101},
+            },
+            "goals": {"home": 2, "away": 1},
+        }]
+
+    monkeypatch.setattr(matches_api, "_assert_match_allowed", allow_match)
+    monkeypatch.setattr(
+        matches_api.football_service,
+        "get_h2h_with_local_team_ids",
+        get_enriched_payload,
+    )
+
+    result = asyncio.run(
+        matches_api.get_match_h2h_symmetric(55, 101, 102, object())
+    )
+
+    assert result[0]["teams"] == {
+        "home": {"id": 2, "local_id": 102},
+        "away": {"id": 1, "local_id": 101},
+    }
+    assert result[0]["goals"] == {"home": 2, "away": 1}
+
+
+def test_h2h_provider_and_stored_refresh_share_projection_and_preserve_raw_payload():
+    raw_payload = [h2h_fixture(home_id=1, away_id=2)]
+
+    class SourceRepository:
+        def __init__(self):
+            self.rows = {}
+
+        async def upsert_one(self, _db, key, data):
+            self.rows[key] = data
+
+    class Provider:
+        def __init__(self):
+            self.calls = []
+
+        async def get_h2h_by_team_ids(self, home_id, away_id):
+            self.calls.append((home_id, away_id))
+            return {"response": raw_payload}
+
+    source_repository = SourceRepository()
+    provider = Provider()
+    projection = h2h_projection()
+
+    class MatchResult:
+        def scalar_one_or_none(self):
+            return SimpleNamespace(
+                local_match_id=77,
+                provider="api-football",
+                provider_fixture_id=700,
+                home_team_id=101,
+                away_team_id=102,
+            )
+
+    class DB:
+        async def execute(self, _statement):
+            return MatchResult()
+
+        async def flush(self):
+            return None
+
+    sync = H2HSyncService(
+        h2h_service=None,
+        h2h_provider=provider,
+        h2h_repository=source_repository,
+        analytics_projection_service=projection,
+        team_repository=H2HTeams(),
+    )
+
+    async def run_both():
+        fresh = await sync.refresh_h2h(DB(), 77)
+        stored = await sync.project_stored_h2h(DB(), 77, raw_payload)
+        return fresh, stored
+
+    fresh, stored = asyncio.run(run_both())
+
+    assert provider.calls == [(1, 2)]
+    assert fresh["data"] == stored["data"] == raw_payload
+    assert source_repository.rows["101-102"] == raw_payload
+    assert source_repository.rows["101-102"][0]["teams"] == {
+        "home": {"id": 1},
+        "away": {"id": 2},
+    }
+    assert projection.h2h_repository.replacements == 2
+    assert [
+        (row["home_local_team_id"], row["away_local_team_id"])
+        for row in projection.h2h_repository.rows
+    ] == [(101, 102)]
+
+
+def test_h2h_model_declares_nullable_local_side_columns_and_pair_check():
+    table = AnalyticsH2HSnapshot.__table__
+    assert table.c.home_local_team_id.nullable
+    assert table.c.away_local_team_id.nullable
+    check_names = {
+        constraint.name
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert "ck_analytics_h2h_local_sides_match_pair" in check_names
+    assert {
+        fk.name: fk.ondelete
+        for fk in table.foreign_keys
+        if fk.name in {
+            "fk_analytics_h2h_home_local_team",
+            "fk_analytics_h2h_away_local_team",
+        }
+    } == {
+        "fk_analytics_h2h_home_local_team": "RESTRICT",
+        "fk_analytics_h2h_away_local_team": "RESTRICT",
+    }
+
+
+MIGRATION_PATH = (
+    Path(__file__).parents[1]
+    / "alembic"
+    / "versions"
+    / "20261030_h2h_local_sides.py"
+)
+MIGRATION_SPEC = importlib.util.spec_from_file_location(
+    "h2h_local_sides_migration",
+    MIGRATION_PATH,
+)
+H2H_MIGRATION = importlib.util.module_from_spec(MIGRATION_SPEC)
+MIGRATION_SPEC.loader.exec_module(H2H_MIGRATION)
+
+
+class MigrationOperations:
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        def capture(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+
+        return capture
+
+
+def test_h2h_local_sides_migration_upgrade_and_downgrade_are_additive(monkeypatch):
+    assert H2H_MIGRATION.revision == "20261030_h2h_local_sides"
+    assert H2H_MIGRATION.down_revision == "20261020_h2h_sync_work"
+
+    operations = MigrationOperations()
+    monkeypatch.setattr(H2H_MIGRATION, "op", operations)
+    monkeypatch.setattr(H2H_MIGRATION.context, "is_offline_mode", lambda: True)
+    H2H_MIGRATION.upgrade()
+
+    columns = [call for call in operations.calls if call[0] == "add_column"]
+    assert [call[1][1].name for call in columns] == [
+        "home_local_team_id",
+        "away_local_team_id",
+    ]
+    assert all(call[1][1].nullable for call in columns)
+    foreign_keys = [
+        call for call in operations.calls if call[0] == "create_foreign_key"
+    ]
+    assert [call[1][0] for call in foreign_keys] == [
+        "fk_analytics_h2h_home_local_team",
+        "fk_analytics_h2h_away_local_team",
+    ]
+    assert all(call[2]["ondelete"] == "RESTRICT" for call in foreign_keys)
+    backfill = str(next(
+        call[1][0] for call in operations.calls if call[0] == "execute"
+    ))
+    assert "home_team.provider = snapshot.source_provider" in backfill
+    assert "home_team.provider_id = snapshot.home_provider_team_id::text" in backfill
+    assert "away_team.provider_id = snapshot.away_provider_team_id::text" in backfill
+    assert "LEAST(home_team.team_id, away_team.team_id) = snapshot.team_low_id" in backfill
+    assert "GREATEST(home_team.team_id, away_team.team_id) = snapshot.team_high_id" in backfill
+    assert "name" not in backfill.lower()
+
+    operations.calls.clear()
+    H2H_MIGRATION.downgrade()
+    assert [(call[0], call[1][0]) for call in operations.calls] == [
+        ("drop_constraint", "ck_analytics_h2h_local_sides_match_pair"),
+        ("drop_constraint", "fk_analytics_h2h_away_local_team"),
+        ("drop_constraint", "fk_analytics_h2h_home_local_team"),
+        ("drop_column", "analytics_h2h_snapshots"),
+        ("drop_column", "analytics_h2h_snapshots"),
+    ]
+    assert [call[1][1] for call in operations.calls[-2:]] == [
+        "away_local_team_id",
+        "home_local_team_id",
+    ]
 
 
 class MismatchedRepository(Repository):

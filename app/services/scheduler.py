@@ -2126,6 +2126,12 @@ class LiveUpdateScheduler:
                                 and existing_h2h.updated_at >= finished_at - timedelta(hours=24)
                             ):
                                 h2h_data = existing_h2h.data
+                                refresh_result = await football_service.project_stored_h2h(
+                                    db=db,
+                                    match_id=local_match_id,
+                                    h2h_data=h2h_data,
+                                )
+                                h2h_data = refresh_result.get("data")
                             else:
                                 refresh_result = await football_service.refresh_h2h(
                                     db=db,

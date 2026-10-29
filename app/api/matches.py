@@ -320,7 +320,12 @@ async def get_match_h2h_symmetric(
     Get head-to-head statistics with symmetric team key logic and smart persistence.
     """
     await _assert_match_allowed(match_id, db)
-    result = await football_service.get_cached_h2h(db, team1_id, team2_id, match_id)
+    result = await football_service.get_h2h_with_local_team_ids(
+        db,
+        team1_id,
+        team2_id,
+        match_id,
+    )
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="H2H data not found")
     return result
