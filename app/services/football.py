@@ -231,6 +231,9 @@ class FootballAPIService:
     async def get_cached_h2h(self, db: AsyncSession, team1_id: int, team2_id: int, match_id: int) -> Optional[dict]:
         return await self.h2h_service.get_cached_h2h(db, team1_id=team1_id, team2_id=team2_id, match_id=match_id)
 
+    async def get_normalized_h2h(self, db: AsyncSession, match) -> Optional[dict]:
+        return await self.h2h_service.get_normalized_h2h(db, match)
+
     async def refresh_h2h(self, db: AsyncSession, match_id: int) -> dict:
         return await self.h2h_service.refresh_h2h(db, match_id=match_id)
 

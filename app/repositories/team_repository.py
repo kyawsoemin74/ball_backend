@@ -5,6 +5,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.team import Team
 
 
+class AmbiguousProviderIdentityError(ValueError):
+    pass
+
+
 class TeamRepository:
     async def find_by_provider_identity(
         self,
@@ -24,7 +28,9 @@ class TeamRepository:
         )
         rows = list(result.scalars().all())
         if len(rows) > 1:
-            raise ValueError(f"Multiple teams found for provider={provider} provider_id={provider_id_key}")
+            raise AmbiguousProviderIdentityError(
+                f"Multiple teams found for provider={provider} provider_id={provider_id_key}"
+            )
         return rows[0] if rows else None
 
     async def get_null_provider_api_football_teams(self, db: AsyncSession) -> list[Team]:

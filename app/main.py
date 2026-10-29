@@ -17,6 +17,7 @@ from app.api.teams import router as teams_router
 from app.api.ads import router as ads_router
 from app.api.news import router as news_router
 from app.api.v2.player_contracts import router as player_v2_router
+from app.api.v2.matches import router as matches_v2_router
 from app.api.auth import router as auth_router
 from app.api.socket import router as socket_router
 from app.api.uploads import router as uploads_router
@@ -108,6 +109,7 @@ app.include_router(ads_router, prefix="/api/ads", tags=["ads"])
 app.include_router(news_router, prefix="/api/news", tags=["news"])
 app.include_router(uploads_router, prefix="/api", tags=["uploads"])
 app.include_router(player_v2_router, prefix="/api/v2")
+app.include_router(matches_v2_router, prefix="/api/v2")
 
 
 @app.on_event("startup")
