@@ -2,7 +2,7 @@ from sqlalchemy import desc, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 
-from app.models.news import News
+from app.models.news import News, NewsCategory
 from app.schemas.news import NewsCreate, NewsPagination
 
 
@@ -26,7 +26,10 @@ async def get_news_by_category(db: AsyncSession, category: str, pagination: News
 
 
 async def create_news(db: AsyncSession, news: NewsCreate) -> News:
-    db_news = News(**news.model_dump())
+    category = NewsCategory.normalize(news.category)
+    news_data = news.model_dump(exclude={"category"})
+    news_data["category"] = category
+    db_news = News(**news_data)
     db.add(db_news)
     await db.commit()
     await db.refresh(db_news)

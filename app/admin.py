@@ -1,9 +1,9 @@
 from sqladmin import Admin, ModelView
-from wtforms import FileField
+from wtforms import FileField, SelectField
 
 from app.models.standing import Standings
 from app.models.match import Match
-from app.models.news import News
+from app.models.news import News, NewsCategory
 from app.models.ad import Ad
 from app.admin_auth import authentication_backend
 from app.services.upload import upload_news_image
@@ -27,8 +27,17 @@ class NewsAdmin(ModelView, model=News):
     ]
     # SQLAdmin 0.25.0 exposes form_overrides in ModelView and uses it when
     # building forms via get_model_form(..., form_overrides=...).
-    form_overrides = {"image_url": FileField}
-    form_args = {"image_url": {"label": "Upload News Image"}}
+    form_overrides = {"category": SelectField, "image_url": FileField}
+    form_args = {
+        "category": {
+            "choices": [
+                (NewsCategory.LATEST.value, "Latest"),
+                (NewsCategory.TRANSFERS.value, "Transfers"),
+                (NewsCategory.TIPS.value, "Tips"),
+            ]
+        },
+        "image_url": {"label": "Upload News Image"},
+    }
     name_plural = "News"
 
     async def on_model_change(self, data: dict, model: News, is_created: bool, request) -> dict:
@@ -37,6 +46,7 @@ class NewsAdmin(ModelView, model=News):
         Create path: when a file is attached, upload it and store the public URL.
         Edit path: keep the existing image_url unless a real replacement file is provided.
         """
+        data["category"] = NewsCategory.normalize(data.get("category"))
         image_file = data.get("image_url")
 
         # Create path: if no file is attached, the field stays empty.
