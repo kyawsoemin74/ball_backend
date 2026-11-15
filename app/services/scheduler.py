@@ -17,6 +17,7 @@ from app.models.match_event import MatchEvent
 from app.models.odds import Odds
 from app.models.league_identity_recovery import LeagueIdentityRecovery
 from app.monitoring import SCHEDULER_JOB_ERRORS, SCHEDULER_JOB_RUNS
+from app.repositories.match_repository import MatchRepository
 from app.repositories.lineup_refresh_state_repository import LineupRefreshStateRepository
 from app.repositories.h2h_sync_work_repository import H2HSyncWorkRepository
 from app.repositories.league_identity_recovery_repository import LeagueIdentityRecoveryRepository
@@ -77,6 +78,8 @@ ODDS_REFRESH_WINDOW_HOURS = 72
 # Myanmar Timezone Offset (UTC+6:30)
 MM_TZ = timezone(timedelta(hours=6, minutes=30))
 LIVE_MATCH_SYNC_LOCK_KEY = 9342002
+MISSING_MATCH_VERIFICATION_LIMIT = 10
+FINALIZATION_DUE_BATCH_LIMIT = 10
 DAILY_FIXTURE_SYNC_LOCK_KEY = 9342003
 REPAIR_DAILY_MATCHES_LOCK_KEY = 9342004
 STANDINGS_REFRESH_LOCK_KEY = 9342001
@@ -433,6 +436,7 @@ async def recover_pending_odds_cache(
 class LiveUpdateScheduler:
     EXPECTED_JOB_IDS = (
         "sync_live_matches",
+        "finalize_due_matches",
         "recover_league_identities",
         "sync_daily_fixtures",
         "repair_daily_matches",
@@ -453,6 +457,7 @@ class LiveUpdateScheduler:
         self.is_running = False
         self.lineup_refresh_state_repository = LineupRefreshStateRepository()
         self.match_finalization_repository = MatchFinalizationRepository()
+        self.match_repository = MatchRepository()
         self.cache_service = CacheService()
         self.pending_odds_cache_invalidations: set[int] = set()
 
@@ -485,6 +490,10 @@ class LiveUpdateScheduler:
                     "partial_matches",
                     "failed_matches",
                     "processed_matches",
+                    "attempted",
+                    "succeeded",
+                    "skipped",
+                    "failed",
                 ):
                     if key in result:
                         summary[key] = result[key]
@@ -512,6 +521,14 @@ class LiveUpdateScheduler:
             id="sync_live_matches",
             name="Sync Live Matches",
             max_instances=1  # Prevent overlapping jobs
+        )
+
+        self.scheduler.add_job(
+            self._finalize_due_matches_job,
+            trigger=IntervalTrigger(seconds=30),
+            id="finalize_due_matches",
+            name="Finalize Due Matches",
+            max_instances=1,
         )
 
         self.scheduler.add_job(
@@ -645,7 +662,7 @@ class LiveUpdateScheduler:
         *,
         live_lock_held: bool = False,
     ) -> dict[str, int]:
-        candidates = sorted({int(match_id) for match_id in (match_ids or [])})
+        candidates = list(dict.fromkeys(int(match_id) for match_id in (match_ids or [])))
         metrics = {"attempted": 0, "succeeded": 0, "skipped": 0, "failed": 0}
         if not candidates:
             return metrics
@@ -828,6 +845,32 @@ class LiveUpdateScheduler:
                 await self._release_live_match_sync_lock(db)
 
         return metrics
+
+    async def _finalize_due_matches_job(self) -> dict[str, int]:
+        SCHEDULER_JOB_RUNS.labels(job="finalize_due_matches").inc()
+        try:
+            async with async_session() as db:
+                if not await self._acquire_live_match_sync_lock(db):
+                    return {"attempted": 0, "succeeded": 0, "skipped": 1, "failed": 0}
+
+                try:
+                    due_match_ids = await self.match_finalization_repository.get_due_match_ids(
+                        db,
+                        datetime.now(timezone.utc),
+                        limit=FINALIZATION_DUE_BATCH_LIMIT,
+                        prioritize_ordinary=True,
+                    )
+                    return await self._finalize_match_sync_candidates(
+                        db,
+                        due_match_ids,
+                        live_lock_held=True,
+                    )
+                finally:
+                    await self._release_live_match_sync_lock(db)
+        except Exception:
+            SCHEDULER_JOB_ERRORS.labels(job="finalize_due_matches").inc()
+            logger.exception("FINAL_MATCH_DUE_QUEUE_JOB_FAILED")
+            raise
             
     async def _should_sync_live_matches(self, db) -> bool:
         now = datetime.now(timezone.utc)
@@ -876,6 +919,75 @@ class LiveUpdateScheduler:
         )
         return should_sync
 
+    async def _select_live_run_finalization_ids(
+        self,
+        db,
+        due_match_ids: list[int],
+        sync_result: dict,
+        now: datetime,
+    ) -> list[int]:
+        candidate_ids = list(
+            dict.fromkeys(
+                int(match_id)
+                for match_id in (
+                    list(due_match_ids or [])
+                    + list(sync_result.get("final_match_sync_candidates") or [])
+                )
+            )
+        )
+        if not candidate_ids:
+            return []
+
+        due_ids = await self.match_finalization_repository.get_due_match_ids(
+            db,
+            now,
+            limit=len(candidate_ids),
+            match_ids=set(candidate_ids),
+        )
+        if not due_ids:
+            return []
+
+        matches = await self.match_repository.get_many_by_ids(db, due_ids)
+        matches_by_id = {
+            int(match.local_match_id): match
+            for match in matches
+        }
+        raw_provider_fixture_ids = sync_result.get("live_provider_fixture_ids")
+        if not isinstance(raw_provider_fixture_ids, list):
+            raise ValueError("LIVE sync result is missing provider fixture identities.")
+
+        provider_fixture_ids: set[int] = set()
+        for raw_fixture_id in raw_provider_fixture_ids:
+            if isinstance(raw_fixture_id, bool):
+                continue
+            try:
+                fixture_id = int(raw_fixture_id)
+            except (TypeError, ValueError):
+                continue
+            if fixture_id > 0:
+                provider_fixture_ids.add(fixture_id)
+
+        missing_ids: set[int] = set()
+        for match_id, match in matches_by_id.items():
+            fixture_id = getattr(match, "provider_fixture_id", None)
+            if (
+                str(getattr(match, "provider", "")).casefold() == API_FOOTBALL_PROVIDER
+                and str(getattr(match, "status", "")).strip().upper() in LIVE_STATUSES
+                and isinstance(fixture_id, int)
+                and not isinstance(fixture_id, bool)
+                and fixture_id > 0
+                and fixture_id not in provider_fixture_ids
+            ):
+                missing_ids.add(match_id)
+
+        ordinary_due = [
+            match_id for match_id in due_ids if int(match_id) not in missing_ids
+        ]
+        missing_due = [
+            int(match_id) for match_id in due_ids if int(match_id) in missing_ids
+        ]
+        return ordinary_due + missing_due[:MISSING_MATCH_VERIFICATION_LIMIT]
+
     async def _sync_live_matches_job(self):
         """Job function to sync live matches"""
         try:
@@ -893,62 +1005,89 @@ class LiveUpdateScheduler:
                         if hasattr(db, "info")
                         else []
                     )
-                    await self._finalize_match_sync_candidates(
-                        db,
-                        due_finalizations,
-                        live_lock_held=True,
-                    )
-
-                    if not await self._should_sync_live_matches(db):
-                        logger.debug("No near-start or active non-FT matches found; skipping live sync")
-                        return
-
-                    async def sync_live() -> dict:
-                        try:
-                            result = await football_service.sync_live_matches(db)
-                            if result.get("success"):
-                                await db.commit()
-                                active_match_updates = result.get("active_match_updates") or {}
-                                if active_match_updates:
+                    sync_result = None
+                    poll_succeeded = False
+                    try:
+                        should_sync = await self._should_sync_live_matches(db)
+                        if should_sync:
+                            async def sync_live() -> dict:
+                                result = await football_service.sync_live_matches(db)
+                                if result.get("success"):
+                                    await db.commit()
+                                    active_match_updates = result.get("active_match_updates") or {}
+                                    if active_match_updates:
+                                        try:
+                                            await football_service.apply_active_match_updates(active_match_updates)
+                                        except Exception:
+                                            logger.exception(
+                                                "LIVE_SYNC_ACTIVE_MATCH_REGISTRATION_FAILED updates=%s",
+                                                active_match_updates,
+                                            )
                                     try:
-                                        await football_service.apply_active_match_updates(active_match_updates)
-                                    except Exception:
-                                        logger.exception(
-                                            "LIVE_SYNC_ACTIVE_MATCH_REGISTRATION_FAILED updates=%s",
-                                            active_match_updates,
+                                        cache_invalidated = await self.cache_service.delete(
+                                            make_cache_key("live_matches")
                                         )
-                                try:
-                                    cache_invalidated = await self.cache_service.delete(
-                                        make_cache_key("live_matches")
-                                    )
-                                    if not cache_invalidated:
-                                        logger.warning("LIVE_SYNC_CACHE_INVALIDATION_FAILED key=live_matches")
-                                except Exception:
-                                    logger.exception("LIVE_SYNC_CACHE_INVALIDATION_FAILED key=live_matches")
-                            else:
-                                await db.rollback()
-                            return result
-                        except Exception:
-                            await db.rollback()
-                            raise
+                                        if not cache_invalidated:
+                                            logger.warning("LIVE_SYNC_CACHE_INVALIDATION_FAILED key=live_matches")
+                                    except Exception:
+                                        logger.exception("LIVE_SYNC_CACHE_INVALIDATION_FAILED key=live_matches")
+                                else:
+                                    await db.rollback()
+                                return result
 
-                    resource_locked, result = await run_with_resource_lock(
-                        db, "live_sync", "global", sync_live
-                    )
-                    if not resource_locked:
-                        logger.info("LIVE_SYNC_SKIPPED reason=resource_lock_not_acquired")
-                        return
+                            resource_locked, sync_result = await run_with_resource_lock(
+                                db, "live_sync", "global", sync_live
+                            )
+                            if not resource_locked:
+                                logger.info("LIVE_SYNC_SKIPPED reason=resource_lock_not_acquired")
+                                sync_result = None
+                            elif sync_result.get("success"):
+                                poll_succeeded = True
+                                if sync_result.get("updated", 0) > 0:
+                                    logger.info("Live sync completed: %s", sync_result)
+                            else:
+                                logger.error("Live sync failed: %s", sync_result)
+                        else:
+                            logger.debug(
+                                "No near-start or active non-FT matches found; skipping live sync"
+                            )
+                    except Exception:
+                        await db.rollback()
+                        logger.exception("LIVE_SYNC_POLL_FAILED")
+
+                    now = datetime.now(timezone.utc)
+                    if poll_succeeded and sync_result is not None:
+                        additional_due = await self.match_finalization_repository.get_due_match_ids(
+                            db, now
+                        )
+                        due_finalizations = list(
+                            dict.fromkeys(due_finalizations + additional_due)
+                        )
+                        work_ids = await self._select_live_run_finalization_ids(
+                            db,
+                            due_finalizations,
+                            sync_result,
+                            now,
+                        )
+                    else:
+                        additional_due = (
+                            await self.match_finalization_repository.get_due_match_ids(
+                                db, now
+                            )
+                            if hasattr(db, "info")
+                            else []
+                        )
+                        work_ids = list(
+                            dict.fromkeys(due_finalizations + additional_due)
+                        )
+
                     await self._finalize_match_sync_candidates(
                         db,
-                        result.get("final_match_sync_candidates", []),
+                        work_ids,
                         live_lock_held=True,
                     )
-                    SCHEDULER_JOB_RUNS.labels(job="sync_live_matches").inc()
-                    if result.get("success"):
-                        if result.get("updated", 0) > 0:
-                            logger.info(f"Live sync completed: {result}")
-                    else:
-                        logger.error(f"Live sync failed: {result}")
+                    if poll_succeeded:
+                        SCHEDULER_JOB_RUNS.labels(job="sync_live_matches").inc()
                 finally:
                     await self._release_live_match_sync_lock(db)
         except Exception as e:

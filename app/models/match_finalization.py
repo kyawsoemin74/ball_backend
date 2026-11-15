@@ -16,6 +16,10 @@ class MatchFinalization(Base):
             name="ck_match_finalization_attempt_count",
         ),
         CheckConstraint(
+            "fast_recheck_count BETWEEN -1 AND 3",
+            name="ck_match_finalization_fast_recheck_count",
+        ),
+        CheckConstraint(
             "(state = 'SUCCESS' AND completed_at IS NOT NULL) OR "
             "(state != 'SUCCESS' AND completed_at IS NULL)",
             name="ck_match_finalization_completed",
@@ -31,6 +35,7 @@ class MatchFinalization(Base):
     )
     state = Column(String(20), nullable=False, server_default="PENDING")
     attempt_count = Column(Integer, nullable=False, server_default="0")
+    fast_recheck_count = Column(Integer, nullable=False, server_default="-1")
     next_retry_at = Column(DateTime(timezone=True), nullable=True)
     last_attempted_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)

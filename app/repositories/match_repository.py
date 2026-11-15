@@ -1,11 +1,66 @@
 from datetime import date, datetime, timedelta, timezone
+from enum import Enum
 
-from sqlalchemy import select, text
+from sqlalchemy import case, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
 
 from app.models.league import League
 from app.models.match import Match
+
+
+FINAL_MATCH_TERMINAL_STATUSES = frozenset({"FT", "AET", "PEN"})
+MATCH_RESULT_LOCK_RESOURCE = "match_result"
+FINALIZED_RESULT_FIELDS = ("status", "elapsed", "home_score", "away_score")
+FINALIZED_METADATA_PROTECTED_FIELDS = (
+    "league_id",
+    "season",
+    "match_time",
+    "home_team_id",
+    "away_team_id",
+    "referee_id",
+)
+
+
+class MatchStateWriteOutcome(str, Enum):
+    UPDATED = "updated"
+    PROTECTED = "protected"
+    MISSING = "missing"
+
+
+def _is_finalized_match_status(status_column):
+    return func.upper(func.trim(func.coalesce(status_column, ""))).in_(
+        tuple(FINAL_MATCH_TERMINAL_STATUSES)
+    )
+
+
+def finalized_result_upsert_values(existing_columns, excluded_columns) -> dict:
+    """Keep finalized result fields intact on non-authoritative fixture upserts."""
+    is_finalized = _is_finalized_match_status(existing_columns.status)
+    return {
+        field: case(
+            (is_finalized, getattr(existing_columns, field)),
+            else_=getattr(excluded_columns, field),
+        )
+        for field in FINALIZED_RESULT_FIELDS
+    }
+
+
+def finalized_metadata_upsert_values(
+    existing_columns,
+    excluded_columns,
+    *,
+    fields: tuple[str, ...] = FINALIZED_METADATA_PROTECTED_FIELDS,
+) -> dict:
+    """Keep finalized match identity and scheduling fields while refreshing display metadata."""
+    is_finalized = _is_finalized_match_status(existing_columns.status)
+    return {
+        field: case(
+            (is_finalized, getattr(existing_columns, field)),
+            else_=getattr(excluded_columns, field),
+        )
+        for field in fields
+    }
 
 
 class MatchRepository:
@@ -27,7 +82,8 @@ class MatchRepository:
         elapsed: int,
         home_score: int,
         away_score: int,
-    ) -> bool:
+        allow_finalized_result_refresh: bool = False,
+    ) -> MatchStateWriteOutcome:
         result = await db.execute(
             text(
                 """
@@ -37,6 +93,11 @@ class MatchRepository:
                     home_score = :home_score,
                     away_score = :away_score
                 WHERE local_match_id = :local_match_id
+                  AND (
+                    :allow_finalized_result_refresh
+                    OR UPPER(TRIM(COALESCE(status, ''))) NOT IN (:status_ft, :status_aet, :status_pen)
+                  )
+                RETURNING local_match_id
                 """
             ),
             {
@@ -45,9 +106,22 @@ class MatchRepository:
                 "elapsed": elapsed,
                 "home_score": home_score,
                 "away_score": away_score,
+                "allow_finalized_result_refresh": allow_finalized_result_refresh,
+                "status_ft": "FT",
+                "status_aet": "AET",
+                "status_pen": "PEN",
             },
         )
-        return result.rowcount == 1
+        if result.scalar_one_or_none() is not None:
+            return MatchStateWriteOutcome.UPDATED
+
+        current = await db.execute(
+            text("SELECT status FROM matches WHERE local_match_id = :local_match_id"),
+            {"local_match_id": local_match_id},
+        )
+        if current.scalar_one_or_none() is None:
+            return MatchStateWriteOutcome.MISSING
+        return MatchStateWriteOutcome.PROTECTED
 
     async def get_many_by_ids(self, db: AsyncSession, match_ids: list[int], allowed_ids: set[int] | None = None) -> list[Match]:
         if not match_ids:
@@ -153,11 +227,41 @@ class MatchRepository:
             ),
         )
 
-    async def get_live_stale(self, db: AsyncSession, provider_fixture_ids: set[int], stale_threshold) -> list[Match]:
+    async def get_live_stale(
+        self,
+        db: AsyncSession,
+        provider_fixture_ids: set[int],
+        stale_threshold: datetime,
+        *,
+        current_time: datetime | None = None,
+        provider: str = "api-football",
+    ) -> list[Match]:
         from app.services.football import LIVE_STATUSES
 
-        query = select(Match).where(Match.status.in_(LIVE_STATUSES), Match.match_time >= stale_threshold)
+        upper_bound = current_time or datetime.now(timezone.utc)
+        if (
+            stale_threshold.tzinfo is None
+            or stale_threshold.utcoffset() is None
+            or upper_bound.tzinfo is None
+            or upper_bound.utcoffset() is None
+        ):
+            raise ValueError("Live match recovery bounds must be timezone-aware.")
+
+        lower_utc = stale_threshold.astimezone(timezone.utc)
+        upper_utc = upper_bound.astimezone(timezone.utc)
+        if lower_utc > upper_utc:
+            raise ValueError("Live match recovery lower bound cannot exceed upper bound.")
+
+        query = select(Match).where(
+            Match.provider == provider,
+            Match.status.in_(LIVE_STATUSES),
+            Match.provider_fixture_id > 0,
+            Match.match_time >= lower_utc,
+            Match.match_time <= upper_utc,
+        )
         if provider_fixture_ids:
             query = query.where(Match.provider_fixture_id.not_in(list(provider_fixture_ids)))
-        result = await db.execute(query)
+        result = await db.execute(
+            query.order_by(Match.match_time.asc(), Match.local_match_id.asc())
+        )
         return list(result.scalars().all())

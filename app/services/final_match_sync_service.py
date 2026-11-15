@@ -4,13 +4,17 @@ from datetime import datetime, timezone
 
 import httpx
 
-from app.repositories.match_repository import MatchRepository
+from app.repositories.match_repository import (
+    FINAL_MATCH_TERMINAL_STATUSES,
+    MATCH_RESULT_LOCK_RESOURCE,
+    MatchRepository,
+    MatchStateWriteOutcome,
+)
 from app.repositories.match_finalization_repository import MatchFinalizationRepository
 from app.services.resource_lock import run_with_resource_lock
 
 logger = logging.getLogger(__name__)
 
-FINAL_MATCH_TERMINAL_STATUSES = frozenset({"FT", "AET", "PEN"})
 FINAL_MATCH_WAIT_STATUSES = frozenset({"1H", "2H", "HT", "ET", "LIVE", "BT", "P"})
 PROVIDER_NAME = "api-football"
 
@@ -43,7 +47,7 @@ class FinalMatchSyncService:
 
     async def sync_final_match(self, db, match_id: int) -> dict:
         record = await self.finalization_repository.get_by_match_id(
-            db, match_id, for_update=True
+            db, match_id
         )
         if record is None:
             return {
@@ -110,26 +114,39 @@ class FinalMatchSyncService:
             }
         if not isinstance(response, dict) or not isinstance(response.get("response"), list):
             return {
-                "state": "EXHAUSTED",
+                "state": "FAILED",
                 "category": "INVALID_PROVIDER_RESPONSE",
                 "message": "Fixture-by-ID response has an invalid structure.",
-                "retryable": False,
+                "retryable": True,
             }
 
         fixtures = response["response"]
+        if any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("fixture"), dict)
+            or isinstance(item["fixture"].get("id"), bool)
+            or not str(item["fixture"].get("id") or "").isdigit()
+            or int(item["fixture"].get("id")) <= 0
+            for item in fixtures
+        ):
+            return {
+                "state": "FAILED",
+                "category": "INVALID_PROVIDER_RESPONSE",
+                "message": "Fixture-by-ID response contains an invalid fixture structure.",
+                "retryable": True,
+            }
+
         matching_fixtures = [
             item
             for item in fixtures
-            if isinstance(item, dict)
-            and isinstance(item.get("fixture"), dict)
-            and str(item["fixture"].get("id")) == str(provider_fixture_id)
+            if str(item["fixture"].get("id")) == str(provider_fixture_id)
         ]
         if len(matching_fixtures) > 1:
             return {
-                "state": "EXHAUSTED",
+                "state": "FAILED",
                 "category": "INVALID_PROVIDER_RESPONSE",
                 "message": "Fixture-by-ID response contains duplicate fixture identities.",
-                "retryable": False,
+                "retryable": True,
             }
         fixture = matching_fixtures[0] if matching_fixtures else None
         if fixture is None:
@@ -142,7 +159,15 @@ class FinalMatchSyncService:
 
         fixture_info = fixture.get("fixture")
         status_payload = fixture_info.get("status") if isinstance(fixture_info, dict) else None
-        status = str(status_payload.get("short") or "").strip().upper() if isinstance(status_payload, dict) else ""
+        raw_status = status_payload.get("short") if isinstance(status_payload, dict) else None
+        if not isinstance(raw_status, str) or not raw_status.strip():
+            return {
+                "state": "FAILED",
+                "category": "INVALID_PROVIDER_RESPONSE",
+                "message": "Fixture-by-ID response is missing a valid status code.",
+                "retryable": True,
+            }
+        status = raw_status.strip().upper()
         if status not in FINAL_MATCH_TERMINAL_STATUSES:
             if status in FINAL_MATCH_WAIT_STATUSES:
                 logger.info(
@@ -156,10 +181,10 @@ class FinalMatchSyncService:
                     "message": f"Fixture-by-ID is still active with status {status}.",
                 }
             return {
-                "state": "EXHAUSTED",
-                "category": "PROVIDER_STATUS_NOT_TERMINAL",
-                "message": f"Fixture-by-ID returned non-terminal status {status or 'UNKNOWN'}.",
-                "retryable": False,
+                "state": "FAILED",
+                "category": "UNKNOWN_PROVIDER_STATUS",
+                "message": f"Fixture-by-ID returned unrecognized status {status}.",
+                "retryable": True,
             }
 
         goals = fixture.get("goals")
@@ -167,84 +192,108 @@ class FinalMatchSyncService:
         final_state = self._validated_state(status, elapsed, goals)
         if final_state is None:
             return {
-                "state": "EXHAUSTED",
+                "state": "FAILED",
                 "category": "INVALID_FINAL_MATCH_STATE",
                 "message": "Terminal provider fixture is missing valid elapsed or score values.",
-                "retryable": False,
+                "retryable": True,
             }
 
-        updated = await self.match_repository.update_live_state(
-            db,
-            int(match_id),
-            status=final_state.status,
-            elapsed=final_state.elapsed,
-            home_score=final_state.home_score,
-            away_score=final_state.away_score,
-        )
-        if not updated:
-            return {
-                "state": "EXHAUSTED",
-                "category": "MATCH_NOT_FOUND",
-                "message": "Canonical Match disappeared before final state persistence.",
-                "retryable": False,
-            }
-
-        try:
-            event_locked, event_result = await run_with_resource_lock(
+        async def persist_final_state() -> dict:
+            updated = await self.match_repository.update_live_state(
                 db,
-                "events",
                 int(match_id),
-                lambda: self.event_sync_service.sync_match_events(db, int(match_id)),
+                status=final_state.status,
+                elapsed=final_state.elapsed,
+                home_score=final_state.home_score,
+                away_score=final_state.away_score,
+                allow_finalized_result_refresh=True,
             )
-        except Exception as exc:
-            logger.exception(
-                "FINAL_EVENT_SYNC_FAILED match_id=%s status=%s",
-                match_id,
-                final_state.status,
+            if updated is MatchStateWriteOutcome.MISSING or updated is False:
+                return {
+                    "state": "EXHAUSTED",
+                    "category": "MATCH_NOT_FOUND",
+                    "message": "Canonical Match disappeared before final state persistence.",
+                    "retryable": False,
+                }
+            if updated is MatchStateWriteOutcome.PROTECTED:
+                return {
+                    "state": "FAILED",
+                    "category": "FINAL_RESULT_PROTECTED",
+                    "message": "Confirmed terminal result was not persisted.",
+                    "retryable": True,
+                }
+
+            try:
+                event_locked, event_result = await run_with_resource_lock(
+                    db,
+                    "events",
+                    int(match_id),
+                    lambda: self.event_sync_service.sync_match_events(db, int(match_id)),
+                )
+            except Exception as exc:
+                logger.exception(
+                    "FINAL_EVENT_SYNC_FAILED match_id=%s status=%s",
+                    match_id,
+                    final_state.status,
+                )
+                return {
+                    "state": "FAILED",
+                    "category": "FINAL_EVENT_SYNC_FAILURE",
+                    "message": str(exc),
+                    "retryable": True,
+                }
+
+            if not event_locked:
+                return {
+                    "state": "FAILED",
+                    "category": "FINAL_EVENT_SYNC_LOCK_CONFLICT",
+                    "message": "Event resource lock was not acquired.",
+                    "retryable": True,
+                }
+            if not isinstance(event_result, dict) or not event_result.get("success"):
+                reason = (
+                    event_result.get("message", "Event sync failed.")
+                    if isinstance(event_result, dict)
+                    else "Event sync returned an invalid result."
+                )
+                logger.warning(
+                    "FINAL_EVENT_SYNC_FAILED match_id=%s status=%s reason=%s",
+                    match_id,
+                    final_state.status,
+                    reason,
+                )
+                return {
+                    "state": "FAILED",
+                    "category": "FINAL_EVENT_SYNC_FAILURE",
+                    "message": reason,
+                    "retryable": True,
+                }
+
+            await self.finalization_repository.mark_success(
+                db, record, completed_at=datetime.now(timezone.utc)
             )
             return {
-                "state": "FAILED",
-                "category": "FINAL_EVENT_SYNC_FAILURE",
-                "message": str(exc),
-                "retryable": True,
+                "state": "SUCCESS",
+                "final_status": final_state.status,
+                "elapsed": final_state.elapsed,
+                "home_score": final_state.home_score,
+                "away_score": final_state.away_score,
             }
 
-        if not event_locked:
-            return {
-                "state": "FAILED",
-                "category": "FINAL_EVENT_SYNC_LOCK_CONFLICT",
-                "message": "Event resource lock was not acquired.",
-                "retryable": True,
-            }
-        if not isinstance(event_result, dict) or not event_result.get("success"):
-            reason = (
-                event_result.get("message", "Event sync failed.")
-                if isinstance(event_result, dict)
-                else "Event sync returned an invalid result."
-            )
-            logger.warning(
-                "FINAL_EVENT_SYNC_FAILED match_id=%s status=%s reason=%s",
-                match_id,
-                final_state.status,
-                reason,
-            )
-            return {
-                "state": "FAILED",
-                "category": "FINAL_EVENT_SYNC_FAILURE",
-                "message": reason,
-                "retryable": True,
-            }
-
-        await self.finalization_repository.mark_success(
-            db, record, completed_at=datetime.now(timezone.utc)
+        locked, outcome = await run_with_resource_lock(
+            db,
+            MATCH_RESULT_LOCK_RESOURCE,
+            int(match_id),
+            persist_final_state,
         )
-        return {
-            "state": "SUCCESS",
-            "final_status": final_state.status,
-            "elapsed": final_state.elapsed,
-            "home_score": final_state.home_score,
-            "away_score": final_state.away_score,
-        }
+        if not locked:
+            return {
+                "state": "FAILED",
+                "category": "MATCH_RESULT_LOCK_CONFLICT",
+                "message": "Match result resource lock was unavailable.",
+                "retryable": True,
+            }
+        return outcome
 
     @staticmethod
     def _validated_state(status: str, elapsed, goals) -> FinalMatchState | None:

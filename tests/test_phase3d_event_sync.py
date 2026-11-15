@@ -14,6 +14,18 @@ from app.services.final_match_sync_service import FinalMatchSyncService
 from app.services.scheduler import LiveUpdateScheduler
 
 
+@pytest.fixture(autouse=True)
+def use_in_memory_resource_locks(monkeypatch):
+    async def run_locked(_db, _resource_type, _resource_identity, operation):
+        return True, await operation()
+
+    monkeypatch.setattr(
+        final_match_sync_module,
+        "run_with_resource_lock",
+        run_locked,
+    )
+
+
 def fixture_payload(status):
     return {
         "fixture": {"id": 7001, "status": {"short": status, "elapsed": 95}},
@@ -120,7 +132,7 @@ def test_terminal_finalization_syncs_events_before_success(status, monkeypatch):
     assert result["state"] == "SUCCESS"
     assert result["final_status"] == status
     assert events.calls == [123]
-    assert locks == [("events", 123)]
+    assert locks == [("match_result", 123), ("events", 123)]
     assert finalizations.record.state == "SUCCESS"
 
 

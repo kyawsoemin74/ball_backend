@@ -15,7 +15,13 @@ from app.models.match import Match
 from app.providers.fixture_provider import FixtureProvider
 from app.repositories.allowed_league_repository import AllowedLeagueRepository
 from app.repositories.league_repository import LeagueRepository
-from app.repositories.match_repository import MatchRepository
+from app.repositories.match_repository import (
+    MATCH_RESULT_LOCK_RESOURCE,
+    MatchRepository,
+    MatchStateWriteOutcome,
+    finalized_metadata_upsert_values,
+    finalized_result_upsert_values,
+)
 from app.repositories.final_lineup_finalization_repository import FinalLineupFinalizationRepository
 from app.repositories.final_lineup_finalization_repository import FINAL_LINEUP_MAX_ATTEMPTS
 from app.repositories.match_finalization_repository import MatchFinalizationRepository
@@ -463,19 +469,33 @@ class FixtureSyncService:
 
         filtered_fixtures = []
         unresolved_identity_count = 0
+        unresolved_fixture_ids: set[str] = set()
+
+        def is_new_unresolved_fixture(fixture_raw: dict) -> bool:
+            fixture_id = (fixture_raw.get("fixture") or {}).get("id")
+            if fixture_id is None or isinstance(fixture_id, bool) or not str(fixture_id).strip():
+                return True
+            normalized_id = str(fixture_id).strip()
+            if normalized_id in unresolved_fixture_ids:
+                return False
+            unresolved_fixture_ids.add(normalized_id)
+            return True
+
         for fixture_raw in fixtures:
             league_info = fixture_raw.get("league") or {}
             provider_id = league_info.get("id")
             league_name = league_info.get("name") or "Unknown league"
             if provider_id is None:
                 logger.warning("Skipping fixture %s with missing league_id", fixture_raw.get("fixture", {}).get("id"))
-                unresolved_identity_count += 1
+                if is_new_unresolved_fixture(fixture_raw):
+                    unresolved_identity_count += 1
                 continue
 
             master = await self.league_repository.find_by_provider_identity(db, "api-football", provider_id)
             if master is None:
                 logger.warning("Skipping fixture with unresolved provider League: provider_id=%s", provider_id)
-                unresolved_identity_count += 1
+                if is_new_unresolved_fixture(fixture_raw):
+                    unresolved_identity_count += 1
                 continue
 
             if master.league_id not in allowed_ids:
@@ -495,7 +515,7 @@ class FixtureSyncService:
                     "success": False,
                     "inserted": 0,
                     "updated": 0,
-                    "total": 0,
+                    "total": unresolved_identity_count,
                     "failed": unresolved_identity_count,
                     "message": "Fixture sync aborted because provider League identity is unresolved for the payload.",
                     "final_lineup_candidates": [],
@@ -507,8 +527,8 @@ class FixtureSyncService:
             "success": True,
             "inserted": 0,
             "updated": 0,
-            "total": len(filtered_fixtures),
-            "failed": 0,
+            "total": len(filtered_fixtures) + unresolved_identity_count,
+            "failed": unresolved_identity_count,
             "standings_prewarm_candidates": 0,
             "final_lineup_candidates": [],
             "active_match_updates": {},
@@ -526,6 +546,8 @@ class FixtureSyncService:
                     result["failed"] += 1
                     logger.warning("Fixture ID %s failed parsing.", fixture_id)
                     continue
+
+                fixture_savepoint = await self._begin_fixture_savepoint(db)
 
                 provider_team_ids = [
                     team_id
@@ -551,12 +573,15 @@ class FixtureSyncService:
                         [{"provider_id": team_id} for team_id in provider_team_ids],
                     )
                 if resolution["unresolved"]:
+                    await self._rollback_fixture_savepoint(
+                        fixture_savepoint,
+                        RuntimeError("TEAM_IDENTITY_UNRESOLVED"),
+                    )
+                    fixture_savepoint = None
                     result["failed"] += 1
                     result.setdefault("retryable_team_identity_missing", []).append(fixture_id)
                     logger.warning("Fixture ID %s has unresolved provider Team identity", fixture_id)
                     continue
-
-                fixture_savepoint = await self._begin_fixture_savepoint(db)
 
                 if match.season is not None and getattr(db, "sync_session", None) is not None:
                     await self.league_season_sync_service.upsert_season(
@@ -612,16 +637,20 @@ class FixtureSyncService:
                     existing_match = legacy_rows[0] if legacy_rows else None
                 existing_rows = [existing_match] if existing_match is not None else []
                 existing_ids = {row.match_id for row in existing_rows}
-                previous_status = None
-                if existing_rows:
-                    previous_status = str(getattr(existing_rows[0], "status", "") or "").upper() or None
                 updated = 1 if existing_rows else 0
                 inserted = 1 - updated
 
                 match_row = match.model_dump()
                 match_row.pop("match_id", None)
                 if existing_rows:
-                    match_row["local_match_id"] = getattr(existing_rows[0], "local_match_id", existing_rows[0].match_id)
+                    existing_local_match_id = getattr(
+                        existing_rows[0], "local_match_id", None
+                    )
+                    match_row["local_match_id"] = (
+                        existing_local_match_id
+                        if existing_local_match_id is not None
+                        else existing_rows[0].match_id
+                    )
                 match_row["venue_id"] = venue_id
                 match_row["referee_id"] = referee_id
                 insert_stmt = pg_insert(Match).values([match_row])
@@ -647,25 +676,108 @@ class FixtureSyncService:
                     "venue_city": insert_stmt.excluded.venue_city,
                     "referee_id": insert_stmt.excluded.referee_id,
                 }
+                protected_metadata_fields = (
+                    "league_id",
+                    "season",
+                    "match_time",
+                    "home_team_id",
+                    "away_team_id",
+                    "referee_id",
+                )
+                if venue_id is not None:
+                    protected_metadata_fields += ("venue_id",)
+                match_update_fields.update(
+                    finalized_metadata_upsert_values(
+                        Match.__table__.c,
+                        insert_stmt.excluded,
+                        fields=protected_metadata_fields,
+                    )
+                )
+                match_update_fields.update(
+                    finalized_result_upsert_values(
+                        Match.__table__.c,
+                        insert_stmt.excluded,
+                    )
+                )
                 if venue_id is not None:
                     match_update_fields["venue_id"] = insert_stmt.excluded.venue_id
                 upsert_stmt = insert_stmt.on_conflict_do_update(
                     constraint="uq_matches_provider_fixture_id",
                     set_=match_update_fields,
                 )
-                await db.execute(upsert_stmt)
-                if get_by_provider_fixture_id is not None:
-                    persisted_match = await get_by_provider_fixture_id(
-                        db, "api-football", match.provider_fixture_id
-                    )
-                else:
-                    persisted_match = existing_match
-                if persisted_match is None:
+
+                async def persist_fixture_upsert():
                     if get_by_provider_fixture_id is not None:
-                        raise ValueError("MATCH_IDENTITY_MISSING")
-                    local_match_id = int(match.provider_fixture_id)
+                        current_match = await get_by_provider_fixture_id(
+                            db, "api-football", match.provider_fixture_id
+                        )
+                    else:
+                        current_match = existing_match
+                    current_status = (
+                        str(getattr(current_match, "status", "") or "").strip().upper()
+                        or None
+                    )
+                    write_result = await db.execute(
+                        upsert_stmt.returning(Match.local_match_id, Match.status)
+                    )
+                    returned_row = (
+                        write_result.one_or_none()
+                        if callable(getattr(write_result, "one_or_none", None))
+                        else None
+                    )
+                    if returned_row is not None:
+                        persisted_local_match_id = int(returned_row[0])
+                        persisted_status = str(returned_row[1] or "").strip().upper()
+                    else:
+                        persisted_match = current_match
+                        if persisted_match is None:
+                            persisted_match = existing_match
+                        if persisted_match is not None:
+                            persisted_local_match_id = int(
+                                getattr(persisted_match, "local_match_id", None)
+                                or getattr(persisted_match, "match_id")
+                            )
+                            persisted_status = str(
+                                getattr(persisted_match, "status", "") or ""
+                            ).strip().upper()
+                        else:
+                            persisted_local_match_id = int(match.provider_fixture_id)
+                            persisted_status = str(match.status or "").strip().upper()
+                    return current_status, persisted_local_match_id, persisted_status
+
+                if existing_rows:
+                    existing_local_match_id = getattr(
+                        existing_rows[0], "local_match_id", None
+                    )
+                    local_match_id_for_lock = int(
+                        existing_local_match_id
+                        if existing_local_match_id is not None
+                        else existing_rows[0].match_id
+                    )
+                    result_lock_acquired, persisted_result = await run_with_resource_lock(
+                        db,
+                        MATCH_RESULT_LOCK_RESOURCE,
+                        local_match_id_for_lock,
+                        persist_fixture_upsert,
+                    )
+                    if not result_lock_acquired:
+                        result["success"] = False
+                        result["failed"] += 1
+                        logger.warning(
+                            "FIXTURE_MATCH_RESULT_LOCK_CONFLICT local_match_id=%s provider_fixture_id=%s",
+                            local_match_id_for_lock,
+                            match.provider_fixture_id,
+                        )
+                        await self._rollback_fixture_savepoint(
+                            fixture_savepoint,
+                            RuntimeError("MATCH_RESULT_LOCK_CONFLICT"),
+                        )
+                        continue
+                    previous_status, local_match_id, persisted_status = persisted_result
                 else:
-                    local_match_id = int(getattr(persisted_match, "local_match_id", getattr(persisted_match, "match_id", 0)))
+                    previous_status, local_match_id, persisted_status = (
+                        await persist_fixture_upsert()
+                    )
 
                 home_team_id = getattr(match, "home_team_id", None)
                 away_team_id = getattr(match, "away_team_id", None)
@@ -691,7 +803,7 @@ class FixtureSyncService:
 
                 await db.flush()
 
-                normalized_status = str(match.status or "").upper()
+                normalized_status = persisted_status
                 if (
                     previous_status in LIVE_STATUSES
                     and normalized_status in FINAL_MATCH_TERMINAL_STATUSES
@@ -719,9 +831,12 @@ class FixtureSyncService:
                     )
 
                 if getattr(self, "_defer_live_cache_invalidation", False):
-                    result["active_match_updates"][local_match_id] = match.status
+                    result["active_match_updates"][local_match_id] = persisted_status
                 else:
-                    await self._sync_active_match_registration(local_match_id, match.status)
+                    await self._sync_active_match_registration(
+                        local_match_id,
+                        persisted_status,
+                    )
 
                 result["inserted"] += inserted
                 result["updated"] += updated
@@ -1180,6 +1295,7 @@ class FixtureSyncService:
             "skipped": 0,
             "failed": 0,
             "final_match_sync_candidates": [],
+            "live_provider_fixture_ids": [],
             "active_match_updates": {},
         }
         logger.info("LIVE_SYNC_PROVIDER_FIXTURES_RECEIVED count=%s", len(fixtures))
@@ -1196,6 +1312,8 @@ class FixtureSyncService:
                     provider_fixture_ids.add(provider_fixture_id)
             except (TypeError, ValueError):
                 continue
+
+        sync_result["live_provider_fixture_ids"] = sorted(provider_fixture_ids)
 
         for fixture_payload in fixtures:
             fixture = fixture_payload.get("fixture") if isinstance(fixture_payload, dict) else None
@@ -1231,38 +1349,112 @@ class FixtureSyncService:
                 )
                 continue
 
-            previous_status = str(getattr(existing_match, "status", "") or "").strip().upper()
-            updated = await self.match_repository.update_live_state(
+            local_match_id = int(existing_match.local_match_id)
+
+            async def update_live_state():
+                current_match = await self.match_repository.get_by_provider_fixture_id(
+                    db,
+                    "api-football",
+                    provider_fixture_id,
+                )
+                if current_match is None:
+                    return None, MatchStateWriteOutcome.MISSING
+                current_status = str(
+                    getattr(current_match, "status", "") or ""
+                ).strip().upper()
+                state_result = await self.match_repository.update_live_state(
+                    db,
+                    local_match_id,
+                    **live_state,
+                )
+                return current_status, state_result
+
+            result_lock_acquired, update_result = await run_with_resource_lock(
                 db,
-                existing_match.local_match_id,
-                **live_state,
+                MATCH_RESULT_LOCK_RESOURCE,
+                local_match_id,
+                update_live_state,
             )
-            if not updated:
+            if not result_lock_acquired:
+                sync_result["skipped"] += 1
+                logger.warning(
+                    "LIVE_SYNC_MATCH_RESULT_LOCK_CONFLICT provider_fixture_id=%s local_match_id=%s",
+                    provider_fixture_id,
+                    local_match_id,
+                )
+                continue
+
+            previous_status, updated = update_result
+            if updated is MatchStateWriteOutcome.PROTECTED:
+                sync_result["skipped"] += 1
+                logger.info(
+                    "LIVE_SYNC_FINALIZED_RESULT_PROTECTED provider_fixture_id=%s local_match_id=%s incoming_status=%s",
+                    provider_fixture_id,
+                    local_match_id,
+                    live_state["status"],
+                )
+                continue
+            if updated is MatchStateWriteOutcome.MISSING or updated is False:
                 sync_result["skipped"] += 1
                 logger.warning(
                     "LIVE_SYNC_MATCH_DISAPPEARED provider_fixture_id=%s local_match_id=%s",
                     provider_fixture_id,
-                    existing_match.local_match_id,
+                    local_match_id,
                 )
                 continue
 
             sync_result["updated"] += 1
-            sync_result["active_match_updates"][int(existing_match.local_match_id)] = live_state["status"]
+            sync_result["active_match_updates"][local_match_id] = live_state["status"]
             if (
                 previous_status in LIVE_STATUSES
                 and live_state["status"].upper() in FINAL_MATCH_TERMINAL_STATUSES
             ):
                 finalization = await self.match_finalization_repository.ensure_pending(
-                    db, int(existing_match.local_match_id)
+                    db, local_match_id
                 )
                 if finalization.state not in {"SUCCESS", "EXHAUSTED"}:
-                    sync_result["final_match_sync_candidates"].append(
-                        int(existing_match.local_match_id)
-                    )
+                    sync_result["final_match_sync_candidates"].append(local_match_id)
 
-        for live_match in await self.match_repository.get_live_matches(db):
-            if str(getattr(live_match, "provider", "")).casefold() != "api-football":
+        now_utc = datetime.now(timezone.utc)
+        recovery_window_start = now_utc - timedelta(hours=6)
+        missing_live_matches = await self.match_repository.get_live_stale(
+            db,
+            provider_fixture_ids,
+            recovery_window_start,
+            current_time=now_utc,
+            provider="api-football",
+        )
+        for live_match in missing_live_matches:
+            if (
+                str(getattr(live_match, "provider", "")).casefold()
+                != "api-football"
+                or str(getattr(live_match, "status", "")).strip().upper()
+                not in LIVE_STATUSES
+            ):
                 continue
+
+            kickoff = getattr(live_match, "match_time", None)
+            if (
+                not isinstance(kickoff, datetime)
+                or kickoff.tzinfo is None
+                or kickoff.utcoffset() is None
+            ):
+                sync_result["skipped"] += 1
+                logger.warning(
+                    "LIVE_SYNC_MISSING_MATCH_INVALID_KICKOFF local_match_id=%s",
+                    getattr(live_match, "local_match_id", None),
+                )
+                continue
+            kickoff_utc = kickoff.astimezone(timezone.utc)
+            if not recovery_window_start <= kickoff_utc <= now_utc:
+                sync_result["skipped"] += 1
+                logger.warning(
+                    "LIVE_SYNC_MISSING_MATCH_OUTSIDE_RECOVERY_WINDOW local_match_id=%s kickoff_utc=%s",
+                    getattr(live_match, "local_match_id", None),
+                    kickoff_utc.isoformat(),
+                )
+                continue
+
             provider_fixture_id = getattr(live_match, "provider_fixture_id", None)
             if (
                 isinstance(provider_fixture_id, bool)
@@ -1270,11 +1462,20 @@ class FixtureSyncService:
                 or provider_fixture_id <= 0
                 or provider_fixture_id in provider_fixture_ids
             ):
+                sync_result["skipped"] += 1
+                logger.warning(
+                    "LIVE_SYNC_MISSING_MATCH_INVALID_IDENTITY local_match_id=%s provider_fixture_id=%s",
+                    getattr(live_match, "local_match_id", None),
+                    provider_fixture_id,
+                )
                 continue
 
             local_match_id = int(live_match.local_match_id)
             finalization = await self.match_finalization_repository.ensure_pending(
-                db, local_match_id
+                db,
+                local_match_id,
+                now=now_utc,
+                enable_fast_rechecks=True,
             )
             if finalization.state not in {"SUCCESS", "EXHAUSTED"}:
                 sync_result["final_match_sync_candidates"].append(local_match_id)
