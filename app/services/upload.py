@@ -74,8 +74,8 @@ async def upload_news_image(
     """Validate, save, and return a public URL for a news image upload."""
     content = await validate_image_upload(file_obj)
 
-    target_dir = Path(upload_dir or getattr(settings, "NEWS_UPLOAD_DIR", "/var/www/fover/uploads/news"))
-    base_url = public_base_url or getattr(settings, "NEWS_UPLOAD_PUBLIC_URL", "https://kyawsoemin.com/uploads/news/")
+    target_dir = Path(upload_dir or settings.NEWS_UPLOAD_DIR)
+    base_url = public_base_url or settings.NEWS_UPLOAD_PUBLIC_URL
 
     target_dir.mkdir(parents=True, exist_ok=True)
 

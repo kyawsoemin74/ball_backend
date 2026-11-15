@@ -1,0 +1,11 @@
+services:
+  api:
+    environment:
+      NEWS_UPLOAD_DIR: /var/www/fover/uploads/news
+      NEWS_UPLOAD_PUBLIC_URL: https://kyawsoemin.com/uploads/news/
+    volumes:
+      - type: bind
+        source: "${FOVER_UPLOADS_HOST_DIR:?Set FOVER_UPLOADS_HOST_DIR to the verified host uploads path}"
+        target: /var/www/fover/uploads
+        bind:
+          create_host_path: false

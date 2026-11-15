@@ -24,3 +24,4 @@ tests/*
 !tests/test_analytics_v1_schema.py
 !tests/test_odds_precision.py
 !tests/test_news_category.py
+!tests/test_uploads.py
