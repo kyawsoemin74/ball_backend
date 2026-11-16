@@ -271,21 +271,34 @@ class PlayerSyncService:
         if provider_id in (None, ""):
             raise ValueError("provider_id is required for provider-backed player creation")
 
+        normalized_player_data = {
+            **player_data,
+            "provider": provider,
+            "provider_id": str(provider_id),
+        }
+        photo = normalized_player_data.get("photo")
+        if isinstance(photo, str):
+            normalized_player_data["photo"] = photo.strip() or None
+
         resolution = await self.player_identity_resolution_service.resolve_provider_player_identity(
             db,
             provider,
             str(provider_id),
-            player_data=player_data,
+            player_data=normalized_player_data,
         )
 
         if resolution.status == "RESOLVED_EXISTING":
             existing = await self.player_repository.get_by_provider_id(db, str(provider_id), provider)
             if existing is None:
                 raise RuntimeError(f"Resolver reported existing player but none was found for provider={provider} provider_id={provider_id}")
-            return existing
+            if resolution.local_player_id is None or existing.player_id != resolution.local_player_id:
+                raise RuntimeError(
+                    f"Resolved player identity conflict for provider={provider} provider_id={provider_id}"
+                )
+            return await self.player_repository.upsert_one(db, normalized_player_data)
 
         if resolution.status == "CREATE_NEW":
-            return await self.player_repository.upsert_one(db, {**player_data, "provider": provider, "provider_id": str(provider_id)})
+            return await self.player_repository.upsert_one(db, normalized_player_data)
 
         raise ValueError(f"Player identity resolution failed: {resolution.status} ({resolution.reason or resolution.evidence or 'unknown reason'})")
 

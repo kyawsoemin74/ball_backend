@@ -1,3 +1,4 @@
+from copy import deepcopy
 import inspect
 import logging
 from datetime import datetime, timezone
@@ -181,9 +182,16 @@ class LineupService:
         if not isinstance(payload, list):
             return payload
 
+        enriched_payload = deepcopy(payload)
+
+        def valid_photo(value: Any) -> str | None:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            return None
+
         provider_ids = list(dict.fromkeys(
             str(player["provider_player_id"]).strip()
-            for lineup in payload
+            for lineup in enriched_payload
             for section in ("startXI", "substitutes")
             for entry in lineup.get(section, [])
             if isinstance(entry, dict)
@@ -216,7 +224,7 @@ class LineupService:
                         )
 
         players_by_local_id = {}
-        for lineup in payload:
+        for lineup in enriched_payload:
             for section in ("startXI", "substitutes"):
                 for entry in lineup.get(section, []):
                     if not isinstance(entry, dict):
@@ -233,7 +241,7 @@ class LineupService:
                         if player is not None and local_id is not None and not self._same_local_player_id(
                             local_id, player.player_id
                         ):
-                            continue
+                            player = None
                     elif local_id is not None:
                         local_key = str(local_id).strip()
                         if local_key not in players_by_local_id:
@@ -247,16 +255,16 @@ class LineupService:
                                 players_by_local_id[local_key] = None
                         player = players_by_local_id[local_key]
 
-                    if player is None:
-                        continue
-
-                    photo = getattr(player, "photo", None)
-                    if photo:
-                        player_data["photo"] = photo
+                    master_photo = valid_photo(getattr(player, "photo", None)) if player is not None else None
+                    lineup_photo = valid_photo(player_data.get("photo"))
+                    if master_photo is not None:
+                        player_data["photo"] = master_photo
+                    elif lineup_photo is not None:
+                        player_data["photo"] = lineup_photo
                     else:
                         player_data.pop("photo", None)
 
-        return payload
+        return enriched_payload
 
     async def get_match_lineup(self, match_id: int, db: AsyncSession | None = None) -> Optional[List[Dict[str, Any]]]:
         """Compatibility read path: cache first, then DB fallback, never provider fetch."""
