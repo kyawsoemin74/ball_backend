@@ -10,7 +10,10 @@ from app.repositories.league_repository import LeagueRepository
 from app.repositories.player_repository import PlayerRepository
 from app.repositories.team_repository import TeamRepository
 from app.services.league_season_sync_service import LeagueSeasonSyncService
-from app.services.player_sync_service import PlayerSyncService
+from app.services.player_sync_service import (
+    PlayerIdentityResolutionError,
+    PlayerSyncService,
+)
 from app.services.player_team_membership_service import PlayerTeamMembershipService
 from app.services.team_sync_service import TeamSyncService
 
@@ -52,6 +55,70 @@ class PlayerMasterRebuildService:
         self.membership_service = membership_service or PlayerTeamMembershipService(
             player_repository=self.player_sync_service.player_repository,
         )
+
+    async def sync_team_squad_photos(self, db, local_team_id: int) -> dict[str, Any]:
+        """Sync only Squad photos for one locally identified API-Football team."""
+        team = await self.team_repository.get_by_id(db, local_team_id)
+        if team is None:
+            raise LookupError("Team not found")
+
+        if str(getattr(team, "provider", "")).strip().casefold() != "api-football":
+            raise ValueError("Team does not use the API-Football provider")
+
+        provider_team_id = str(getattr(team, "provider_id", "") or "").strip()
+        if not provider_team_id.isdigit() or int(provider_team_id) <= 0:
+            raise ValueError("Team has no valid API-Football provider identity")
+
+        collected = await self.player_provider.collect_team_squad(int(provider_team_id))
+        if (
+            not isinstance(collected, dict)
+            or collected.get("provider_request_status") != "SUCCESS"
+            or not isinstance(collected.get("players"), list)
+        ):
+            raise ConnectionError("Squad provider request failed")
+
+        seen_provider_player_ids = set()
+        for player in collected["players"]:
+            if not isinstance(player, dict) or player.get("id") in (None, ""):
+                continue
+            provider_player_id = str(player["id"]).strip()
+            if provider_player_id in seen_provider_player_ids:
+                raise PlayerIdentityResolutionError(
+                    "Squad response contains duplicate provider player identities"
+                )
+            seen_provider_player_ids.add(provider_player_id)
+
+        metrics = {
+            "success": True,
+            "team_id": local_team_id,
+            "provider_team_id": provider_team_id,
+            "players_collected": len(collected["players"]),
+            "photos_inserted": 0,
+            "photos_updated": 0,
+            "existing_photos_preserved": 0,
+            "players_skipped": 0,
+            "invalid_photos": 0,
+            "missing_photos": 0,
+        }
+        for squad_player in collected["players"]:
+            outcome = await self.player_sync_service.sync_squad_player_photo(
+                db,
+                squad_player,
+            )
+            status = outcome["status"]
+            if status == "inserted":
+                metrics["photos_inserted"] += 1
+            elif status == "updated":
+                metrics["photos_updated"] += 1
+            elif status == "preserved":
+                metrics["existing_photos_preserved"] += 1
+            else:
+                metrics["players_skipped"] += 1
+            if outcome["reason"] == "invalid_photo":
+                metrics["invalid_photos"] += 1
+            elif outcome["reason"] == "missing_photo":
+                metrics["missing_photos"] += 1
+        return metrics
 
     @staticmethod
     def _current_season(payload: dict) -> dict | None:

@@ -273,6 +273,7 @@ class PlayerIdentityResolutionService:
     async def resolve_lineup(self, db, lineup_payload: list[dict]) -> tuple[list[PlayerReadiness], list[dict]]:
         results: list[PlayerReadiness] = []
         canonical_payload = []
+        player_sync_service = self.player_sync_service
         for lineup in lineup_payload:
             team = lineup.get("team") if isinstance(lineup, dict) else None
             provider_team_id = team.get("id") if isinstance(team, dict) else None
@@ -289,30 +290,31 @@ class PlayerIdentityResolutionService:
                         provider_player_id,
                         player_data=player_data,
                     ) if provider_player_id is not None else None
+                    normalized_player_data = None
+                    if isinstance(player_data, dict) and provider_player_id is not None:
+                        normalized_player_data = {
+                            "provider": self.provider,
+                            "provider_id": str(provider_player_id),
+                            "name": str(player_data.get("name") or "").strip(),
+                            "nationality": player_data.get("nationality"),
+                            "position": player_data.get("position") or player_data.get("pos"),
+                            "photo": player_data.get("photo"),
+                            "height": player_data.get("height"),
+                            "weight": player_data.get("weight"),
+                            "preferred_foot": player_data.get("preferred_foot"),
+                            "birth_date": player_data.get("birth_date"),
+                            "birth_place": player_data.get("birth_place"),
+                            "birth_country": player_data.get("birth_country"),
+                            "first_name": player_data.get("first_name"),
+                            "last_name": player_data.get("last_name"),
+                        }
 
                     if resolution is None:
                         readiness = self._failure("MISSING", player_data, provider_team_id, "provider player id is missing", retryable=True, terminal=False)
                     elif resolution.status in {"RESOLVED_EXISTING", "CREATE_NEW"}:
                         local_player_id = resolution.local_player_id
                         if local_player_id is None and resolution.status == "CREATE_NEW":
-                            if isinstance(player_data, dict):
-                                normalized = {
-                                    "provider": self.provider,
-                                    "provider_id": str(provider_player_id),
-                                    "name": str(player_data.get("name") or "").strip(),
-                                    "nationality": player_data.get("nationality"),
-                                    "position": player_data.get("position") or player_data.get("pos"),
-                                    "photo": player_data.get("photo"),
-                                    "height": player_data.get("height"),
-                                    "weight": player_data.get("weight"),
-                                    "preferred_foot": player_data.get("preferred_foot"),
-                                    "birth_date": player_data.get("birth_date"),
-                                    "birth_place": player_data.get("birth_place"),
-                                    "birth_country": player_data.get("birth_country"),
-                                    "first_name": player_data.get("first_name"),
-                                    "last_name": player_data.get("last_name"),
-                                }
-                                player_sync_service = self.player_sync_service
+                            if normalized_player_data is not None:
                                 if player_sync_service is None:
                                     from app.services.player_sync_service import PlayerSyncService
 
@@ -320,9 +322,79 @@ class PlayerIdentityResolutionService:
                                         player_repository=self.player_repository,
                                         player_identity_resolution_service=self,
                                     )
-                                created = await player_sync_service.upsert_player(db, normalized)
+                                    self.player_sync_service = player_sync_service
+                                created = await player_sync_service.upsert_player(
+                                    db,
+                                    normalized_player_data,
+                                )
                                 local_player_id = created.player_id
-                            else:
+                        elif resolution.status == "RESOLVED_EXISTING":
+                            try:
+                                exact_player = await self.player_repository.get_by_provider_id(
+                                    db,
+                                    str(provider_player_id),
+                                    self.provider,
+                                )
+                            except MultipleResultsFound:
+                                exact_player = None
+                                local_player_id = None
+
+                            if exact_player is not None:
+                                exact_provider = self._normalize_provider(
+                                    getattr(exact_player, "provider", None)
+                                )
+                                exact_provider_id = str(
+                                    getattr(exact_player, "provider_id", "")
+                                ).strip()
+                            try:
+                                expected_local_player_id = int(resolution.local_player_id)
+                                exact_local_player_id = (
+                                    int(exact_player.player_id)
+                                    if exact_player is not None
+                                    else None
+                                )
+                            except (TypeError, ValueError):
+                                expected_local_player_id = None
+                            if exact_player is not None:
+                                resolution_provider = self._normalize_provider(
+                                    resolution.provider
+                                )
+                                resolution_provider_id = (
+                                    str(resolution.provider_id).strip()
+                                    if resolution.provider_id is not None
+                                    else None
+                                )
+                                if (
+                                    normalized_player_data is None
+                                    or exact_provider != self._normalize_provider(self.provider)
+                                    or exact_provider_id != provider_player_id
+                                    or resolution_provider != self._normalize_provider(self.provider)
+                                    or resolution_provider_id != provider_player_id
+                                    or expected_local_player_id is None
+                                    or expected_local_player_id <= 0
+                                    or exact_local_player_id != expected_local_player_id
+                                ):
+                                    local_player_id = None
+                                else:
+                                    if player_sync_service is None:
+                                        from app.services.player_sync_service import PlayerSyncService
+
+                                        player_sync_service = PlayerSyncService(
+                                            player_repository=self.player_repository,
+                                            player_identity_resolution_service=self,
+                                        )
+                                        self.player_sync_service = player_sync_service
+                                    updated = await player_sync_service.upsert_player(
+                                        db,
+                                        normalized_player_data,
+                                        expected_local_player_id=expected_local_player_id,
+                                    )
+                                    if int(updated.player_id) != expected_local_player_id:
+                                        raise RuntimeError(
+                                            "Player upsert changed the verified local Player identity"
+                                        )
+                                    local_player_id = expected_local_player_id
+                            elif resolution.evidence == "provider+provider_id exact match":
                                 local_player_id = None
                         if local_player_id is None:
                             readiness = self._failure("INVALID", player_data, provider_team_id, "player identity could not be resolved", retryable=False, terminal=True)

@@ -40,16 +40,6 @@ def _safe_lineup_log_extra(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-async def _invalidate_lineup_cache(cache_service: Any | None, cache_key: str | None, metrics: Dict[str, Any]) -> None:
-    if cache_service is None or not cache_key:
-        return
-    try:
-        await cache_service.delete(cache_key)
-    except Exception:
-        metrics["cache_invalidation"] = "CACHE_INVALIDATION_PENDING"
-        logger.exception("LINEUP_SYNC_CACHE_INVALIDATION_FAILED", extra={"cache_key": cache_key})
-
-
 class LineupSyncService:
     """Write/refresh orchestration for lineup data without owning read or cache logic."""
 
@@ -68,15 +58,6 @@ class LineupSyncService:
         self.match_repository = MatchRepository()
         self.team_repository = team_repository or TeamRepository()
         self.missing_identity_repository = MissingLineupIdentityRepository()
-
-    async def _rollback_then_verify_existing_lineup(self, db: AsyncSession, match_id: int):
-        """Crash-proof recovery contract: rollback before any repository verification query.
-
-        This preserves the service-layer transaction ownership and prevents post-flush repository
-        reads from running on a poisoned session.
-        """
-        await db.rollback()
-        return await self.lineup_repository.get_by_match_id(db, match_id)
 
     def _validate_canonical_lineup_payload(self, payload: list[dict] | Any) -> str | None:
         """Reject canonical payloads that are structurally malformed or semantically contradictory.
@@ -254,8 +235,11 @@ class LineupSyncService:
                 logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
                 return metrics
 
-            participant_ids = {getattr(match, "home_team_id", None), getattr(match, "away_team_id", None)} - {None}
-            if not participant_ids:
+            participant_ids = {
+                getattr(match, "home_team_id", None),
+                getattr(match, "away_team_id", None),
+            } - {None}
+            if len(participant_ids) != 2:
                 return {
                     "success": False,
                     "match_id": match_id,
@@ -263,6 +247,7 @@ class LineupSyncService:
                     "failure_classification": "MATCH_IDENTITY_MISSING",
                 }
             canonical_lineup_data = []
+            resolved_team_ids = set()
             for lineup in lineup_data:
                 provider_team_id = (lineup.get("team") or {}).get("id") if isinstance(lineup, dict) else None
                 team = await self.team_repository.find_by_provider_identity(db, "api-football", provider_team_id)
@@ -273,7 +258,22 @@ class LineupSyncService:
                         "reason": "team_identity_missing",
                         "failure_classification": "TEAM_IDENTITY_MISSING",
                     }
-                local_team_id = int(team.team_id)
+                try:
+                    local_team_id = int(team.team_id)
+                except (TypeError, ValueError):
+                    return {
+                        "success": False,
+                        "match_id": match_id,
+                        "reason": "team_identity_missing",
+                        "failure_classification": "TEAM_IDENTITY_MISSING",
+                    }
+                if local_team_id in resolved_team_ids:
+                    return {
+                        "success": False,
+                        "match_id": match_id,
+                        "reason": "duplicate_resolved_team",
+                        "failure_classification": "DUPLICATE_RESOLVED_TEAM",
+                    }
                 if local_team_id not in participant_ids:
                     return {
                         "success": False,
@@ -282,9 +282,17 @@ class LineupSyncService:
                         "failure_classification": "TEAM_NOT_MATCH_PARTICIPANT",
                         "diagnostics": [{"fixture_id": match_id, "provider_team_id": str(provider_team_id), "local_team_id": local_team_id}],
                     }
+                resolved_team_ids.add(local_team_id)
                 canonical_lineup = dict(lineup)
                 canonical_lineup["local_team_id"] = local_team_id
                 canonical_lineup_data.append(canonical_lineup)
+            if resolved_team_ids != participant_ids:
+                return {
+                    "success": False,
+                    "match_id": match_id,
+                    "reason": "lineup_team_set_incomplete",
+                    "failure_classification": "LINEUP_TEAM_SET_INCOMPLETE",
+                }
             lineup_data = canonical_lineup_data
 
             readiness, canonical_lineup_data = await self.player_identity_resolution_service.resolve_lineup(db, lineup_data)
@@ -320,14 +328,60 @@ class LineupSyncService:
                     str((lineup.get("team") or {}).get("id")): lineup.get("local_team_id")
                     for lineup in lineup_data
                 }
-                partial_diagnostics = [
-                    {
+                player_data_by_slot = {}
+                for lineup in canonical_lineup_data:
+                    team_data = lineup.get("team") if isinstance(lineup, dict) else None
+                    provider_team_id = team_data.get("id") if isinstance(team_data, dict) else None
+                    for section, role in (("startXI", "STARTER"), ("substitutes", "SUBSTITUTE")):
+                        entries = lineup.get(section, []) if isinstance(lineup, dict) else []
+                        for position, entry in enumerate(entries, start=1):
+                            if not isinstance(entry, dict):
+                                continue
+                            try:
+                                lineup_position = int(entry.get("lineup_position") or position)
+                            except (TypeError, ValueError):
+                                continue
+                            entry_role = entry.get("roster_role") or role
+                            player_data = entry.get("player")
+                            if isinstance(player_data, dict) and provider_team_id is not None:
+                                player_data_by_slot[
+                                    (str(provider_team_id), str(entry_role), lineup_position)
+                                ] = player_data
+
+                partial_diagnostics = []
+                for item in unresolved:
+                    provider_team_id = item.get("team_id")
+                    roster_role = item.get("roster_role") or "UNKNOWN"
+                    try:
+                        lineup_position = int(item.get("lineup_position") or 0)
+                    except (TypeError, ValueError):
+                        lineup_position = 0
+                    player_data = player_data_by_slot.get(
+                        (str(provider_team_id), str(roster_role), lineup_position),
+                        {},
+                    )
+                    shirt_number = player_data.get("number")
+                    if isinstance(shirt_number, str):
+                        try:
+                            shirt_number = int(shirt_number.strip())
+                        except ValueError:
+                            shirt_number = None
+                    if isinstance(shirt_number, bool) or not isinstance(shirt_number, int):
+                        shirt_number = None
+                    position = player_data.get("pos") or player_data.get("position")
+                    grid = player_data.get("grid")
+                    diagnostic = {
                         **item,
                         "fixture_id": match_id,
-                        "provider_team_id": item.get("team_id"),
+                        "provider_team_id": provider_team_id,
+                        "roster_role": roster_role,
+                        "lineup_position": lineup_position,
+                        "shirt_number": shirt_number,
+                        "position": str(position) if position is not None else None,
+                        "grid": str(grid) if grid is not None else None,
                     }
-                    for item in unresolved
-                ]
+                    partial_diagnostics.append(diagnostic)
+
                 if hasattr(db, "execute"):
                     for item in partial_diagnostics:
                         await self.missing_identity_repository.upsert_missing(
@@ -335,14 +389,14 @@ class LineupSyncService:
                             match_id=match_id,
                             provider_fixture_id=str(getattr(match, "provider_fixture_id", match_id)),
                             local_team_id=local_team_by_provider.get(str(item.get("team_id"))),
-                            provider_team_id=str(item.get("team_id")),
+                            provider_team_id=str(item.get("provider_team_id")),
                             provider="api-football",
                             player_name=item.get("player_name"),
-                            shirt_number=None,
-                            position=None,
-                            grid=None,
-                            roster_role=item.get("roster_role") or "UNKNOWN",
-                            lineup_position=int(item.get("lineup_position") or 0),
+                            shirt_number=item.get("shirt_number"),
+                            position=item.get("position"),
+                            grid=item.get("grid"),
+                            roster_role=item.get("roster_role"),
+                            lineup_position=item.get("lineup_position"),
                             missing_reason=item.get("failure_reason") or "provider player id is missing",
                             raw_identity_state="missing",
                         )
@@ -351,39 +405,12 @@ class LineupSyncService:
                         match_id,
                         [item.as_dict() for item in readiness if item.status == "READY"],
                     )
-                canonical_lineup_data = [
-                    {
-                        **lineup,
-                        "startXI": [entry for entry in lineup.get("startXI", []) if entry.get("player", {}).get("player_id") is not None],
-                        "substitutes": [entry for entry in lineup.get("substitutes", []) if entry.get("player", {}).get("player_id") is not None],
-                    }
-                    for lineup in canonical_lineup_data
-                ]
-            lineup_data = canonical_lineup_data
-
-            if partial:
-                valid_entries = sum(
-                    len(lineup.get("startXI", [])) + len(lineup.get("substitutes", []))
-                    for lineup in canonical_lineup_data
-                )
-                existing_partial = await self.lineup_repository.get_by_match_id(db, match_id)
-                created = False
-                updated = False
-                if valid_entries:
-                    if existing_partial:
-                        await self.lineup_repository.update_one(db, existing_partial, canonical_lineup_data)
-                        updated = True
-                    else:
-                        await self.lineup_repository.create_one(db, match_id, canonical_lineup_data)
-                        created = True
-                    if hasattr(db, "flush"):
-                        await db.flush()
                 metrics = {
                     "success": True,
                     "partial": True,
                     "match_id": match_id,
-                    "created": created,
-                    "updated": updated,
+                    "created": False,
+                    "updated": False,
                     "failure_classification": "PARTIAL",
                     "reason": "missing_player_identity",
                     "diagnostics": partial_diagnostics,
@@ -392,6 +419,7 @@ class LineupSyncService:
                 logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
                 return metrics
 
+            lineup_data = canonical_lineup_data
             validation_failure = self._validate_canonical_lineup_payload(lineup_data)
             if validation_failure:
                 metrics = {
@@ -420,9 +448,8 @@ class LineupSyncService:
                 try:
                     await db.flush()
                 except Exception:
-                    await db.rollback()
                     metrics = {"success": False, "match_id": match_id, "reason": "lineup_sync_failed"}
-                    logger.warning("LINEUP_SYNC_FAILED", extra=_safe_lineup_log_extra(metrics))
+                    logger.exception("LINEUP_SYNC_PERSISTENCE_FAILED", extra=_safe_lineup_log_extra(metrics))
                     logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
                     return metrics
                 try:
@@ -440,45 +467,17 @@ class LineupSyncService:
                 logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
                 return metrics
 
-            await self.lineup_repository.create_one(db, match_id, lineup_data)
             try:
+                await self.lineup_repository.create_one(db, match_id, lineup_data)
                 await db.flush()
             except IntegrityError:
-                existing_after_race = await self._rollback_then_verify_existing_lineup(db, match_id)
-                if not existing_after_race:
-                    metrics = {"success": False, "match_id": match_id, "reason": "lineup_sync_failed"}
-                    logger.warning("LINEUP_SYNC_FAILED", extra=_safe_lineup_log_extra(metrics))
-                    logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
-                    return metrics
-
-                await self.lineup_repository.update_one(db, existing_after_race, lineup_data)
-                try:
-                    await db.flush()
-                except Exception:
-                    await db.rollback()
-                    metrics = {"success": False, "match_id": match_id, "reason": "lineup_sync_failed"}
-                    logger.warning("LINEUP_SYNC_FAILED", extra=_safe_lineup_log_extra(metrics))
-                    logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
-                    return metrics
-                try:
-                    projection = await self.analytics_projection_service.project_lineup(db, match_id, lineup_data)
-                except AttributeError as exc:
-                    if not self.analytics_projection_service.unavailable_for_fake_db(exc):
-                        raise
-                    projection = None
-                if projection is not None and not projection["success"]:
-                    raise ValueError(f"Lineup analytics projection rejected: {projection.get('reason', 'reconciliation failure')}")
-                metrics = {"success": True, "match_id": match_id, "created": False, "updated": True}
-                if projection is not None:
-                    metrics["analytics"] = projection
-                await _invalidate_lineup_cache(cache_service if invalidate_cache else None, cache_key, metrics)
-                logger.debug("LINEUP_SYNC_UPDATED", extra=_safe_lineup_log_extra(metrics))
+                metrics = {"success": False, "match_id": match_id, "reason": "lineup_sync_failed"}
+                logger.exception("LINEUP_SYNC_INSERT_CONFLICT", extra=_safe_lineup_log_extra(metrics))
                 logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
                 return metrics
             except Exception:
-                await db.rollback()
                 metrics = {"success": False, "match_id": match_id, "reason": "lineup_sync_failed"}
-                logger.warning("LINEUP_SYNC_FAILED", extra=_safe_lineup_log_extra(metrics))
+                logger.exception("LINEUP_SYNC_PERSISTENCE_FAILED", extra=_safe_lineup_log_extra(metrics))
                 logger.info("LINEUP_SYNC_COMPLETE", extra=_safe_lineup_log_extra(metrics))
                 return metrics
 

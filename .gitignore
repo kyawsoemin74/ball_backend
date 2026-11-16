@@ -25,3 +25,6 @@ tests/*
 !tests/test_odds_precision.py
 !tests/test_news_category.py
 !tests/test_uploads.py
+!tests/test_lineup_service_sync.py
+!tests/test_player_identity_resolution_service.py
+!tests/test_squad_photo_sync.py

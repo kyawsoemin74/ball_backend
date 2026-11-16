@@ -16,6 +16,7 @@ from app.services.cache_service import CacheService
 from app.services.lineup_sync_service import LineupSyncService
 from app.services.player_identity_resolution_service import PlayerIdentityResolutionService
 from app.services.player_service import PlayerService
+from app.services.player_sync_service import PlayerSyncService
 from app.services.team_service import TeamService
 
 logger = logging.getLogger(__name__)
@@ -104,14 +105,19 @@ class LineupService:
         if not isinstance(lineup_data, list) or not lineup_data:
             return False
 
-        seen_players: set[tuple[Any, str]] = set()
+        seen_teams: set[str] = set()
+        seen_players: set[str] = set()
         for lineup in lineup_data:
             if not isinstance(lineup, dict):
                 return False
 
             team = lineup.get("team")
-            if not isinstance(team, dict) or not team.get("id"):
+            if not isinstance(team, dict):
                 return False
+            team_id = self._normalize_provider_id(team.get("id"))
+            if team_id is None or team_id in seen_teams:
+                return False
+            seen_teams.add(team_id)
 
             if not isinstance(lineup.get("startXI"), list):
                 return False
@@ -119,20 +125,60 @@ class LineupService:
             if not isinstance(lineup.get("substitutes"), list):
                 return False
             formation = lineup.get("formation")
-            if formation is not None and (not isinstance(formation, str) or not formation.strip()):
-                return False
-            for section, role in (("startXI", "STARTER"), ("substitutes", "SUBSTITUTE")):
+            if formation is not None:
+                if not isinstance(formation, str) or not formation.strip():
+                    return False
+                formation_parts = (
+                    [part.strip() for part in formation.split("-")]
+                    if "-" in formation
+                    else formation.split()
+                )
+                if not formation_parts or any(
+                    not part or not part.isdigit() or int(part) <= 0 for part in formation_parts
+                ):
+                    return False
+            for section in ("startXI", "substitutes"):
                 for entry in lineup[section]:
                     if not isinstance(entry, dict) or not isinstance(entry.get("player"), dict):
                         return False
-                    player_id = entry["player"].get("id")
-                    if player_id is not None and str(player_id).strip() != "":
-                        key = str(player_id)
-                        if key in seen_players:
+                    player = entry["player"]
+                    raw_player_id = player.get("id")
+                    if raw_player_id is None or (
+                        isinstance(raw_player_id, str) and not raw_player_id.strip()
+                    ):
+                        raw_player_id = player.get("provider_id")
+                    if raw_player_id is None or (
+                        isinstance(raw_player_id, str) and not raw_player_id.strip()
+                    ):
+                        continue
+
+                    player_id = self._normalize_provider_id(raw_player_id)
+                    if player_id is None:
+                        return False
+                    alternate_player_id = player.get("provider_id")
+                    if alternate_player_id is not None and not (
+                        isinstance(alternate_player_id, str) and not alternate_player_id.strip()
+                    ):
+                        normalized_alternate_id = self._normalize_provider_id(alternate_player_id)
+                        if normalized_alternate_id is None or normalized_alternate_id != player_id:
                             return False
-                        seen_players.add(key)
+                    if player_id in seen_players:
+                        return False
+                    seen_players.add(player_id)
 
         return True
+
+    @staticmethod
+    def _normalize_provider_id(value: Any) -> str | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return str(value) if value > 0 else None
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized.isdigit() and int(normalized) > 0:
+                return str(int(normalized))
+        return None
 
     @staticmethod
     def _canonical_response(match_id: int, payload: Any) -> Any:
@@ -178,91 +224,175 @@ class LineupService:
         except (TypeError, ValueError):
             return str(left).strip() == str(right).strip()
 
+    @staticmethod
+    def _normalize_local_player_id(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized.isdigit() and int(normalized) > 0:
+                return int(normalized)
+        return None
+
+    @staticmethod
+    def _lineup_provider_player_id(player_data: dict[str, Any]) -> str | None:
+        provider_ids = []
+        for field in ("provider_player_id", "provider_id"):
+            value = player_data.get(field)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                return None
+            provider_id = str(value).strip()
+            if provider_id:
+                provider_ids.append(provider_id)
+        if not provider_ids or any(value != provider_ids[0] for value in provider_ids[1:]):
+            return None
+        return provider_ids[0]
+
     async def _enrich_player_photos(self, db: AsyncSession, payload: Any, match_id: int) -> Any:
         if not isinstance(payload, list):
             return payload
 
         enriched_payload = deepcopy(payload)
+        photo_entries: list[tuple[dict[str, Any], str | None, int | None, str | None]] = []
+        provider_ids: list[str] = []
+        for lineup in enriched_payload:
+            if not isinstance(lineup, dict):
+                continue
+            for section in ("startXI", "substitutes"):
+                entries = lineup.get(section)
+                if not isinstance(entries, list):
+                    continue
+                for entry in entries:
+                    player_data = entry.get("player") if isinstance(entry, dict) else None
+                    if not isinstance(player_data, dict):
+                        continue
+                    provider_id = self._lineup_provider_player_id(player_data)
+                    local_player_id = self._normalize_local_player_id(
+                        player_data.get("local_player_id")
+                    )
+                    lineup_photo = PlayerSyncService._normalize_photo_url(
+                        player_data.get("photo")
+                    )
+                    photo_entries.append(
+                        (player_data, provider_id, local_player_id, lineup_photo)
+                    )
+                    if lineup_photo is None and provider_id is not None:
+                        provider_ids.append(provider_id)
 
-        def valid_photo(value: Any) -> str | None:
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-            return None
-
-        provider_ids = list(dict.fromkeys(
-            str(player["provider_player_id"]).strip()
-            for lineup in enriched_payload
-            for section in ("startXI", "substitutes")
-            for entry in lineup.get(section, [])
-            if isinstance(entry, dict)
-            and isinstance((player := entry.get("player")), dict)
-            and player.get("provider_player_id") is not None
-            and str(player["provider_player_id"]).strip()
-        ))
-        players_by_provider_id = {}
+        provider_ids = list(dict.fromkeys(provider_ids))
+        players_by_provider_id: dict[str, Any] = {}
+        ambiguous_provider_ids: set[str] = set()
         if provider_ids:
             try:
                 players = await self.player_service.get_players_by_provider_ids(db, provider_ids)
-                players_by_provider_id = {
-                    str(player.provider_id): player
-                    for player in players
-                }
             except Exception:
                 logger.exception(
                     "LINEUP_PLAYER_PHOTO_BATCH_LOOKUP_FAILED",
                     extra={"match_id": match_id},
                 )
-                for provider_id in provider_ids:
-                    try:
-                        player = await self.player_service.get_player_by_provider_id(db, provider_id)
-                        if player is not None:
-                            players_by_provider_id[provider_id] = player
-                    except Exception:
-                        logger.exception(
-                            "LINEUP_PLAYER_PHOTO_LOOKUP_FAILED",
-                            extra={"match_id": match_id, "provider_player_id": provider_id},
+                players = []
+
+            for player in players:
+                provider_id = str(getattr(player, "provider_id", "") or "").strip()
+                if provider_id not in provider_ids:
+                    continue
+                provider = getattr(player, "provider", None)
+                if provider is not None and str(provider).strip().casefold() != "api-football":
+                    continue
+                if provider_id in players_by_provider_id:
+                    ambiguous_provider_ids.add(provider_id)
+                else:
+                    players_by_provider_id[provider_id] = player
+            for provider_id in ambiguous_provider_ids:
+                players_by_provider_id.pop(provider_id, None)
+
+        local_ids = list(dict.fromkeys(
+            local_player_id
+            for _, provider_id, local_player_id, lineup_photo in photo_entries
+            if lineup_photo is None
+            and provider_id is not None
+            and local_player_id is not None
+            and provider_id not in players_by_provider_id
+            and provider_id not in ambiguous_provider_ids
+        ))
+        players_by_local_id: dict[int, Any] = {}
+        ambiguous_local_ids: set[int] = set()
+        if local_ids:
+            try:
+                local_players = await self.player_service.get_players_by_ids(db, local_ids)
+            except Exception:
+                logger.exception(
+                    "LINEUP_PLAYER_PHOTO_LOCAL_BATCH_LOOKUP_FAILED",
+                    extra={"match_id": match_id},
+                )
+                local_players = []
+
+            for player in local_players:
+                local_player_id = self._normalize_local_player_id(
+                    getattr(player, "player_id", None)
+                )
+                if local_player_id not in local_ids:
+                    continue
+                if local_player_id in players_by_local_id:
+                    ambiguous_local_ids.add(local_player_id)
+                else:
+                    players_by_local_id[local_player_id] = player
+            for local_player_id in ambiguous_local_ids:
+                players_by_local_id.pop(local_player_id, None)
+
+        for player_data, provider_id, local_player_id, lineup_photo in photo_entries:
+            selected_photo = lineup_photo
+            if selected_photo is None and provider_id is not None:
+                player = None
+                provider_player = (
+                    players_by_provider_id.get(provider_id)
+                    if provider_id not in ambiguous_provider_ids
+                    else None
+                )
+                if provider_player is not None:
+                    if (
+                        local_player_id is None
+                        or self._same_local_player_id(
+                            local_player_id,
+                            getattr(provider_player, "player_id", None),
                         )
+                    ):
+                        player = provider_player
+                elif (
+                    local_player_id is not None
+                    and provider_id not in ambiguous_provider_ids
+                    and local_player_id not in ambiguous_local_ids
+                ):
+                    local_player = players_by_local_id.get(local_player_id)
+                    if (
+                        local_player is not None
+                        and self._same_local_player_id(
+                            local_player_id,
+                            getattr(local_player, "player_id", None),
+                        )
+                        and str(getattr(local_player, "provider", "")).strip().casefold()
+                        == "api-football"
+                        and str(getattr(local_player, "provider_id", "")).strip()
+                        == provider_id
+                    ):
+                        player = local_player
 
-        players_by_local_id = {}
-        for lineup in enriched_payload:
-            for section in ("startXI", "substitutes"):
-                for entry in lineup.get(section, []):
-                    if not isinstance(entry, dict):
-                        continue
-                    player_data = entry.get("player")
-                    if not isinstance(player_data, dict):
-                        continue
+                selected_photo = (
+                    PlayerSyncService._normalize_photo_url(
+                        getattr(player, "photo", None)
+                    )
+                    if player is not None
+                    else None
+                )
 
-                    provider_id = player_data.get("provider_player_id")
-                    local_id = player_data.get("local_player_id")
-                    player = None
-                    if provider_id is not None and str(provider_id).strip():
-                        player = players_by_provider_id.get(str(provider_id).strip())
-                        if player is not None and local_id is not None and not self._same_local_player_id(
-                            local_id, player.player_id
-                        ):
-                            player = None
-                    elif local_id is not None:
-                        local_key = str(local_id).strip()
-                        if local_key not in players_by_local_id:
-                            try:
-                                players_by_local_id[local_key] = await self.player_service.get_player(db, local_id)
-                            except Exception:
-                                logger.exception(
-                                    "LINEUP_PLAYER_PHOTO_LOOKUP_FAILED",
-                                    extra={"match_id": match_id, "local_player_id": local_key},
-                                )
-                                players_by_local_id[local_key] = None
-                        player = players_by_local_id[local_key]
-
-                    master_photo = valid_photo(getattr(player, "photo", None)) if player is not None else None
-                    lineup_photo = valid_photo(player_data.get("photo"))
-                    if master_photo is not None:
-                        player_data["photo"] = master_photo
-                    elif lineup_photo is not None:
-                        player_data["photo"] = lineup_photo
-                    else:
-                        player_data.pop("photo", None)
+            if selected_photo is not None:
+                player_data["photo"] = selected_photo
+            else:
+                player_data.pop("photo", None)
 
         return enriched_payload
 

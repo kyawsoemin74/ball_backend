@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -34,6 +34,15 @@ class PlayerRepository:
             select(Player).where(
                 (Player.provider == provider) & (Player.provider_id.in_(provider_ids))
             )
+        )
+        return result.scalars().all()
+
+    async def get_many_by_ids(self, db: AsyncSession, player_ids: List[int]) -> List[Player]:
+        """Get multiple players by local Player Master IDs."""
+        if not player_ids:
+            return []
+        result = await db.execute(
+            select(Player).where(Player.player_id.in_(player_ids))
         )
         return result.scalars().all()
 
@@ -92,6 +101,65 @@ class PlayerRepository:
                 f"Player upsert failed for provider={provider} provider_id={provider_id}"
             )
         return player
+
+    async def upsert_squad_photo(
+        self,
+        db: AsyncSession,
+        *,
+        provider: str,
+        provider_id: str,
+        name: str,
+        photo: str,
+    ) -> tuple[Player, str]:
+        """Insert a photo-bearing player or update only the photo of an existing one."""
+        identity = {
+            "provider": provider,
+            "provider_id": provider_id,
+        }
+        insert_stmt = pg_insert(Player).values(
+            **identity,
+            name=name,
+            photo=photo,
+        )
+        insert_result = await db.execute(
+            insert_stmt
+            .on_conflict_do_nothing(constraint="uq_players_provider_provider_id")
+            .returning(Player.player_id)
+        )
+        inserted_player_id = insert_result.scalar_one_or_none()
+        if inserted_player_id is not None:
+            player = await self.get_by_id(db, inserted_player_id)
+            if player is None:
+                raise RuntimeError(
+                    f"Player photo insert failed for provider={provider} provider_id={provider_id}"
+                )
+            return player, "inserted"
+
+        update_result = await db.execute(
+            update(Player)
+            .where(
+                Player.provider == provider,
+                Player.provider_id == provider_id,
+                Player.photo.is_distinct_from(photo),
+            )
+            .values(photo=photo, updated_at=func.now())
+            .returning(Player.player_id)
+        )
+        updated_player_id = update_result.scalar_one_or_none()
+        if updated_player_id is not None:
+            player = await self.get_by_id(db, updated_player_id)
+            if player is None:
+                raise RuntimeError(
+                    f"Player photo update failed for provider={provider} provider_id={provider_id}"
+                )
+            return player, "updated"
+
+        player = await self.get_by_provider_id(db, provider_id, provider)
+        if player is None:
+            raise RuntimeError(
+                f"Player photo upsert failed for provider={provider} provider_id={provider_id}"
+            )
+        return player, "unchanged"
 
     async def upsert_many(self, db: AsyncSession, players_data: List[dict]) -> tuple[int, int]:
         """

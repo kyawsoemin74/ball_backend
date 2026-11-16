@@ -45,6 +45,12 @@ class PlayerService:
         """Get multiple players by provider IDs."""
         return await self.player_repository.get_many_by_provider_ids(db, provider_ids, provider)
 
+    async def get_players_by_ids(
+        self, db: AsyncSession, player_ids: List[int]
+    ) -> List[Player]:
+        """Get multiple players by local Player Master IDs."""
+        return await self.player_repository.get_many_by_ids(db, player_ids)
+
     async def get_all_players(self, db: AsyncSession) -> List[Player]:
         """Get all players."""
         return await self.player_repository.get_all(db)
